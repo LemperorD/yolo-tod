@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tod"
+version = "0.0.1"
+description = "小目标检测（Tiny/Small Object Detection）魔改 YOLO 收集库：插件化模块库 + 变体消融流水线"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }   # 仅本仓库自有代码；第三方模块许可证见各模块元数据
+
+dependencies = [
+    "pyyaml>=6.0",
+    # 主干框架：AGPL-3.0。本库不修改其源码，仅注入模块命名空间（见 src/tod/compat.py）。
+    "ultralytics>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.5",
+]
+# 按需安装：算子编译（DCNv4 等）与实验分析
+ops = ["ninja", "pandas", "matplotlib", "seaborn", "tqdm"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

@@ -1,0 +1,26 @@
+# 环境
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 数据与权重（体积大，不入库）
+data/
+datasets/
+*.pt
+*.onnx
+*.engine
+*.pth
+
+# 实验结果：只保留 summary，权重与可视化另存
+results/*
+!results/.gitkeep
+
+# 测试临时产物
+tests/.tmp/
+
+# 编辑器
+.vscode/
+.idea/

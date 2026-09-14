@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 from functools import lru_cache
 from pathlib import Path
 
@@ -118,6 +120,40 @@ def load_yaml(path: str | Path) -> dict:
         raise CompatError("需要 PyYAML：pip install pyyaml") from exc
     with open(path, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
+
+
+@lru_cache(maxsize=1)
+def base_conv():
+    """框架的基础卷积类（含 BN + 激活 + autopad）。
+
+    优先使用框架实现，保证魔改模块与主干在初始化/激活配置上完全一致。
+    ultralytics 的导入路径在历史上变动过，这里按可靠性依次尝试。
+    """
+    if not installed():
+        raise CompatError("未安装 ultralytics，无法获取基础 Conv 类。")
+    for mod_path in ("ultralytics.nn.modules.conv",
+                     "ultralytics.nn.modules",
+                     "ultralytics.nn.modules.block"):
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:  # pragma: no cover
+            continue
+        conv = getattr(mod, "Conv", None)
+        if conv is not None:
+            return conv
+    raise CompatError("未能在 ultralytics 中找到 Conv 类，请检查框架版本。")
+
+
+def framework_has(name: str) -> bool:
+    """框架自身的模型解析命名空间里是否已有同名模块。
+
+    用于检测我们的注册名是否会遮蔽框架自带实现
+    （例如 ultralytics 可能自带 ADown，名字不冲突才不会出意外）。
+    """
+    try:
+        return name in model_globals()
+    except CompatError:
+        return False
 
 
 def dump_yaml(data: dict, path: str | Path) -> Path:

@@ -1,0 +1,165 @@
+#1 | CTX: ...ify the generalization performance of the model. In real-world onboard deployment, the model is implemented on an Intel NUC11TNHi7 embedded UAV platform with OpenVINO acceleration and achieves 43.9 FPS at a resolution of || MATH: 640 × 640
+
+#2 | CTX: ...3.org/1999/xlink" content-type="thumb" xlink:href="sensors-26-03424-g002.gif"> (1) The angular loss, denoted as || MATH: Λ
+
+#3 | CTX: ...mum angle between the center-connecting line of the predicted box and the reference box, and the x -axis and y -axis. Its mathematical formulation is presented below. (1) || MATH: Λ = 1 − 2 sin 2 sin − 1 c h σ − π 4
+
+#4 | CTX: .../mml:mstyle> − π 4 (2) Denoted as || MATH: Δ
+
+#5 | CTX: ...mml:mrow> Δ , it characterizes the separation between the central points, and its penalty exhibits a positive correlation with the angular cost. The contribution becomes more significant as || MATH: α
+
+#6 | CTX: ...h the angular cost. The contribution becomes more significant as α approaches || MATH: π / 4
+
+#7 | CTX: ...="mm6" overflow="scroll"> π / 4 . Its mathematical formulation is provided below. (2) || MATH: Δ = ∑ t = x , y 1 − e − ( 2 − Λ ) P t
+
+#8 | CTX: ...2 − Λ ) P t (3) || MATH: P x = B c x g t − B c x C w 2
+
+#9 | CTX: ...l:mrow> C w 2 (4) || MATH: P y = B c y g t − B c y C h 2
+
+#10 | CTX: ...y C h 2 In the formulas, || MATH: B c x g t
+
+#11 | CTX: ...L" id="mm10" overflow="scroll"> B c x g t and || MATH: B c y g t
+
+#12 | CTX: ...l:mi>B c y g t stand for the central position of the real target box, while || MATH: B c x
+
+#13 | CTX: ...-formula> B c x and || MATH: B c y
+
+#14 | CTX: ..."http://www.w3.org/1998/Math/MathML" id="mm13" overflow="scroll"> B c y correspond to the predicted box. || MATH: C w
+
+#15 | CTX: ...orrespond to the predicted box. C w and || MATH: C h
+
+#16 | CTX: ...mm15" overflow="scroll"> C h denote the width and height of the smallest rectangle enclosing both boxes. (3) The shape loss, denoted as || MATH: Ω
+
+#17 | CTX: ...width and height between model outputs and real object boxes, helping predictions better match the actual object shapes and enhancing detection stability. Its mathematical expression is given below. (5) || MATH: Ω = ∑ t = w , h 1 − e w t θ
+
+#18 | CTX: ...l:mo>− e w t θ (6) || MATH: w w = w − w g t M a x w , w g t
+
+#19 | CTX: .../mml:mo> w g t (7) || MATH: w h = h − h g t M a x h , h g t
+
+#20 | CTX: ...ml:mi> t In this case, w and h indicate the size of the regression box, || MATH: w g t
+
+#21 | CTX: ...-formula> w g t and || MATH: h g t
+
+#22 | CTX: ...rg/1998/Math/MathML" id="mm21" overflow="scroll"> h g t stand for the dimensions of the real target, and || MATH: θ
+
+#23 | CTX: ...sed by an average pooling operation, which helps retain local contextual information before subsequent downsampling. The resulting feature tensor is then split into two equal parts along the channel dimension, denoted as || MATH: x 1
+
+#24 | CTX: ...e channel dimension, denoted as x 1 and || MATH: x 2
+
+#25 | CTX: ...math> and x 2 . For the || MATH: x 1
+
+#26 | CTX: .../inline-formula>. For the x 1 branch, a || MATH: 3 × 3
+
+#27 | CTX: ...6" overflow="scroll"> 3 × 3 convolution with stride 2 is used to perform spatial downsampling and feature extraction. For the || MATH: x 2
+
+#28 | CTX: ...ature extraction. For the x 2 branch, a || MATH: 3 × 3
+
+#29 | CTX: ...id="mm28" overflow="scroll"> 3 × 3 max-pooling operation is first applied to emphasize salient local responses, followed by a || MATH: 1 × 1
+
+#30 | CTX: ...design enables the network to obtain richer downsampled features while maintaining a compact structure. The structural schematic is illustrated in Figure 1 . The ADown module employs || MATH: 3 × 3
+
+#31 | CTX: ...odule employs 3 × 3 and || MATH: 1 × 1
+
+#32 | CTX: ... complexity. By splitting the feature channels before downsampling, the module reduces redundant convolutional computation compared with conventional stride-2 convolution. Given an input feature map with the dimension of || MATH: h × w × c
+
+#33 | CTX: ...8/Math/MathML" id="mm32" overflow="scroll"> h × w × c , the downsampled output has the size of || MATH: h / 2 × w / 2 × c
+
+#34 | CTX: .../mml:mo> c , where h and w denote the height and width, respectively, and c represents the channel number. The parameter counts || MATH: P a
+
+#35 | CTX: ...el number. The parameter counts P a and || MATH: P c
+
+#36 | CTX: ...P c , as well as the computational costs || MATH: F a
+
+#37 | CTX: ...well as the computational costs F a and || MATH: F c
+
+#38 | CTX: ...ne-formula> F c associated with the ADown module and the || MATH: 3 × 3
+
+#39 | CTX: ...la> convolution with stride 2, are presented in Equations ( 8 ) and ( 9 ). (8) || MATH: P a = 5 2 c 2 F a = 5 8 c 2 × h × w
+
+#40 | CTX: ...ml:mi> 2 × h × w (9) || MATH: P c = 9 c 2 F c = 9 4 c 2 × h × w
+
+#41 | CTX: ...table> As reflected in Equations ( 8 ) and ( 9 ), the conventional || MATH: 3 × 3
+
+#42 | CTX: ..., model compactness, and real-time deployment requirements. 3.4. Efficient_UAVDet Head Aiming at the problem that the original detection head of YOLOv8n uses ordinary || MATH: 3 × 3
+
+#43 | CTX: ...l branch. Here, x represents the total channel dimension of the input feature map corresponding to the respective detection head branch. The group number is calculated as follows: (10) || MATH: g = x 16
+
+#44 | CTX: ...mml:mfrac> Based on this grouping, the core operation of the channel-adaptive grouped convolution can be formulated as: (11) || MATH: Y = GroupConv ( X , k = 3 , g ) = Concat Conv ( X i , k = 3 ) i = 1 g
+
+#45 | CTX: ...nced> i = 1 g The input feature corresponding to the i -th group is denoted by || MATH: X i
+
+#46 | CTX: ...mula> X i , with each group containing || MATH: x / g
+
+#47 | CTX: ...mm46" overflow="scroll"> x / g channels. When the input and output channel numbers are equal, the parameter count of a single || MATH: 3 × 3
+
+#48 | CTX: ...ml:math xmlns:mml="http://www.w3.org/1998/Math/MathML" id="mm47" overflow="scroll"> 3 × 3 grouped convolution is reduced from || MATH: 9 x 2
+
+#49 | CTX: ...e-formula> 9 x 2 to || MATH: 9 x 2 / g
+
+#50 | CTX: ...l channels. Each group is independently processed using a convolution kernel of the appropriate size, and the resulting outputs are then concatenated to form the final feature. This strategy lowers the parameter count to || MATH: 1 / g
+
+#51 | CTX: ...a standard convolution, where g denotes the number of groups. In the detection head of this paper, a channel-adaptive version of grouped convolution is employed. Unlike the schematic example with a fixed group setting of || MATH: g = 2
+
+#52 | CTX: ...nline-formula> shown in Figure 3 , the number of groups here is dynamically computed according to the input channel count x in the detection head branch, using the formula || MATH: g = x 16
+
+#53 | CTX: ...mfenced separators="" open="⌊" close="⌋"> x 16 (for example, if || MATH: x = 32
+
+#54 | CTX: ...xample, if x = 32 , then || MATH: g = 2
+
+#55 | CTX: ...?cloudpmc-bucket cdn?> Figure 4 illustrates the overall design of the stem feature enhancement module, which is implemented with two consecutive layers of || MATH: 3 × 3
+
+#56 | CTX: ...ations. To maintain consistent feature dimensions, the input and output channel counts are aligned. By substituting standard convolution with the proposed channel-adaptive grouped convolution, the parameter count of each || MATH: 3 × 3
+
+#57 | CTX: ...mml="http://www.w3.org/1998/Math/MathML" id="mm56" overflow="scroll"> 3 × 3 convolutional layer is significantly reduced from || MATH: 9 x 2
+
+#58 | CTX: ...e-formula> 9 x 2 to || MATH: 9 x 2 / g
+
+#59 | CTX: ...ll"> 9 x 2 / g . For instance, considering the P2 branch with an input of || MATH: x = 32
+
+#60 | CTX: ...inline-formula> x = 32 channels, setting || MATH: g = 2
+
+#61 | CTX: ...3424-g004.gif?> Table 3 lists the input channel count x , group number g , and channels per group || MATH: x / g
+
+#62 | CTX: ...mml:math> for each branch of the YOLOv8n detection head. Here, x denotes the input channel number of each detection head branch, g denotes the number of groups used in grouped convolution, and || MATH: x / g
+
+#63 | CTX: ...g denotes the number of channels assigned to each group. Since the input channels of all detection heads are integer multiples of 16, the group number is calculated as || MATH: g = x 16
+
+#64 | CTX: ...om:solid thin;border-top:solid thin" rowspan="1" colspan="1">Group Number g Channels per Group || MATH: x / g
+
+#65 | CTX: ...ttom:solid thin" rowspan="1" colspan="1">16 Note: x denotes the input channel number of each detection head branch, g denotes the number of groups, and || MATH: x / g
+
+#66 | CTX: ...real-time response capability of the proposed model in micro-UAV applications. To intuitively compare the overall efficiency of different models, we propose an Efficiency Score, defined as: (12) || MATH: Efficiency Score = mAP @ 0.5 × FPS Parameters ( M )
+
+#67 | CTX: ...n="middle" style="border-bottom:solid thin;border-top:solid thin" rowspan="1" colspan="1">FPS (f/s) Parameters ( || MATH: 10 6
+
+#68 | CTX: ...n="middle" style="border-bottom:solid thin;border-top:solid thin" rowspan="1" colspan="1">FPS (f/s) Parameters ( || MATH: 10 6
+
+#69 | CTX: ...Efficient_UAVDet on the Det-Fly dataset. Channels per Group || MATH: x / g
+
+#70 | CTX: ...n="middle" style="border-bottom:solid thin;border-top:solid thin" rowspan="1" colspan="1">FPS (f/s) Parameters ( || MATH: 10 6
+
+#71 | CTX: ...r" valign="middle" style="border-bottom:solid thin" rowspan="1" colspan="1">7.3 4.5 Note: || MATH: x / g
+
+#72 | CTX: ...assigned to each group. The group numbers correspond to the P2, P3, P4, and P5 detection heads, respectively. A sensitivity analysis was conducted by comparing three channel-per-group settings, namely || MATH: x / g = 8
+
+#73 | CTX: ...l:math xmlns:mml="http://www.w3.org/1998/Math/MathML" id="mm65" overflow="scroll"> x / g = 8 , || MATH: x / g = 16
+
+#74 | CTX: ...h xmlns:mml="http://www.w3.org/1998/Math/MathML" id="mm66" overflow="scroll"> x / g = 16 , and || MATH: x / g = 32
+
+#75 | CTX: ...nd validation settings, the corresponding group numbers for the P2, P3, P4, and P5 detection heads are 4/8/16/32, 2/4/8/16, and 1/2/4/8, respectively. As shown in Table 7 , setting || MATH: x / g = 8
+
+#76 | CTX: ...ds the smallest model with 1.99 M parameters, 6.0 GFLOPs, and a model size of 4.1 MB. However, excessive grouping restricts inter-channel information exchange, resulting in slightly lower recall and mAP@0.5:0.95 than the || MATH: x / g = 16
+
+#77 | CTX: ..." overflow="scroll"> x / g = 16 setting, although it achieves the same mAP@0.5 of 0.922. When || MATH: x / g = 32
+
+#78 | CTX: ...ncreases the parameter count to 2.19 M and the computational cost to 7.3 GFLOPs. However, this setting does not improve detection accuracy, with the mAP@0.5 decreasing to 0.918 and the FPS dropping to 196.4. In contrast, || MATH: x / g = 16
+
+#79 | CTX: ...oor real-world scenes. The dataset is divided into training, validation, and test subsets with 5200, 2600, and 2200 images, respectively, and includes a total of 10,109 annotated UAV targets. Image resolutions range from || MATH: 160 × 240
+
+#80 | CTX: ...range from 160 × 240 to || MATH: 3744 × 5616
+
+#81 | CTX: ...n="middle" style="border-bottom:solid thin;border-top:solid thin" rowspan="1" colspan="1">FPS (f/s) Parameters ( || MATH: 10 6
+
+#82 | CTX: ...n="middle" style="border-bottom:solid thin;border-top:solid thin" rowspan="1" colspan="1">FPS (f/s) Parameters ( || MATH: 10 6
+
+#83 | CTX: ...> ONNX/OpenVINO-optimized model Input resolution || MATH: 640 × 640

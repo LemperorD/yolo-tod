@@ -125,13 +125,22 @@ class Variant:
     # ---------------------------------------------------------------- 导出
 
     def used_modules(self) -> list[str]:
-        """收集本变体引用到的、已在注册表中登记的模块名。"""
+        """收集本变体引用到的、已在注册表中登记的模块名。
+
+        同时扫描各 EP 覆盖与 ``model`` 段（P2 预处理、融合块等也常填模块名），
+        用于在变体卡片里自动列出论文来源与许可证。
+        """
         found: list[str] = []
-        for cfg in self.eps.values():
+
+        def scan(cfg: dict) -> None:
             for value in cfg.values():
                 for item in (value if isinstance(value, (list, tuple)) else [value]):
                     if isinstance(item, str) and has(item) and item not in found:
                         found.append(item)
+
+        for cfg in self.eps.values():
+            scan(cfg)
+        scan(self.model_cfg)
         return found
 
     def spec(self) -> dict[str, Any]:
@@ -154,6 +163,27 @@ class Variant:
         from tod.compat import dump_yaml
 
         return dump_yaml(self.spec(), path)
+
+    @classmethod
+    def from_spec(cls, data: dict[str, Any]) -> "Variant":
+        """从 ``dump()`` 写出的 spec 还原变体对象。
+
+        这样训练脚本可以直接读变体配置，并**现场重新生成**模型 YAML，
+        保证 model.yaml 与变体配置永不脱节（不需要把生成物手工 commit 后再维护）。
+        """
+        v = cls(
+            name=str(data.get("id") or data.get("name") or "unnamed"),
+            base=str(data.get("base", "yolov8n")),
+            dataset=str(data.get("dataset", "")),
+            status=str(data.get("status", "planned")),
+            tags=list(data.get("tags") or []),
+            notes=str(data.get("notes", "")),
+        )
+        v.eps = {k: dict(x) for k, x in (data.get("eps") or {}).items()}
+        v.data_cfg = dict(data.get("data") or {})
+        v.train_cfg = dict(data.get("train") or {})
+        v.model_cfg = dict(data.get("model") or {})
+        return v
 
     # ------------------------------------------------------------ 模型 YAML
 
@@ -181,42 +211,69 @@ class Variant:
     def model_yaml(self, path: str | Path | None = None, *, write: bool = True) -> dict:
         """由 ``base`` 的内置模型 YAML 生成变体模型图。
 
-        当前 M0 支持两类结构性改造：
-          * 类型替换（``type_map``，如 ``Conv -> SPDConv``、``nn.Upsample -> DySample``）
-          * P2 检测头注入（``add_p2=True``，见 ``inject_p2_head``）
+        改造按"先结构、后改名"的顺序执行，顺序不可颠倒：
+          1. ``downsample`` —— 按节点索引把主干下采样换成 ADown 等模块
+          2. ``add_p2``      —— 注入 P2（stride=4）检测分支
+          3. ``type_map``    —— 节点类型批量改名
+
+        **检测头（EP5）刻意不做 YAML 改名**：ultralytics 的 ``parse_model`` 用
+        精确类成员判断（``m in {Detect, ...}``）来给检测头追加输入通道列表 ``ch``，
+        子类不会被识别，写进 YAML 会因为缺少 ``ch`` 而构造失败。因此 EP5 的改动
+        记录到 ``_head_surgery``，由 ``tod.engine.surgery`` 在模型构建完成后
+        就地替换分支卷积——不改框架源码，也不依赖该判断的实现细节。
 
         更复杂的颈部重拓扑（BiFPN / AFPN / HS-FPN）属于 M1 工作。
         """
         cfg, scale = self._load_base_cfg()
-        type_map: dict[str, str] = dict(self.model_cfg.get("type_map", {}))
-
-        # EP 覆盖 → 节点类型替换。只映射语义等价的节点类型：
-        # 注意力类模块不是 Conv 的等价替换，必须写在 type_map 或 neck/head 配置里。
-        ep_targets = (("EP3", "upsample", "nn.Upsample"),
-                      ("EP1", "conv", "Conv"),
-                      ("EP1", "block", "C2f"),
-                      ("EP5", "head", "Detect"))
-        for ep, key, target in ep_targets:
-            new = self.eps.get(ep, {}).get(key)
-            if isinstance(new, str) and new and new != target:
-                type_map[target] = new
 
         if self.model_cfg.get("nc") is not None:
             cfg["nc"] = self.model_cfg["nc"]
         if scale:
             cfg["scale"] = scale
 
-        if type_map:
-            apply_type_map(cfg, type_map)
+        # ---- 1) 结构：主干下采样替换 ----
+        ds_module = self.model_cfg.get("downsample") or self.eps.get("EP1", {}).get("downsample")
+        if ds_module:
+            replace_downsample(
+                cfg,
+                module=str(ds_module),
+                indices=self.model_cfg.get("downsample_indices")
+                or self.eps.get("EP1", {}).get("downsample_indices"),
+            )
 
+        # ---- 2) 结构：P2 检测分支 ----
         if self.model_cfg.get("add_p2"):
+            p2_pre = self.model_cfg.get("p2_pre")
+            if isinstance(p2_pre, dict):        # {type: Conv, args: [64,1,1]}
+                p2_pre = [p2_pre["type"], p2_pre.get("args", [])]
             inject_p2_head(
                 cfg,
                 p2_idx=int(self.model_cfg.get("p2_idx", 2)),
                 p2_channels=int(self.model_cfg.get("p2_channels", 64)),
                 fuse_block=str(self.model_cfg.get("p2_fuse_block", "C2f")),
                 upsample=str(self.eps.get("EP3", {}).get("upsample") or "nn.Upsample"),
+                p2_pre=p2_pre,
             )
+
+        # ---- 3) 改名：EP 覆盖 → 节点类型替换 ----
+        type_map: dict[str, str] = dict(self.model_cfg.get("type_map", {}))
+        # 只映射语义等价的节点类型；注意力类模块不是 Conv 的等价替换，
+        # 必须显式写在 type_map 或颈部配置里。
+        ep_targets = (("EP3", "upsample", "nn.Upsample"),
+                      ("EP1", "conv", "Conv"),
+                      ("EP1", "block", "C2f"))
+        for ep, key, target in ep_targets:
+            new = self.eps.get(ep, {}).get(key)
+            if isinstance(new, str) and new and new != target:
+                type_map[target] = new
+
+        if type_map:
+            apply_type_map(cfg, type_map)
+
+        # ---- 4) 检测头：记录为建模后手术，见上面的说明 ----
+        head_name = self.eps.get("EP5", {}).get("head")
+        if isinstance(head_name, str) and head_name not in ("", "Detect"):
+            cfg["_head_surgery"] = head_name
 
         if write:
             if path is None:
@@ -307,24 +364,30 @@ def _node_lists(cfg: dict) -> tuple[list, list, int]:
 
 
 def _find_detect(nodes: Sequence) -> int:
+    """定位检测头节点（兼容 Detect / DetectP2 / Efficient_UAVDet 等命名）。"""
     for i in range(len(nodes) - 1, -1, -1):
-        if str(nodes[i][2]).endswith("Detect"):
+        if "detect" in str(nodes[i][2]).lower():
             return i
-    raise ValueError("未在模型图中找到 Detect 头节点。")
+    raise ValueError("未在模型图中找到检测头节点（类型名含 'detect'）。")
 
 
 def apply_type_map(cfg: dict, type_map: dict[str, str]) -> dict:
-    """按 ``{旧类型: 新类型}`` 替换节点类型；就地修改并返回 cfg。"""
+    """按 ``{旧类型: 新类型}`` 替换节点类型；就地修改 cfg（节点本身替换为新列表）。
+
+    节点采用"替换而非改写"的方式，避免污染调用方浅拷贝共享的节点对象。
+    """
     if "backbone" in cfg and "head" in cfg:
         lists = [cfg["backbone"], cfg["head"]]
     else:
         lists = [cfg["model"]]
     hit = {k: 0 for k in type_map}
     for nodes in lists:
-        for node in nodes:
+        for i, node in enumerate(nodes):
             t = str(node[2])
             if t in type_map:
-                node[2] = type_map[t]
+                new_node = list(node)
+                new_node[2] = type_map[t]
+                nodes[i] = new_node
                 hit[t] += 1
     cfg["_type_map_applied"] = {k: v for k, v in hit.items() if v}
     return cfg
@@ -338,29 +401,32 @@ def inject_p2_head(
     fuse_block: str = "C2f",
     upsample: str = "nn.Upsample",
     repeats: int = 3,
+    p2_pre: Sequence | None = None,
 ) -> dict:
     """把 P2（stride=4）分支接进检测头 —— PLAN.md 中最高 ROI 的改动。
 
     生成的结构（以 YOLOv8 为例，P3 头节点为 15、P2 源为 2）::
 
+        [2, 1, Conv, [64, 1, 1]]                     # 可选：P2 侧 1x1 降维/校准
         [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 由 P3 上采样
         [[-1, 2], 1, Concat, [1]]                    # 与 backbone P2 拼接
         [-1, 3, C2f, [64]]                           # 融合
         [[24, 15, 18, 21], 1, Detect, [nc]]          # Detect(P2, P3, P4, P5)
 
-    这是"直连式 P2 头"（M0 版本）：只做一次自顶向下融合，不做完整双向重拓扑。
-    完整 P2 双向融合 / BiFPN 属于 M1。
+    这是"直连式 P2 头"：只做一次自顶向下融合，不做完整双向重拓扑。
 
     Args:
         p2_idx: backbone 中 P2（stride=4）特征源的全局节点索引。
             YOLOv8 系列为 2；换主干后请对照模型 YAML 注释确认。
         p2_channels: 融合块输出通道（会被 width 缩放）。
         upsample: 上采样模块名，可填注册表中的名字（如 ``DySample``）。
+        p2_pre: 可选的 P2 侧预处理节点，形如 ``[类型, [参数...]]``。
+            SPAE-YOLOv8 §3.2 在此处用 1x1 卷积降维并做特征校准，
+            对应 ``["Conv", [64, 1, 1]]``。
     """
     nodes, base, _ = _node_lists(cfg)
     det_i = _find_detect(nodes)
-    det_node = nodes[det_i]
-    src = list(det_node[0])
+    src = list(nodes[det_i][0])
 
     if len(src) == 4:
         cfg["_p2_status"] = "already_present"
@@ -369,17 +435,82 @@ def inject_p2_head(
         raise ValueError(f"预期 Detect 有 3 个输入（P3,P4,P5），实际 {src}。")
 
     p3_idx, p4_idx, p5_idx = src
-    det_global = base + det_i
+    det_global = base + det_i          # 插入后 Detect 自身将占用的全局索引
+    offset = 0
 
-    new_nodes = [
-        [p3_idx, 1, upsample, [None, 2, "nearest"]],
-        [[-1, p2_idx], 1, "Concat", [1]],
-        [-1, repeats, fuse_block, [p2_channels]],
-    ]
-    for offset, node in enumerate(new_nodes):
-        nodes.insert(det_i + offset, node)
+    # 1) 可选的 P2 侧降维/校准
+    if p2_pre is not None:
+        pre_type, pre_args = p2_pre[0], list(p2_pre[1])
+        nodes.insert(det_i + offset, [p2_idx, 1, pre_type, pre_args])
+        p2_src = det_global + offset
+        offset += 1
+    else:
+        p2_src = p2_idx
 
-    fuse_idx = det_global + 2
-    nodes[det_i + 3][0] = [fuse_idx, p3_idx, p4_idx, p5_idx]
+    # 2) P3 上采样
+    nodes.insert(det_i + offset, [p3_idx, 1, upsample, [None, 2, "nearest"]])
+    offset += 1
+
+    # 3) 与 P2 拼接
+    nodes.insert(det_i + offset, [[-1, p2_src], 1, "Concat", [1]])
+    offset += 1
+
+    # 4) 融合
+    fuse_idx = det_global + offset
+    nodes.insert(det_i + offset, [-1, repeats, fuse_block, [p2_channels]])
+    offset += 1
+
+    # 5) Detect 输入扩展为 P2-P5
+    #    写回的是**新列表**而非就地修改：调用方可能传入浅拷贝的节点列表
+    #    （例如 {"model": backbone + head}），就地改写会污染其原图。
+    updated = list(nodes[det_i + offset])
+    updated[0] = [fuse_idx, p3_idx, p4_idx, p5_idx]
+    nodes[det_i + offset] = updated
     cfg["_p2_status"] = "injected"
+    cfg["_p2_channels"] = p2_channels
+    return cfg
+
+
+def replace_downsample(
+    cfg: dict,
+    *,
+    module: str = "ADown",
+    indices: Sequence[int] | None = None,
+    segments: Sequence[str] = ("backbone",),
+) -> dict:
+    """把主干中的 stride-2 下采样卷积换成给定模块（如 ADown）。
+
+    为什么不能直接用 ``apply_type_map``：ADown 只在**下采样位置**语义等价，
+    把全图 Conv 都换掉会破坏 neck 与 head。所以这里按**节点索引**精确替换。
+
+    Args:
+        module: 替换后的模块名。
+        indices: 全局节点索引列表，默认 ``(1, 3, 5, 7)``
+            —— YOLOv8 主干的 P2/P3/P4/P5 下采样点（索引 0 是 stem，
+            输入通道为 3（奇数），ADown 这类需要通道一分为二的模块不能放）。
+        segments: 在哪些段里替换，默认只改 backbone。
+
+    Returns:
+        就地修改后的 cfg，并写入 ``_downsample_replaced`` 供核查。
+    """
+    indices = tuple(indices) if indices is not None else (1, 3, 5, 7)
+    replaced: dict[int, str] = {}
+
+    for segment in segments:
+        if segment not in cfg:
+            continue
+        seg_nodes = cfg[segment]
+        seg_base = len(cfg["backbone"]) if segment == "head" and "backbone" in cfg else 0
+        for local_i, node in enumerate(seg_nodes):
+            global_i = seg_base + local_i
+            if global_i not in indices:
+                continue
+            old = str(node[2])
+            if old != module:                     # 幂等
+                new_node = list(node)
+                new_node[2] = module
+                seg_nodes[local_i] = new_node
+                replaced[global_i] = f"{old} -> {module}"
+
+    cfg["_downsample_replaced"] = replaced
     return cfg

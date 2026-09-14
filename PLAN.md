@@ -391,6 +391,7 @@ ultralytics 内部 API 变动频繁（`parse_model`、`DetectionModel`、`v8Dete
 
 | 名称 | 赛道 | 核心卖点 | 收录方式 |
 |---|---|---|---|
+| **SPAE-YOLOv8** ([Sensors 2026](https://doi.org/10.3390/s26113424)) ✅ **已实现** | 空对空微小型无人机 | SIoU + P2 浅层 + ADown + Efficient_UAVDet；PARAMS −30%、FPS +28%，但精度主贡献来自 P2（+7.5pp），换头本身 −0.4pp | 全模块化（EP1/EP5/EP7 + P2 注入） |
 | **TPH-YOLOv5 / TPH-YOLOv5++** | 航拍 VisDrone | Transformer 预测头 + 额外小目标头 + 复制粘贴增强 | 建议整仓 submodule + 适配器 |
 | **CEASC** ([CVPR 2023](https://openaccess.thecvf.com//content/CVPR2023/html/Du_Adaptive_Sparse_Convolutional_Networks_With_Global_Context_Enhancement_for_Faster_CVPR_2023_paper.html)) | 航拍 | 自适应稀疏卷积 + 全局上下文增强，加速密集小目标推理 | 模块化（EP1/EP4） |
 | **Gold-YOLO** (NeurIPS 2023) | 通用 | GD 汇聚-分发颈部，低延迟涨点 | 模块化（EP2） |
@@ -560,35 +561,62 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ## 12. 落地进展
 
-### M0 架构层（已完成，`python tests/smoke.py` 35 项检查全绿）
+### M0 架构层（已完成，`python tests/smoke.py` 51 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
 | `src/tod/registry.py` | 注册表：强制登记 EP 归属 / 论文 / 许可证 / 成本；重复注册与非法 EP 直接报错；`catalog()` 自动生成模块总表 | ✅ |
-| `src/tod/compat.py` | 唯一触碰 ultralytics 内部的兼容层：命名空间注入、内置模型 YAML 定位、版本区间校验 | ✅ |
-| `src/tod/compose.py` | 变体 DSL：`patch/without/data/train/model` → 变体配置、模型 YAML、变体卡片；含 **P2 头注入**与节点类型替换 | ✅ |
-| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（35 项），含 P2 注入的索引正确性验证 | ✅ |
-| `tools/catalog.py` | 生成 `docs/VARIANTS.md` | ✅ |
-| `configs/_base_/datasets/visdrone2019-det.yaml` | VisDrone 数据配置 + 尺度分层/长尾类别标注 | ✅ |
-| `pyproject.toml` / `.gitignore` / `README.md` | 工程外壳 | ✅ |
+| `src/tod/compat.py` | 唯一触碰 ultralytics 内部的兼容层：命名空间注入、基础 Conv/Detect 获取、内置模型 YAML 定位、版本区间校验 | ✅ |
+| `src/tod/compose.py` | 变体 DSL：`patch/without/data/train/model` → 变体配置、模型 YAML、变体卡片；含 **P2 头注入**、**主干下采样替换**、节点类型替换 | ✅ |
+| `src/tod/runtime.py` | 变体 spec 的运行时上下文（避免污染框架的训练参数校验） | ✅ |
+| `src/tod/loss/box.py` + `criterion.py` | **SIoU** 与训练准则接入：只替换 IoU 项、复用框架 DFL | ✅ |
+| `src/tod/engine/trainer.py` + `surgery.py` | 自定义 Trainer（换准则 + 检测头手术） | ✅ |
+| `src/tod/modules/conv/adown.py` | **ADown** 双分支自适应下采样（EP1） | ✅ |
+| `src/tod/modules/head/efficient_uavdet.py` | **Efficient_UAVDet** 轻量检测头，两组通道策略（EP5） | ✅ |
+| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**51 项**） | ✅ |
+| `tests/test_modules.py` | 形状 / 数值 / 换头 / 端到端建图测试（需 torch） | ✅ |
+| `tools/make_variant.py` / `train.py` / `catalog.py` | 变体物化、训练入口（含 `--dry-run` 结构自检）、文档生成 | ✅ |
+| `variants/SPAE-YOLOv8n/` | 首个完整变体：`recipe.py` + `variant.yaml` + `card.md` + `paper-notes.md` + `evidence/` | ✅ |
 
 **已验证的关键逻辑**（对官方 yolov8 同构图做单元验证）：
 
-- `inject_p2_head` 生成的 `Detect` 输入为 `[24, 15, 18, 21]`，上采样取自 P3 节点、Concat 接 backbone P2、
-  融合块通道经 width 缩放，**backbone 不被改动**，且**重复调用幂等**；
+- `inject_p2_head` 生成的 `Detect` 输入为 `[24, 15, 18, 21]`（带 P2 预处理节点时为 `[25, 15, 18, 21]`），
+  上采样取自 P3 节点、Concat 接 backbone P2、融合块通道经 width 缩放，**backbone 不被改动**，且**重复调用幂等**；
+- `replace_downsample` 精确替换主干下采样点（默认 1/3/5/7），**不误伤 stem（索引 0，输入 3 通道为奇数）与 C2f 节点**；
 - `apply_type_map` 可把 `Conv→SPDConv`、`nn.Upsample→DySample` 全图替换并统计命中数；
+- **节点改造采用"替换而非就地改写"**：修复了一个真实缺陷 —— 调用方传入浅拷贝节点列表
+  （如 `{"model": backbone + head}`）时，就地改写会污染其原图（已加回归测试）；
 - 变体配置/卡片可落盘，卡片自动带出来源与许可证表格。
+
+### 已实现变体：SPAE-YOLOv8n（Sensors 2026, DOI 10.3390/s26113424）
+
+四个组件全部落地：SIoU（EP7）+ P2 浅层（EP0/EP5）+ ADown（EP1）+ Efficient_UAVDet（EP5）。
+取证笔记见 `variants/SPAE-YOLOv8n/paper-notes.md`（含原文摘录、完整消融表、**两处论文内部数据冲突**、
+以及"哪些是原文、哪些是推断"的逐项标注）。
+
+**实现过程中得到的三个关键设计结论：**
+
+1. **自定义检测头不能靠 YAML 改名**：ultralytics 的 `parse_model` 用精确类成员判断
+   （`m in {Detect, ...}`）给检测头追加输入通道 `ch`，子类不被识别。本库改为
+   **建模后模块手术**（`tod/engine/surgery.py`），既不改框架源码，还能复用末端 1×1 卷积的预训练权重。
+2. **ADown 只能按节点索引替换**：它对通道数有"一分为二"的隐含要求（输入通道必须为偶数），
+   全图 `Conv→ADown` 会破坏 neck/head，因此实现了 `replace_downsample(indices=...)`。
+3. **论文自身的数据需要交叉验证**：Table 3 的 x=32/64/128/256 反向确定了 P2 融合块应为 128 通道
+   （width=0.25 → 32），这同时验证了 P2 注入与检测头分组配置的一致性。
 
 ### 尚未完成（阻塞项）
 
-1. **训练环境未装**：本机只有 numpy + pyyaml，缺 torch / ultralytics。
-   且 `pip` 在 workspace-write 沙箱下无法写用户级 site-packages（需放宽权限或改用 venv 后申请一次）。
+1. **训练环境未装**：本机只有 numpy + pyyaml，缺 torch / ultralytics（用户正在建 conda 环境）。
+   环境就绪后 `tests/smoke.py` 与 `tests/test_modules.py` 的 SKIP 项会自动变为真实校验。
 2. **`inject_p2_head` 只覆盖直连式 P2 头**：完整 P2 双向融合 / BiFPN / AFPN 重拓扑属于 M1。
-3. **模块库为空**：`src/tod/modules/` 尚无模块，需按 §5 的 P0 清单逐项落地。
+3. **论文未说明的部分**：是否用预训练权重、§3.2 的 "feature calibration" 具体算子、
+   P2 拼接后的模块、检测头跨尺度是否共享权重 —— 均已在 paper-notes §5 标注为推断。
 
-### M0 剩余任务（下一步）
+### M1 剩余任务（下一步）
 
-- [ ] 用 Python 3.12 建 venv，安装 `torch`（CUDA 版）+ `ultralytics`，跑通真实模型构建（`tests/smoke.py` 的最后一项会从 SKIP 变为真实校验）
-- [ ] `tools/train.py` / `tools/val.py` / `tools/ablation.py`
-- [ ] 尺度分层评测（`src/tod/eval/`）：在上报中固定输出 `AP_small` / `AP_tiny` / 分层召回
-- [ ] 路线 1 基线：`YOLOv8n + P2 头 + imgsz=1280`，记录 AP/显存/延迟作为锚点
+- [ ] conda 环境装好后跑 `python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --dry-run`，
+      确认 P2 头 / ADown / Efficient_UAVDet 三处改造生效并记录参数量（论文换头 −0.6M 可作对照）
+- [ ] `tools/val.py` / `tools/ablation.py`
+- [ ] 尺度分层评测（`src/tod/eval/`）：固定输出 `AP_small` / `AP_tiny` / 分层召回
+- [ ] 路线 1 干净基线：`YOLOv8n + P2 + imgsz=640`，记录 AP/显存/延迟作为锚点
+- [ ] SPAE 四组件的单模块消融，复现论文的贡献排序（预期 P2 占绝对主导）

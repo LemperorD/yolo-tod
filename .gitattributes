@@ -1,0 +1,27 @@
+# 换行符策略
+#
+# 为什么必须显式声明：Windows 的 cmd 对 **LF-only 的 .bat 会解析异常**
+# （带 goto/标签的批处理可能死循环或跳过整段），而 Linux 对 CRLF 的 .sh
+# 会报 `bad interpreter: /bin/bash^M`。仓库里两者都要有，就必须由 git 统一。
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+*.sh    text eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.cfg   text eol=lf
+
+# 二进制资源不做换行转换
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.pdf   binary
+*.pt    binary
+*.onnx  binary

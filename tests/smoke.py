@@ -16,7 +16,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tod.compose import Variant, apply_type_map, inject_p2_head  # noqa: E402
+from tod.compose import (  # noqa: E402
+    Variant,
+    apply_type_map,
+    inject_p2_head,
+    replace_downsample,
+)
 from tod.registry import (  # noqa: E402
     EXTENSION_POINTS,
     RegistryError,
@@ -189,6 +194,10 @@ def test_inject_p2() -> None:
     inject_p2_head(flat, p2_idx=2)
     check("支持单一 model 列表形式", flat["model"][-1][0] == [24, 15, 18, 21])
 
+    # 回归测试：浅拷贝时节点对象是共享的，改造不得就地污染调用方的原图
+    check("浅拷贝输入不污染原图", YOLOV8_LIKE["head"][-1][0] == [15, 18, 21],
+          f"实际 {YOLOV8_LIKE['head'][-1][0]}")
+
 
 def test_type_map() -> None:
     import copy
@@ -200,6 +209,60 @@ def test_type_map() -> None:
     check("backbone Conv 全部替换", convs == 5, f"实际 {convs}")
     check("上采样全部替换", ups == 2, f"实际 {ups}")
     check("替换统计正确", cfg["_type_map_applied"]["Conv"] == 7)
+
+
+# ------------------------------------------------- 3b. 主干下采样替换 / P2 预处理
+
+
+def test_downsample_replacement() -> None:
+    import copy
+
+    cfg = copy.deepcopy(YOLOV8_LIKE)
+    replace_downsample(cfg, module="ADown", indices=[1, 3, 5, 7])
+
+    check("主干下采样替换 4 处", len(cfg["_downsample_replaced"]) == 4,
+          f"实际 {cfg['_downsample_replaced']}")
+    check("索引 1（P2/4）已替换", cfg["backbone"][1][2] == "ADown")
+    check("索引 3/5/7 已替换",
+          [cfg["backbone"][i][2] for i in (3, 5, 7)] == ["ADown"] * 3)
+    check("索引 0 的 stem 未被替换（输入通道为奇数）", cfg["backbone"][0][2] == "Conv")
+    check("索引 2 的 C2f 未被替换", cfg["backbone"][2][2] == "C2f")
+    check("head 段未被误伤", all(n[2] != "ADown" for n in cfg["head"]))
+
+    replace_downsample(cfg, module="ADown", indices=[1, 3, 5, 7])
+    check("重复替换幂等", cfg["backbone"][1][2] == "ADown")
+
+
+def test_p2_pre_node() -> None:
+    import copy
+
+    cfg = copy.deepcopy(YOLOV8_LIKE)
+    inject_p2_head(cfg, p2_idx=2, p2_channels=128, p2_pre=["Conv", [128, 1, 1]])
+    head = cfg["head"]
+
+    check("head 长度 +4（含 P2 预处理）", len(head) == len(YOLOV8_LIKE["head"]) + 4)
+    check("P2 侧 1x1 预处理节点已插入", head[12][0] == 2 and head[12][2] == "Conv"
+          and head[12][3] == [128, 1, 1], f"实际 {head[12]}")
+    check("上采样取自 P3 节点", head[13][0] == 15 and head[13][2] == "nn.Upsample")
+    check("Concat 拼接预处理输出（全局索引 22）", head[14][0] == [-1, 22],
+          f"实际 {head[14][0]}")
+    check("融合块为 Concat 的下一个节点", head[15][2] == "C2f" and head[15][3] == [128])
+    check("Detect 输入为 [25, 15, 18, 21]", head[16][0] == [25, 15, 18, 21],
+          f"实际 {head[16][0]}")
+    check("P2 通道记录正确", cfg["_p2_channels"] == 128)
+
+
+def test_from_spec_roundtrip() -> None:
+    v = (Variant("RoundTrip", base="yolov8n", tags=["rt"], notes="说明")
+         .upsample("_Dummy")
+         .head("Efficient_UAVDet", per_group=16)
+         .loss(box="_Dummy")
+         .model(add_p2=True, p2_channels=128)
+         .train(epochs=1))
+    data = v.spec()
+    restored = Variant.from_spec(data)
+    check("from_spec 往返一致", restored.spec() == data,
+          f"\n{restored.spec()}\n!=\n{data}")
 
 
 # ------------------------------------------------------------ 4. 可选：真模型
@@ -220,9 +283,17 @@ def test_real_model_if_available() -> None:
     detect = (cfg.get("head") or cfg.get("model"))[-1]
     check("真实图 P2 头注入成功", len(detect[0]) == 4)
 
+    # 检测头不做 YAML 改名，而是记录为建模后手术
+    cfg2 = (Variant("RealHead", base="yolov8n")
+            .head("Efficient_UAVDet").model(nc=10, add_p2=True).model_yaml(write=False))
+    check("检测头记录为建模后手术", cfg2.get("_head_surgery") == "Efficient_UAVDet")
+    check("YAML 中检测头仍是原生 Detect",
+          str((cfg2.get("head") or cfg2.get("model"))[-1][2]) == "Detect")
+
 
 def main() -> int:
     tests = [test_registry, test_compose, test_inject_p2, test_type_map,
+             test_downsample_replacement, test_p2_pre_node, test_from_spec_roundtrip,
              test_real_model_if_available]
     for fn in tests:
         fn()

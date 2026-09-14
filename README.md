@@ -3,11 +3,13 @@
 收集、复现并**可归因地**对比针对小目标检测（Tiny/Small Object Detection）的 YOLO 魔改。
 完整方案见 [`PLAN.md`](PLAN.md)：架构设计、值得收录的魔改清单、优先级、评测协议。
 
-**当前状态：M0 骨架已完成（51 项冒烟检查全绿）；首个变体 SPAE-YOLOv8n 已实现，待环境就绪后验证。**
+**当前状态：M0 骨架已完成（51 项冒烟检查全绿）；首个变体 SPAE-YOLOv8n 已实现，待环境就绪后验证。
+推理端（C++/TensorRT）工厂化骨架已落地：`src/todrt/`，CPU 自检 107 项全绿。**
 
 - 主干框架：**ultralytics**（AGPL-3.0）
 - 第一主战场：**VisDrone2019-DET**（航拍小目标）
 - 本机：RTX 5060 Laptop **8 GB** ／ Python 3.14.5 → 建议另建 **Python 3.12** 虚拟环境
+- 部署端：**Linux + TensorRT 10.x**（Jetson Orin 优先，DLA + FP16）；见 [`docs/DEPLOY.md`](docs/DEPLOY.md)
 
 ## 已实现的变体
 
@@ -85,7 +87,7 @@ v.card("variants/visdrone-yolov8n-p2-dysample-nwd/card.md")
 ## 目录
 
 ```
-src/tod/
+src/tod/            训练侧（Python）
 ├─ registry.py      魔改注册表（强制元数据）
 ├─ compose.py       变体 DSL + 模型图改造（P2 注入 / 下采样替换 / 类型替换）
 ├─ compat.py        唯一触碰 ultralytics 内部的地方
@@ -95,11 +97,48 @@ src/tod/
 │  └─ head/efficient_uavdet.py Efficient_UAVDet（EP5）
 ├─ loss/box.py + criterion.py  SIoU 与训练准则接入（EP7）
 └─ engine/trainer.py + surgery.py  自定义 Trainer 与检测头"建模后手术"
+
+src/todrt/          部署侧（C++17 / TensorRT）—— 与 src/tod 并列，可独立复用
+├─ include/todrt/   core（注册表）/ json / modules / factory / backend
+├─ src/models/      ★ 变体配方（一个变体一个文件，两行宏）
+├─ src/             factory / preprocess / decode / nms / config_io
+├─ src/backend/     TensorRT 引擎构建与执行（无 TRT 时走 stub）
+├─ apps/todrt_cli   部署工具（list/info/dryrun/probe/bench/run）
+└─ tests/cpp_smoke  架构自检（**不需要 GPU**，107 项）
+
 configs/_base_/     数据集等基础配置
+configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 C++ 的唯一契约）
 variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
-tools/              make_variant.py / train.py / catalog.py
+tools/              make_variant.py / train.py / catalog.py / export_onnx.py
+docs/DEPLOY.md      部署流程与硬件加速（DLA / FP16 / INT8）说明
 tests/              smoke.py（无 torch 依赖，51 项）+ test_modules.py（形状/换头/端到端）
 ```
+
+## 部署（推理端）
+
+```powershell
+# 导出 ONNX + 部署配置（需要 torch/ultralytics）
+python tools\export_onnx.py --variant variants\SPAE-YOLOv8n\variant.yaml `
+    --weights results\SPAE-YOLOv8n\weights\best.pt --imgsz 640 `
+    --deploy-config configs\deploy\spae-yolov8n.json
+```
+
+```bash
+# 实机（Linux/Jetson）：构建 + 自检 + 实测
+cmake -S src/todrt -B src/todrt/build -DTODRT_WITH_TENSORRT=ON && cmake --build src/todrt/build -j
+./src/todrt/build/todrt_cli probe                              # 看 TensorRT 版本 / DLA core 数
+./src/todrt/build/todrt_cli dryrun configs/deploy/xxx.json     # 配置装配自检（不需要 GPU）
+./src/todrt/build/todrt_cli bench  configs/deploy/xxx.json sample.ppm 200
+```
+
+调用方只有两行：
+
+```cpp
+auto det = todrt::Detector::CreateFromFile("configs/deploy/xxx.json");
+auto results = det->Run(bgr_image);          // 坐标已是原图像素
+```
+
+详见 [`docs/DEPLOY.md`](docs/DEPLOY.md) 与 [`src/todrt/README.md`](src/todrt/README.md)（工厂模式的设计说明）。
 
 ## 下一步（M1）
 
@@ -110,4 +149,14 @@ tests/              smoke.py（无 torch 依赖，51 项）+ test_modules.py（�
 3. 把 SPAE 的四个组件做单模块消融（`v.without(...)`），复现论文的贡献排序；
 4. 再按 `PLAN.md §5` 的 P0 清单补模块（SAHI、Copy-Paste、SPD-Conv、BiFPN/ASFF、NWD…）。
 
+部署侧（`src/todrt/`）待实机验证的清单：
+
+- [ ] 在 Orin 上跑 `todrt_cli probe`，记录 TensorRT 版本与 DLA core 数；
+- [ ] `dryrun` 一份真实部署配置，确认 anchor 数、strides、layout 与导出图一致；
+- [ ] 构建 FP16 engine，`bench` 出「推理 / 后处理 / 端到端」三段延迟，
+      判断瓶颈在哪一段（小目标变体经常卡在后处理，因为 P2 头有 25600 个 anchor）；
+- [ ] 开 DLA（`--preset=orin`）后对比层分布：DLA 层数、GPU 回退层是哪几层；
+- [ ] 复测 ONNX / FP16 / INT8 / DLA 四档的 `AP_small`（**不能只看 FPS**）。
+
 > 注意：`PLAN.md §11.1` 记录了 8 GB 显存下的分辨率/batch 约束，不要一上来就用 1536。
+> 部署端只能验证延迟与吞吐，**精度必须回到训练侧评测协议**（`PLAN.md §7`）。

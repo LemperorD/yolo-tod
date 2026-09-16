@@ -11,5 +11,6 @@
 """
 
 # 导入即注册。集中列在这里，保证 ``import tod.modules`` 能拿到全部零件。
+from tod.modules.attention import dual_attention  # noqa: F401
 from tod.modules.conv import adown  # noqa: F401
 from tod.modules.head import efficient_uavdet  # noqa: F401

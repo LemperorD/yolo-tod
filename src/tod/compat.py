@@ -9,13 +9,20 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 from functools import lru_cache
 from pathlib import Path
 
 FRAMEWORK = "ultralytics"
 #: 本库开发/验证所基于的框架版本区间。
 MIN_VERSION = "8.2.0"
-MAX_TESTED_VERSION = "8.3.999"
+#: 8.4 起：``BboxLoss.forward`` 追加 imgsz/stride、检测头支持 ``end2end``（NMS-free）、
+#: 训练器自带 ``MuSGD``、TAL 自带小目标先验（STAL）。SDD-YOLO 依赖这些能力，
+#: 故本地实测区间上探到 8.4（见 variants/SDD-YOLO26n/paper-notes.md §框架依赖）。
+MAX_TESTED_VERSION = "8.4.999"
+
+#: 仓库根目录（``src/tod/compat.py`` → 上溯三级）。
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class CompatError(RuntimeError):
@@ -29,6 +36,58 @@ def installed() -> bool:
     return importlib.util.find_spec(FRAMEWORK) is not None
 
 
+def _default_user_config_dir() -> Path:
+    """复刻 ultralytics 的默认用户配置目录，且**不 import 框架**。
+
+    框架在 ``ultralytics.utils.get_user_config_dir()`` 里用同样规则取路径，
+    并在 import 阶段就 ``mkdir`` 它——所以不能靠 ``import`` 来探路。
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "Ultralytics"
+
+
+def _writable(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".tod_write_probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def ensure_runtime_env() -> str | None:
+    """保证 ultralytics 能拿到一个可写的用户配置目录。
+
+    为什么必须放在 ``import ultralytics`` 之前：框架 import 期就会
+    ``mkdir`` 用户配置目录，目录不可写时抛的是 ``PermissionError``（不是
+    ``ImportError``），调用方无法用常规的 try/except 兜住，整个进程直接死掉。
+    在受限环境（只读 HOME / 文件沙箱）里，这里把 ``YOLO_CONFIG_DIR`` 改指到
+    仓库内 ``.cache/ultralytics``（已 gitignore），让框架正常工作。
+
+    Returns:
+        回退生效时返回新的配置目录，否则返回 None。
+    """
+    current = os.environ.get("YOLO_CONFIG_DIR")
+    if current and _writable(Path(current)):
+        return None
+    target = _default_user_config_dir()
+    if _writable(target):
+        return None
+    fallback = REPO_ROOT / ".cache" / "ultralytics"
+    if not _writable(fallback):
+        raise CompatError(
+            f"ultralytics 配置目录不可写：默认 {target}，回退 {fallback} 也不可写。"
+            "请设置环境变量 YOLO_CONFIG_DIR 指向一个可写目录。"
+        )
+    os.environ["YOLO_CONFIG_DIR"] = str(fallback)
+    return str(fallback)
+
+
 def version() -> str:
     """返回 ultralytics 版本号；未安装时抛 CompatError。"""
     if not installed():
@@ -38,6 +97,7 @@ def version() -> str:
             "  pip install -e .[dev]\n"
             "注意：本机 Python 3.14 下 torch 轮子可能不可用，建议用 3.11/3.12。"
         )
+    ensure_runtime_env()
     import ultralytics
 
     return getattr(ultralytics, "__version__", "unknown")
@@ -69,6 +129,7 @@ def assert_supported() -> str:
 @lru_cache(maxsize=1)
 def _tasks():
     """缓存 ``ultralytics.nn.tasks`` 模块对象。"""
+    ensure_runtime_env()
     import ultralytics.nn.tasks as tasks
 
     return tasks
@@ -90,6 +151,7 @@ def cfg_root() -> Path:
     """ultralytics 内置配置目录（内含 models/ 与 datasets/）。"""
     if not installed():
         raise CompatError("未安装 ultralytics。")
+    ensure_runtime_env()
     import ultralytics
 
     return Path(ultralytics.__file__).parent / "cfg"
@@ -131,6 +193,7 @@ def base_conv():
     """
     if not installed():
         raise CompatError("未安装 ultralytics，无法获取基础 Conv 类。")
+    ensure_runtime_env()
     for mod_path in ("ultralytics.nn.modules.conv",
                      "ultralytics.nn.modules",
                      "ultralytics.nn.modules.block"):

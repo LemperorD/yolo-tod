@@ -6,6 +6,9 @@ __pycache__/
 build/
 dist/
 
+# ultralytics 用户配置目录的回退位置（只读 HOME / 沙箱下由 tod.compat 指向这里）
+.cache/
+
 # 数据与权重（体积大，不入库）
 data/
 datasets/

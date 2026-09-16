@@ -3,9 +3,13 @@
 收集、复现并**可归因地**对比针对小目标检测（Tiny/Small Object Detection）的 YOLO 魔改。
 完整方案见 [`PLAN.md`](PLAN.md)：架构设计、值得收录的魔改清单、优先级、评测协议。
 
-**当前状态：M0 骨架已完成（`tests/smoke.py` 63 项全绿，`tests/test_modules.py` 86 项全绿）；
-两个论文级变体已实现 —— SPAE-YOLOv8n（VisDrone 待验证）与 SDD-YOLO26n（结构自检已通过，训练待跑）。
-推理端（C++/TensorRT）工厂化骨架已落地：`src/todrt/`，CPU 自检 107 项全绿。**
+**当前状态：M0 骨架已完成（`tests/smoke.py` 66 项全绿，`tests/test_modules.py` 105 项全绿）；
+两个论文级变体已实现 —— SPAE-YOLOv8n 与 SDD-YOLO26n（结构自检全通）；
+训练回路已用**合成数据**端到端跑通（`tests/train_smoke.py`：训练/验证/EMA/存权重/载权重/推理），
+并补齐了**尺度分层评测**（`tools/val.py`：整体 AP + AP_small/AP_tiny）与
+**消融流水线**（`tools/ablation.py`：leave-one-out + 逐字段 diff + 汇总表）。
+真实数据集上的精度数字待 M1。推理端（C++/TensorRT）工厂化骨架已落地：
+`src/todrt/`，CPU 自检 107 项全绿。**
 
 - 主干框架：**ultralytics**（AGPL-3.0；本库实测区间 8.2 → **8.4**，8.4 才自带
   `end2end`/`MuSGD`/TAL 小目标先验，SDD-YOLO 依赖这三项）
@@ -129,6 +133,7 @@ src/tod/            训练侧（Python）
 ├─ assigner/stal.py  STAL 小目标感知分配（EP6，可消融开关）
 ├─ optim/musgd.py    MuSGD（EP9，Muon 式 NS 正交化 + SGD 分量）
 ├─ loss/box.py + criterion.py  SIoU / Wise-IoU v3 与训练准则接入（EP7）
+├─ eval/scales.py    尺度分层评测（整体 AP + AP_small/AP_tiny，COCO 式 101 点插值）
 └─ engine/           trainer.py（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
                     / distill.py（EP9 特征对齐蒸馏）
 
@@ -144,10 +149,39 @@ src/todrt/          部署侧（C++17，四个后端可选）—— 与 src/tod 
 configs/_base_/     数据集等基础配置
 configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 C++ 的唯一契约）
 variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
-tools/              make_variant.py / train.py / catalog.py / export_onnx.py / convert_rknn.py
+tools/              make_variant.py / train.py / val.py / ablation.py / catalog.py
+                    / make_dummy_dataset.py / export_onnx.py / convert_rknn.py
 docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
-tests/              smoke.py（无 torch 依赖，63 项）+ test_modules.py（形状/数值/手术/蒸馏/端到端，86 项）
+docs/VARIANTS.md    模块总表（由 tools/catalog.py 自动生成）
+tests/              smoke.py（无 torch 依赖，66 项）+ test_modules.py（形状/数值/手术/蒸馏/
+                    优化器/评测/端到端，105 项）+ train_smoke.py（合成数据跑真训练，opt-in）
 ```
+
+## 评测与消融（可归因对比）
+
+```powershell
+# 0) 合成数据集：几秒钟造一份"训练回路自检"数据（离线、确定性）
+python tools\make_dummy_dataset.py --out tests\.tmp\tiny-detect
+
+# 1) 训练回路自检：真训练 + 验证 + 存/载权重 + 推理（1–2 分钟）
+python tests\train_smoke.py --epochs 2 --device 0
+
+# 2) 尺度分层评测：整体 AP **与** AP_small / AP_tiny 一起报（只看整体会掩盖小目标退化）
+python tools\val.py --variant variants\SDD-YOLO26n\variant.yaml `
+    --weights results\SDD-YOLO26n\weights\best.pt `
+    --data configs\_base_\datasets\visdrone2019-det.yaml --imgsz 1024 `
+    --json variants\SDD-YOLO26n\results.json
+
+# 3) 消融流水线：先看网格与逐字段 diff（秒级、不训练），确认无误再真跑
+python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py --plan
+python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py `
+    --data configs\_base_\datasets\visdrone2019-det.yaml --epochs 100 --imgsz 1024 --batch 4
+```
+
+> 消融的两条硬规矩（都写进了代码）：① 组件的"关掉"动作不能一律用 `without` ——
+> 由**框架继承**来的能力（STAL / MuSGD）删键只会退回框架默认（8.4 的默认 TAL 本身就带
+> 小目标先验），必须显式切到经典替代物；② `v.without()` 覆盖 EP、model、train 三段，
+> 并会自动识别"剔掉的键本来就是默认值"这种假消融。
 
 ## 部署（推理端）
 
@@ -193,11 +227,10 @@ auto results = det->Run(bgr_image);          // 坐标已是原图像素
 ## 下一步（M1）
 
 1. 准备 VisDrone，跑通「YOLOv8n + P2 + imgsz=640」与「YOLO26n + P2 + imgsz=1024」两条**干净基线**
-   作为锚点（后者的结构自检已通过：2.50 M 参数、nl=4、stride=[4,8,16,32]）；
-2. 单模块消融（`v.without(...)`）：SPAE 复现论文的贡献排序；
-   SDD 则补齐论文 Table 3 **捆绑在一起**的 `¬DFL / NMS-free / MuSGD / STAL` 四列各自贡献；
-3. 验证 SDD 的三项"底座自带"能力在真实训练中的行为：ProgLoss 的 O2M 权重衰减、
-   STAL 对小目标召回的影响、MuSGD 与 SGD/AdamW 的收敛对比；
+   作为锚点（后者的结构自检已通过：2.50 M 参数、nl=4、stride=[4,8,16,32]；训练回路已用合成数据验证）；
+2. 用 `tools/ablation.py` 做单模块消融：SPAE 复现论文贡献排序；
+   SDD 补齐论文 Table 3 **捆绑在一起**的 `¬DFL / NMS-free / MuSGD / STAL` 四列各自贡献；
+3. 用 `tools/val.py` 统一上报整体 AP 与 `AP_small`/`AP_tiny`（含 3 个 seed 的重复性检查）；
 4. 再按 `PLAN.md §5` 的 P0 清单补模块（SAHI、Copy-Paste、SPD-Conv、BiFPN/ASFF、NWD…）。
 
 部署侧（`src/todrt/`）待实机验证的清单：

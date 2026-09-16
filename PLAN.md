@@ -561,7 +561,7 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ## 12. 落地进展
 
-### M0 架构层（已完成，`python tests/smoke.py` 63 项 + `python tests/test_modules.py` 86 项检查全绿）
+### M0 架构层（已完成，`python tests/smoke.py` 66 项 + `python tests/test_modules.py` 105 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
@@ -577,8 +577,11 @@ planned → reproducing → reproduced → (promoted | dropped)
 | `src/tod/optim/musgd.py` | **MuSGD**（Muon 式 Newton–Schulz + SGD 分量，优先框架原生）（EP9） | ✅ |
 | `src/tod/engine/distill.py` | **特征对齐蒸馏** P2–P5 逐层 KL（EP9，SDD-YOLO 式 6/7） | ✅ |
 | `src/tod/modules/head/efficient_uavdet.py` | **Efficient_UAVDet** 轻量检测头，两组通道策略（EP5） | ✅ |
-| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**63 项**） | ✅ |
-| `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 端到端建图测试（需 torch，**86 项**） | ✅ |
+| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**66 项**） | ✅ |
+| `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 评测 / 端到端建图测试（需 torch，**105 项**） | ✅ |
+| `src/tod/eval/scales.py` + `tools/val.py` | 尺度分层评测（整体 AP + `AP_small`/`AP_tiny`，COCO 式 AP 与 ignore 语义） | ✅ |
+| `tools/ablation.py` | 消融流水线（leave-one-out、逐字段 diff、假消融识别、汇总 csv/md） | ✅ |
+| `tools/make_dummy_dataset.py` + `tests/train_smoke.py` | 合成数据集 + 训练回路自检（真训练/验证/EMA/存载权重/推理） | ✅ |
 | `tools/make_variant.py` / `train.py` / `catalog.py` | 变体物化、训练入口（含 `--dry-run` 结构自检）、文档生成 | ✅ |
 | `variants/SPAE-YOLOv8n/` | 变体 1：`recipe.py` + `variant.yaml` + `model.yaml` + `card.md` + `paper-notes.md` | ✅ |
 | `variants/SDD-YOLO26n/` | 变体 2：同上（+ 论文矛盾/推断清单、本库实测数据表） | ✅ |
@@ -633,21 +636,30 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ### 尚未完成（阻塞项）
 
-1. **精度类数字尚未产生**：本机训练环境（Python 3.13 + torch 2.11 + ultralytics 8.4.60 + RTX 5060 8 GB）
-   刚刚可用，SPAE/SDD 的首轮训练与消融属于 M1；当前所有"验证"都是**结构与数值级**的。
+1. **精度类数字尚未产生**：训练回路已用合成数据跑通（`tests/train_smoke.py`）并补齐了
+   尺度分层评测与消融流水线，但 VisDrone 上的真实基线/消融仍属 M1；
+   当前所有"验证"都是**结构、数值与流水线级**的。
 2. **`inject_p2_head` 只覆盖直连式 P2 头**：完整 P2 双向融合 / BiFPN / AFPN 重拓扑属于 M1。
 3. **论文未说明的部分**：SPAE 的 "feature calibration"、SDD 的 STAL 公式与 KD 锚点归一化、
    是否用预训练权重、epoch/batch 设置 —— 均已在各自 paper-notes 里标注为推断。
 4. **换头在不同主干上的压缩程度不同**：YOLOv8 系的分类分支 stem 是 2 层卷积（与论文一致），
    而 YOLO26 系（非 legacy）是 `DWConv+Conv` 嵌套两块 = 4 层 —— 本库换头仍只放两层分组卷积，
    在 YOLO26 上属"更激进压缩"。替换前的层数已由 `describe()` / `--dry-run` 输出，便于核对。
+5. **受限沙箱下跑不了真训练**：ultralytics 的标签缓存用 `multiprocessing.Pool`
+   （Windows 上是命名管道），在文件沙箱会话里会 `PermissionError [WinError 5]`。
+   这不是本库的 bug，但 CI 若要跑 `train_smoke.py` / `ablation.py` 需要放开该限制。
 
 ### M1 剩余任务（下一步）
 
-- [ ] `tools/val.py` / `tools/ablation.py`
-- [ ] 尺度分层评测（`src/tod/eval/`）：固定输出 `AP_small` / `AP_tiny` / 分层召回
+- [x] `src/tod/eval/` 尺度分层评测：整体 AP + `AP_small` / `AP_tiny`（COCO 式 101 点插值，
+      含两处口径细节：命中层外 GT 按 ignore 语义忽略、零预测类别计 0 分）
+- [x] `tools/val.py`：评测入口（表格 + results.json，带 git commit 与权重 mtime）
+- [x] `tools/ablation.py`：消融流水线（leave-one-out、逐字段 diff、假消融识别、汇总 csv/md）
+- [x] 训练回路自检：`tools/make_dummy_dataset.py` + `tests/train_smoke.py`
+      → 真训练/验证/EMA/存载权重/推理全通（`dfl_loss` 恒为 0，证明无 DFL 分支真的生效）
 - [ ] 路线 1 干净基线：`YOLOv8n + P2 + imgsz=640`，记录 AP/显存/延迟作为锚点
 - [ ] 路线 2 干净基线：`YOLO26n + P2 + imgsz=1024`（SDD 的锚点；结构自检已通过）
 - [ ] SPAE 四组件的单模块消融，复现论文的贡献排序（预期 P2 占绝对主导）
 - [ ] SDD 补齐论文 Table 3 捆在一起的四列消融：`¬DFL / NMS-free / MuSGD / STAL` 各自贡献
 - [ ] SDD 打开蒸馏（需本地 YOLO26x 权重或更小的教师）验证 λ=0.5/T=3.0 的增益
+- [ ] 评测协议落实：3 个 seed × 同协议，报 `AP_small` 的同时给重复性（PLAN §7.4）

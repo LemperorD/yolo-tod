@@ -255,9 +255,12 @@ Conv），包在外面会顺带改动颈部聚合 —— 那既不是论文说�
 | KD 项量级（λ=0.5, T=3.0, 均值口径） | KD ≈ 0.44 vs `L_task` ≈ 22.8 | `test_modules.py::test_kd` |
 | 式 (6) 一致性 | criterion 11.617682 vs `0.5·L_task+0.5·L_KD` 11.617683 | 同上 |
 | 双注意力开销 | +11,786 参数、+0.04 GFLOPs | §5-2 表 |
+| **训练回路（合成数据）** | 2 epoch 跑通训练/验证/EMA/存权重；`results.csv` 的 `dfl_loss` **恒为 0**（§4.3 的无 DFL 真的生效）；best.pt 5.4 MB 可在**新进程**载入并推理 | `python tests/train_smoke.py --epochs 2 --device 0` |
+| **消融流水线（合成数据）** | `without-DualAttention` 2,484,688 vs baseline 2,496,474 参数（**−11,786**，正是注意力开销）；`--plan` 秒级产出 7 份配置并打印逐字段 diff | `python tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan` |
+| 尺度分层评测 | `tools/val.py` 在训练出的 best.pt 上跑通：整体与 <8 / 8-16 / 16-32 / 32-96 / ≥96 px 五层 AP 同时给出，并写 results.json（带 git commit） | `python tools/val.py --weights <best.pt> --data <dataset.yaml>` |
 
-> 精度类数字（mAP / AP_small / 延迟）**尚未产生**：本机训练环境刚刚可用，
-> 首次训练与消融属于 M1 任务（见 PLAN.md §12）。
+> 精度类数字（mAP / AP_small / 延迟）**尚未产生**：合成数据上的 AP 恒为 0，不构成任何结论；
+> 真实数据（VisDrone）上的基线、消融与重复性属于 M1（见 PLAN.md §12）。
 
 ---
 
@@ -285,17 +288,34 @@ python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
 python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml `
     --data configs\_base_\datasets\visdrone2019-det.yaml
 
-# 4) 单模块与数值验证
+# 3b) 没有数据集时：先跑合成数据的训练回路自检（1–2 分钟）
+python tools\make_dummy_dataset.py --out tests\.tmp\tiny-detect
+python tests\train_smoke.py --epochs 2 --device 0
+
+# 4) 评测（整体 AP **与** AP_small / AP_tiny 一起报）与消融
+python tools\val.py --weights results\SDD-YOLO26n\weights\best.pt `
+    --data configs\_base_\datasets\visdrone2019-det.yaml --imgsz 1024 `
+    --json variants\SDD-YOLO26n\results.json
+python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py --plan   # 先看网格
+python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py `
+    --data configs\_base_\datasets\visdrone2019-det.yaml --epochs 100 --imgsz 1024
+
+# 5) 单模块与数值验证
 python tests\smoke.py            # 无 torch 依赖的架构检查
-python tests\test_modules.py     # 形状 / 数值 / 手术 / 蒸馏 / 优化器
+python tests\test_modules.py     # 形状 / 数值 / 手术 / 蒸馏 / 优化器 / 评测
 ```
 
 **消融怎么开**（对应论文 Table 3 的列）：
 
 ```python
 v.without("wiou")             # 回到框架默认 IoU 项 → 论文的 ¬DFL 列近似
-v.assigner("TAL")             # 关掉 STAL 的小目标放宽
+v.assigner("TAL", small_target_aware=False)   # 关掉 STAL 的小目标放宽（显式切经典 TAL）
 v.strategy(optimizer="SGD")   # 关掉 MuSGD
 v.without("DualAttention")    # 去掉双注意力
 v.without("C3")               # 换掉 P2 的融合块
+v.without("add_p2")           # 去掉 P2 头（论文主贡献）
 ```
+
+> ⚠️ STAL / MuSGD 这类**由底座继承**的能力，不能靠"删掉配置键"来消融：
+> 删键只会退回框架默认，而 8.4 的默认 TAL 本身就带小目标先验 —— 那样得到的
+> "消融"其实没关掉任何东西。`tools/ablation.py` 的 `ABLATION_ACTIONS` 专门处理这件事。

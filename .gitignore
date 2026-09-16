@@ -21,6 +21,9 @@ datasets/
 results/*
 !results/.gitkeep
 
+# ultralytics 的默认输出目录（project 写相对路径时会落到这里）
+runs/
+
 # 测试临时产物
 tests/.tmp/
 

@@ -32,8 +32,20 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--batch", type=int, default=None)
     ap.add_argument("--device", default=None, help="如 0 或 cpu")
     ap.add_argument("--name", default=None, help="实验名，默认用变体 id")
+    ap.add_argument("--set", action="append", default=[], metavar="K=V",
+                    help="覆盖任意训练参数（可重复），如 --set workers=0 --set plots=False")
     ap.add_argument("--dry-run", action="store_true", help="只建模型并前向一次，不训练")
     return ap
+
+
+def _coerce(text: str):
+    """把 ``--set`` 的字符串值转成 int/float/bool/None，失败则原样保留字符串。"""
+    import ast
+
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return text
 
 
 def main() -> int:
@@ -122,6 +134,12 @@ def main() -> int:
         return 0
 
     train_args = dict(spec.get("train") or {})
+    for item in args.set:                      # --set k=v 覆盖（消融/自检常用）
+        if "=" not in item:
+            raise SystemExit(f"--set 需要 K=V 形式，收到 {item!r}")
+        key, value = item.split("=", 1)
+        train_args[key.strip()] = _coerce(value.strip())
+
     data = args.data or _default_data(variant.dataset)
     if data is not None:
         train_args["data"] = str(data)
@@ -131,7 +149,11 @@ def main() -> int:
             "或在变体配置里写 data.dataset。"
         )
 
-    train_args.setdefault("project", str(ROOT / "results"))
+    # 实验输出目录：变体里写的可能是相对路径（如 "results"），必须锚到仓库根，
+    # 否则 ultralytics 会把它解析成 runs/detect/results/...（散落在仓库里）
+    project = train_args.get("project")
+    if not project or not Path(str(project)).is_absolute():
+        train_args["project"] = str(ROOT / (str(project) if project else "results"))
     train_args["name"] = args.name or variant.name
     for key, value in (("epochs", args.epochs), ("imgsz", args.imgsz),
                        ("batch", args.batch), ("device", args.device)):

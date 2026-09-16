@@ -89,16 +89,26 @@ def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt, eps=1e-9):
 
 
 def small_target_assigner_class(small_target_aware: bool = True) -> type:
-    """构造（并缓存）STAL 分配器类：框架 ``TaskAlignedAssigner`` 的子类。"""
+    """构造（并缓存）STAL 分配器类：框架 ``TaskAlignedAssigner`` 的子类。
+
+    动态类必须**同时挂到模块全局名**上：准则会被写进 checkpoint（``torch.save``），
+    pickle 需要按限定名 ``tod.assigner.stal.SmallTargetAssigner`` 反查类；
+    只放在 ``_CLASSES`` 字典里会在训练末保存权重时报
+    ``PicklingError: Can't pickle <class ...>: attribute lookup ... failed``
+    ——这是"跑通一次真训练"才发现的问题，单模块测试覆盖不到。
+    """
     key = bool(small_target_aware)
     if key not in _CLASSES:
         base = tal_assigner()
         name = "SmallTargetAssigner" if key else "ClassicTALAssigner"
-        _CLASSES[key] = type(
+        cls = type(
             name,
             (base,),
             {"small_target_aware": key, "select_candidates_in_gts": select_candidates_in_gts},
         )
+        cls.__module__ = __name__
+        globals()[name] = cls          # 供 pickle 反查（见 docstring）
+        _CLASSES[key] = cls
     return _CLASSES[key]
 
 

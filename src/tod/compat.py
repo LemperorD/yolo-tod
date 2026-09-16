@@ -219,6 +219,30 @@ def framework_has(name: str) -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def tal_assigner():
+    """框架的 ``TaskAlignedAssigner``（EP6 的基类）。
+
+    导入路径在历史版本里变动过（``ultralytics.utils.tal`` → 有时被再导出到
+    ``ultralytics.utils``），按可靠性依次尝试，失败时给出可操作的报错。
+    """
+    if not installed():
+        raise CompatError("未安装 ultralytics，无法获取 TaskAlignedAssigner。")
+    ensure_runtime_env()
+    for mod_path in ("ultralytics.utils.tal", "ultralytics.utils"):
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:  # pragma: no cover
+            continue
+        cls = getattr(mod, "TaskAlignedAssigner", None)
+        if cls is not None:
+            return cls
+    raise CompatError(
+        "未能在 ultralytics 中找到 TaskAlignedAssigner，"
+        "框架结构可能已变更，请检查 src/tod/compat.py。"
+    )
+
+
 def dump_yaml(data: dict, path: str | Path) -> Path:
     try:
         import yaml

@@ -27,6 +27,7 @@ def import_modules() -> None:
     模块文件依赖 torch；环境未就绪时总表会缺条目（这是环境问题，不是 bug）。
     """
     try:
+        import tod.assigner  # noqa: F401
         import tod.loss  # noqa: F401
         import tod.modules  # noqa: F401
         import tod.optim  # noqa: F401

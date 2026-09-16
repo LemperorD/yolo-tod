@@ -230,6 +230,19 @@ class Variant:
             cfg["nc"] = self.model_cfg["nc"]
         if scale:
             cfg["scale"] = scale
+            # 为什么要把所选规模排到 scales 的**第一位**：
+            # ultralytics 的 ``yaml_model_load`` 会用**文件名**猜规模
+            # （``guess_model_scale`` 只认 yolo<数字><nsmlx> 这种名字），我们生成的
+            # 文件叫 model.yaml，猜不出来 → ``d["scale"] = ""``，YAML 里写的 scale
+            # 被覆盖；``parse_model`` 于是退化为 ``next(iter(scales.keys()))``。
+            # 对 yolov8n/yolo26n 恰好等于 'n' 所以一直没暴露，换成 s/m/l/x 就会
+            # **静默建错规模的模型**。把所选规模放首位即可彻底消除这个隐患。
+            scales = cfg.get("scales")
+            if isinstance(scales, dict) and scale in scales:
+                cfg["scales"] = {
+                    scale: scales[scale],
+                    **{k: v for k, v in scales.items() if k != scale},
+                }
 
         # ---- 1) 结构：主干下采样替换 ----
         ds_module = self.model_cfg.get("downsample") or self.eps.get("EP1", {}).get("downsample")

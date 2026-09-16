@@ -561,7 +561,7 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ## 12. 落地进展
 
-### M0 架构层（已完成，`python tests/smoke.py` 63 项 + `python tests/test_modules.py` 71 项检查全绿）
+### M0 架构层（已完成，`python tests/smoke.py` 63 项 + `python tests/test_modules.py` 86 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
@@ -578,7 +578,7 @@ planned → reproducing → reproduced → (promoted | dropped)
 | `src/tod/engine/distill.py` | **特征对齐蒸馏** P2–P5 逐层 KL（EP9，SDD-YOLO 式 6/7） | ✅ |
 | `src/tod/modules/head/efficient_uavdet.py` | **Efficient_UAVDet** 轻量检测头，两组通道策略（EP5） | ✅ |
 | `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**63 项**） | ✅ |
-| `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 端到端建图测试（需 torch，**71 项**） | ✅ |
+| `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 端到端建图测试（需 torch，**86 项**） | ✅ |
 | `tools/make_variant.py` / `train.py` / `catalog.py` | 变体物化、训练入口（含 `--dry-run` 结构自检）、文档生成 | ✅ |
 | `variants/SPAE-YOLOv8n/` | 变体 1：`recipe.py` + `variant.yaml` + `model.yaml` + `card.md` + `paper-notes.md` | ✅ |
 | `variants/SDD-YOLO26n/` | 变体 2：同上（+ 论文矛盾/推断清单、本库实测数据表） | ✅ |

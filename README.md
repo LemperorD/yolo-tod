@@ -3,7 +3,7 @@
 收集、复现并**可归因地**对比针对小目标检测（Tiny/Small Object Detection）的 YOLO 魔改。
 完整方案见 [`PLAN.md`](PLAN.md)：架构设计、值得收录的魔改清单、优先级、评测协议。
 
-**当前状态：M0 骨架已完成（`tests/smoke.py` 63 项全绿，`tests/test_modules.py` 71 项全绿）；
+**当前状态：M0 骨架已完成（`tests/smoke.py` 63 项全绿，`tests/test_modules.py` 86 项全绿）；
 两个论文级变体已实现 —— SPAE-YOLOv8n（VisDrone 待验证）与 SDD-YOLO26n（结构自检已通过，训练待跑）。
 推理端（C++/TensorRT）工厂化骨架已落地：`src/todrt/`，CPU 自检 107 项全绿。**
 
@@ -146,7 +146,7 @@ configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 
 variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
 tools/              make_variant.py / train.py / catalog.py / export_onnx.py / convert_rknn.py
 docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
-tests/              smoke.py（无 torch 依赖，63 项）+ test_modules.py（形状/数值/手术/蒸馏/端到端，71 项）
+tests/              smoke.py（无 torch 依赖，63 项）+ test_modules.py（形状/数值/手术/蒸馏/端到端，86 项）
 ```
 
 ## 部署（推理端）

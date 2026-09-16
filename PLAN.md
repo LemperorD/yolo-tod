@@ -638,8 +638,9 @@ planned → reproducing → reproduced → (promoted | dropped)
 2. **`inject_p2_head` 只覆盖直连式 P2 头**：完整 P2 双向融合 / BiFPN / AFPN 重拓扑属于 M1。
 3. **论文未说明的部分**：SPAE 的 "feature calibration"、SDD 的 STAL 公式与 KD 锚点归一化、
    是否用预训练权重、epoch/batch 设置 —— 均已在各自 paper-notes 里标注为推断。
-4. **SPAE 在 8.4 上的头结构差异**：8.4 的分类分支是嵌套 Sequential（层数多于 8.2/8.3 的 2 层），
-   本库换头仍只放两层分组卷积 → 属"更激进压缩"，已在 `describe()` 里输出替换前的 stem 层数。
+4. **换头在不同主干上的压缩程度不同**：YOLOv8 系的分类分支 stem 是 2 层卷积（与论文一致），
+   而 YOLO26 系（非 legacy）是 `DWConv+Conv` 嵌套两块 = 4 层 —— 本库换头仍只放两层分组卷积，
+   在 YOLO26 上属"更激进压缩"。替换前的层数已由 `describe()` / `--dry-run` 输出，便于核对。
 
 ### M1 剩余任务（下一步）
 

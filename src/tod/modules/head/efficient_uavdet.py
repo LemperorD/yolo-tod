@@ -182,8 +182,9 @@ def swap_detect_head(head: nn.Module, per_group: int = 16, channels: str = "nati
     if not (hasattr(head, "cv2") and hasattr(head, "cv3")):
         raise TypeError("传入的对象不是检测头（缺少 cv2/cv3 分支）。")
 
-    # 记录替换前分支 stem 的卷积层数（框架版本差异会体现在这里）
-    stem_convs = {attr: count_stem_convs(getattr(head, attr)[0][0])
+    # 记录替换前分支 stem（输出 1x1 之前的全部卷积）的卷积层数：
+    # 8.2/8.3 的 cv2/cv3 都是 2；8.4 的 cv3 变成 "DWConv+Conv" 嵌套两块 = 4 层
+    stem_convs = {attr: sum(count_stem_convs(m) for m in getattr(head, attr)[0][:-1])
                   for attr in ("cv2", "cv3")}
     head._tod_ep5_stem_convs = stem_convs
 
@@ -239,11 +240,12 @@ def _out_channels(module: nn.Module) -> int:
 
 
 def count_stem_convs(module: nn.Module) -> int:
-    """统计分支 stem 里的卷积层数（用于暴露框架结构差异）。
+    """统计模块里的卷积层数（用于暴露框架/主干之间的头结构差异）。
 
-    8.2/8.3 的分类分支 stem 是 2 层卷积（与论文 Efficient_UAVDet 的"两层"对应）；
-    8.4 起分类分支变成**嵌套 Sequential**（层数更多）。本库的换头仍然只放两层分组
-    卷积，因此在新框架上属于"比论文更激进的压缩"，这个计数会被记录到日志/卡片里。
+    YOLOv8 系（8.2–8.4）的分类分支 stem 是 2 层 3×3 卷积 —— 与论文 Efficient_UAVDet
+    的"两层"完全对应；YOLO26 系（非 legacy）的分类分支改成 `DWConv+Conv` 嵌套两块 = 4 层，
+    本库的换头仍然只放两层分组卷积，因此在新主干上属于"比论文更激进的压缩"。
+    这个计数会被记录到 `head._tod_ep5_stem_convs` 并出现在 `describe()` 与日志里。
     """
     if isinstance(module, nn.Sequential):
         return sum(count_stem_convs(m) for m in module)
@@ -265,7 +267,8 @@ def describe(head: nn.Module) -> str:
             lines.append(f"{attr}[{i}] {role}: in={c_in} -> mid={c_mid} (g={g}, "
                          f"{c_in / g if isinstance(g, int) and g else 0:.1f} ch/group)")
     stem_convs = getattr(head, "_tod_ep5_stem_convs", {})
-    lines.append("本库把分支 stem 换成 2 层分组卷积（论文 §3.4）；替换前原始 stem 卷积层数："
+    lines.append("本库把分支 stem 换成 2 层分组卷积（论文 §3.4）；替换前 stem 的卷积层数："
                  f"cv2={stem_convs.get('cv2', '?')}、cv3={stem_convs.get('cv3', '?')}"
-                 "（8.2/8.3 为 2；8.4 的分类分支是嵌套结构、层数更多 → 属更激进压缩）")
+                 "（YOLOv8 系在 8.4 上仍是 2/2；而 YOLO26 系（非 legacy）的分类分支是"
+                 " DWConv+Conv 嵌套两块 = 4 层，被压成 2 层分组卷积属更激进压缩）")
     return "\n".join(lines)

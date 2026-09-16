@@ -323,7 +323,9 @@ def test_musgd() -> None:
     train_with(MuSGD(params=param_groups(mine, lr=0.02, momentum=0.9, weight_decay=0.01),
                      muon=0.2, sgd=1.0), mine)
     if native is not None:
-        diff = max(float((p - q).abs().max()) for p, q in zip(ref.parameters(), mine.parameters()))
+        with torch.no_grad():
+            diff = max(float((p - q).abs().max())
+                       for p, q in zip(ref.parameters(), mine.parameters()))
         check("本库 MuSGD 与框架原生数值一致（<1e-3）", diff < 1e-3, f"实际 {diff:.2e}")
 
     opt, source = build(mine, lr=0.01, prefer_native=False)
@@ -610,6 +612,99 @@ def test_end_to_end_build(fast: bool = False) -> None:
           f"，换头减少 {n_yaml - n_final:,}，头输入尺寸 {getattr(head, 'f', None)}")
 
 
+# ------------------------------------------------------- SDD-YOLO26n 端到端
+
+
+def test_sdd_end_to_end(fast: bool = False) -> None:
+    """按配方（variants/SDD-YOLO26n/recipe.py）走一遍完整链路：建图 → 手术 → 准则 → 反传。"""
+    if fast:
+        return skip("SDD 端到端建图", "--fast")
+
+    torch = _need_torch()
+    if torch is None:
+        return skip("SDD 端到端建图", "未安装 torch")
+
+    import importlib.util
+
+    for pkg in ("torch", "ultralytics"):
+        if importlib.util.find_spec(pkg) is None:
+            return skip("SDD 端到端建图", f"未安装 {pkg}")
+
+    recipe = ROOT / "variants" / "SDD-YOLO26n" / "recipe.py"
+    if not recipe.is_file():
+        return skip("SDD 端到端建图", "缺少 SDD 配方")
+
+    import tod
+    from tod.compat import dump_yaml
+
+    tod.bootstrap()
+    variant = _load_recipe_variant(recipe)
+    spec = variant.spec()
+
+    cfg = variant.model_yaml(write=False)
+    check("SDD：底座是 YOLO26（end2end=True / NMS-free）", cfg.get("end2end") is True)
+    check("SDD：reg_max=1（无 DFL 分支）", cfg.get("reg_max") == 1)
+    check("SDD：P2 分支已注入", cfg.get("_p2_status") == "injected")
+    check("SDD：P2 融合块为 C3（论文 §4.2 原文）",
+          any(str(n[2]) == "C3" for n in cfg["head"]), f"{cfg['head'][-4:]}")
+    check("SDD：训练配置里 dfl=0.0（论文 §4.3）",
+          float((spec.get("train") or {}).get("dfl", 1.5)) == 0.0)
+
+    from ultralytics import YOLO
+    from ultralytics.cfg import get_cfg
+
+    from tod.engine.surgery import apply_spec
+    from tod.loss.criterion import build_detection_loss, bbox_criteria
+
+    model_path = recipe.parent / "model.yaml"
+    dump_yaml(cfg, model_path)
+    model = YOLO(str(model_path)).model
+    head = model.model[-1]
+    check("SDD：YAML 阶段检测头仍是原生 Detect（改动走手术）",
+          type(head).__name__ == "Detect" and len(head.f) == 4, f"{type(head).__name__} f={list(head.f)}")
+
+    applied = apply_spec(model, spec)
+    check("SDD：EP4 注意力插入 4 处（P2–P5）",
+          any("DualAttention × 4" in a for a in applied), f"applied={applied}")
+    check("SDD：Detect 输入已重指向注意力节点",
+          all(getattr(model.model[i], "_tod_ep4", None) for i in head.f),
+          f"f={list(head.f)}")
+    check("SDD：stride 含 4（P2 层生效）", 4 in [int(s) for s in head.stride],
+          f"实际 {[int(s) for s in head.stride]}")
+
+    # 准则：与 tools/train.py --dry-run 同一条路径
+    args = get_cfg()
+    for key, value in (spec.get("train") or {}).items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    model.args = args
+    criterion = build_detection_loss(model, kind="wiou", use_dfl=False, stal=True)
+    subs = bbox_criteria(criterion)
+    check("SDD：E2ELoss 的两套子准则都被替换（O2M+O2O）",
+          len(subs) == 2 and all(type(s.bbox_loss).__name__ == "TODBboxLoss" for s in subs),
+          f"subs={len(subs)}")
+    check("SDD：回归损失为 WiseIoU 且关闭了 DFL 分支",
+          all(s.bbox_loss.fn.__class__.__name__ == "WiseIoU" and s.bbox_loss.use_dfl is False
+              for s in subs))
+    check("SDD：分配器换成 STAL（small_target_aware=True）",
+          all(getattr(s.assigner, "small_target_aware", False) for s in subs))
+
+    model.criterion = criterion
+    model.train()
+    batch = _unit_batch(320)
+    total, items = model(batch)
+    check("SDD：训练前向可跑通", bool(torch.isfinite(total).all()))
+    check("SDD：DFL 增益为 0 → 回归项 loss_items[2] == 0",
+          abs(float(items[2])) < 1e-8, f"items={[round(float(x), 4) for x in items]}")
+    total.sum().backward()
+    attn = model.model[head.f[0]]
+    check("SDD：反向传播到达注意力层", attn.channel[2].weight.grad is not None)
+
+    n_final = sum(p.numel() for p in model.parameters())
+    print(f"       ↳ SDD-YOLO26n：{n_final:,} 参数（{n_final / 1e6:.2f} M）、"
+          f"nl={head.nl}、stride={[int(s) for s in head.stride]}、f={list(head.f)}")
+
+
 def _load_recipe_variant(path: Path):
     import importlib.util
 
@@ -617,7 +712,6 @@ def _load_recipe_variant(path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.variant
-
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -637,6 +731,10 @@ def main() -> int:
         test_end_to_end_build(args.fast)
     except Exception:  # noqa: BLE001
         failures.append(f"test_end_to_end_build:\n{traceback.format_exc()}")
+    try:
+        test_sdd_end_to_end(args.fast)
+    except Exception:  # noqa: BLE001
+        failures.append(f"test_sdd_end_to_end:\n{traceback.format_exc()}")
 
     print(f"\n通过 {len(PASSED)} 项，跳过 {len(SKIPPED)} 项，失败 {len(failures)} 项\n")
     for label in PASSED:

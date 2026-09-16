@@ -74,26 +74,50 @@ def main() -> int:
 
     if args.dry_run:
         import torch
+        from ultralytics.cfg import get_cfg
 
         from tod.engine.surgery import apply_spec
+        from tod.loss.criterion import build_detection_loss
 
         imgsz = args.imgsz or int(spec.get("data", {}).get("imgsz", 640))
+        n_before = sum(p.numel() for p in model.model.parameters())
         applied = apply_spec(model.model, spec)
         if applied:
-            print("[EP5] 检测头手术：")
+            print("[EP4/EP5] 建模后手术：")
             for line in applied:
                 print(f"       {line}")
+        n_after = sum(p.numel() for p in model.model.parameters())
+
+        # ---- EP6/EP7/EP9：准则与优化器接线自检（同样不需要数据集）----
+        eps = spec.get("eps") or {}
+        ep6, ep7, ep9 = (eps.get("EP6") or {}), (eps.get("EP7") or {}), (eps.get("EP9") or {})
+        model.model.args = _dry_run_args(spec, get_cfg)      # 准则会读 model.args 当 hyp
+
+        from tod.engine.trainer import stal_flag
+
+        dfl_gain = float(getattr(model.model.args, "dfl", 1.5) or 0.0)
+        use_dfl = False if (dfl_gain == 0.0 and ep7.get("box")) else None
+        criterion = build_detection_loss(
+            model.model, kind=ep7.get("box"),
+            theta=float(ep7.get("theta", 4.0) or 4.0), use_dfl=use_dfl,
+            stal=stal_flag(ep6), **(ep7.get("kind_kwargs") or {}),
+        )
+        print("[EP6/EP7] 训练准则：" + ("；".join(criterion._tod_patched) or "框架默认（未做替换）"))
+        prog = callable(getattr(criterion, "update", None)) or callable(
+            getattr(getattr(criterion, "base", None), "update", None))
+        print(f"[EP9] 优化器={ep9.get('optimizer', 'auto')}"
+              f" | dfl 增益={dfl_gain}"
+              f" | 蒸馏={'开启' if ep9.get('distill') and ep9.get('teacher') else '关闭'}"
+              f" | ProgLoss={'框架原生 E2ELoss.update' if prog else '不适用'}")
 
         model.model.eval()
         head = model.model.model[-1]
-        n_before = sum(p.numel() for p in model.model.parameters())
         with torch.no_grad():
             out = model.model(torch.zeros(1, 3, imgsz, imgsz))
-        n_after = sum(p.numel() for p in model.model.parameters())
         print(f"[自检] imgsz={imgsz}  参数量={n_after:,} ({n_after / 1e6:.2f} M)"
-              + (f"  头部手术影响 {n_before - n_after:+,} 参数" if applied else ""))
+              + (f"  手术影响 {n_after - n_before:+,} 参数" if applied else ""))
         print(f"[自检] 检测层数 nl={getattr(head, 'nl', '?')}  stride={list(getattr(head, 'stride', []))}")
-        print(f"[自检] 头输入特征图尺寸：{getattr(head, 'f', None)}")
+        print(f"[自检] 头输入特征图索引：{list(getattr(head, 'f', []))}")
         print(f"[自检] 前向输出层数：{len(out) if isinstance(out, (list, tuple)) else 1}")
         return 0
 
@@ -125,6 +149,19 @@ def main() -> int:
     return 0
 
 
+def _dry_run_args(spec: dict, get_cfg):
+    """给 ``--dry-run`` 造一份训练超参命名空间。
+
+    准则（``v8DetectionLoss``/``E2ELoss``）会把 ``model.args`` 当超参读，
+    直接建图得到的 ``model.args`` 是 dict，会报 ``'dict' object has no attribute 'box'``。
+    """
+    args = get_cfg()
+    for key, value in (spec.get("train") or {}).items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    return args
+
+
 def _default_data(dataset: str) -> Path | None:
     """按数据集名推断本库的 base 配置路径。"""
     if not dataset:
@@ -134,7 +171,11 @@ def _default_data(dataset: str) -> Path | None:
 
 
 if __name__ == "__main__":
+    # CompatError 在 main() 内部才被导入（那时 sys.path 才加好），
+    # 所以这里也要延迟导入：早年写成模块级 except 会抛 NameError 掩盖真实退出码。
+    from tod.compat import CompatError as _CompatError
+
     try:
         raise SystemExit(main())
-    except CompatError as exc:  # 环境/版本问题给出可读提示
+    except _CompatError as exc:  # 环境/版本问题给出可读提示
         raise SystemExit(f"[环境错误] {exc}") from exc

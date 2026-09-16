@@ -113,7 +113,7 @@ class TODDetectionTrainer(_DetectionTrainer):
         # 论文 §4.3 的 "setting dfl=0.0"：增益为 0 时连计算一起省掉
         dfl_gain = float(getattr(self.args, "dfl", 1.5) or 0.0)
         use_dfl = False if (dfl_gain == 0.0 and kind is not None) else None
-        stal = _stal_flag(ep6)
+        stal = stal_flag(ep6)
 
         criterion = build_detection_loss(
             model,
@@ -151,8 +151,11 @@ class TODDetectionTrainer(_DetectionTrainer):
               f" | ProgLoss={'框架原生 E2ELoss.update' if _has_prog_loss(criterion) else '不适用'}")
 
 
-def _stal_flag(ep6: dict) -> bool | None:
-    """把 EP6 配置翻译成 ``build_detection_loss(stal=...)`` 的三态参数。"""
+def stal_flag(ep6: dict) -> bool | None:
+    """把 EP6 配置翻译成 ``build_detection_loss(stal=...)`` 的三态参数。
+
+    供训练器与 ``tools/train.py --dry-run`` 共用，避免两处判断不一致。
+    """
     value = ep6.get("assigner", ep6.get("small_target_aware"))
     if value is None:
         return None

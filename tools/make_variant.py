@@ -51,11 +51,12 @@ def main() -> int:
     out = args.out or args.recipe.parent
     out.mkdir(parents=True, exist_ok=True)
 
-    # 先导入模块库/损失库，让卡片能自动带出论文来源与许可证。
-    # 这两步依赖 torch，环境未就绪时降级为警告，不阻塞 spec 生成。
+    # 先导入所有注册库，让卡片能自动带出论文来源与许可证（EP4/EP6/EP7/EP9 都在内）。
+    # 这一步依赖 torch，环境未就绪时降级为警告，不阻塞 spec 生成。
     try:
-        import tod.modules  # noqa: F401
-        import tod.loss  # noqa: F401
+        import tod
+
+        tod.import_libraries()
     except ImportError as exc:
         print(f"[warn ] 未能导入模块库（{exc}）：卡片里的来源表可能为空。")
 

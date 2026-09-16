@@ -1,0 +1,39 @@
+spec_version: 1
+id: SDD-YOLO26n
+base: yolo26n
+status: planned
+dataset: visdrone2019-det
+tags: [paper-repro, small-object, uav, ground-to-air, nms-free, dfl-free, distillation]
+notes: "论文原设定：DroneSOD-30K（未公开，约 30K 张空对地无人机图）、1024×1024 输入、MuSGD + ProgLoss + STAL、DFL-free、NMS-free、YOLO26x\
+  \ 教师蒸馏（λ=0.5, T=3.0）。\n\n本变体差异：① 数据集换成本库主战场 VisDrone2019-DET（域迁移，86.0 mAP@0.5 不可引用）；②\
+  \ batch 因 8 GB 显存降到 4（论文用 32 GB 的 5090，未给 batch）；③ 蒸馏默认关闭（YOLO26x 教师在本机放不下），键位已备好，给本地\
+  \ .pt 路径即可启用。\n\n论文自相矛盾之处（引用数字前必读）：\n  · 消融表 Table 3 的基线 0.8341 与主表 Table 2 的 YOLO26n\
+  \ 原生 0.786 对不上；同一配置 '+P2' 在 Table 3 是 0.8419、Table 2 是 0.849。\n  · Table 2/4 里 YOLO26n、'+P2'、'Final'\
+  \ 三行的 Params(2.50M) 与 FLOPs(5.77G) 完全相同 —— 加了 P2 头与注意力不可能一个参数都不变。\n  · 数据集三个子集相加\
+  \ 47 750 张 ≠ 摘要'约 30K'；Table 2 的 CPU FPS 列与 Table 4 的同一模型也有出入（30.4 vs 30.4、35.0\
+  \ vs 35.0 一致，但 YOLOv5n 34.9 与'低于 YOLO26n 的 30.4'叙述矛盾）。\n  · 式 (4) 的空间分支公式（[AvgPool;MaxPool]+Conv7×7）与正文'捕捉运动区域'的描述不符；式\
+  \ (7) 没说 KL 在锚点维求和还是求均值（本库取均值：求和时 KD 会压垮任务损失）。\n"
+eps:
+  EP4:
+    attention: DualAttention
+    levels: [2, 3, 4, 5]
+    reduction: 16
+  EP6: {assigner: STAL, small_target_aware: true}
+  EP7:
+    box: wiou
+    kind_kwargs: {variant: 3, alpha: 1.9, delta: 3.0}
+  EP9:
+    optimizer: MuSGD
+    prefer_native: true
+    prog_loss: framework
+    distill: null
+    kd_lambda: 0.5
+    temperature: 3.0
+    kd_levels: [2, 3, 4, 5]
+data: {imgsz: 1024}
+model: {nc: 10, add_p2: true, p2_idx: 2, p2_channels: 128, p2_fuse_block: C3}
+train: {dfl: 0.0, epochs: 100, batch: 4, imgsz: 1024, lr0: 0.01, lrf: 0.01, momentum: 0.9,
+  weight_decay: 0.0005, warmup_epochs: 3.0, warmup_momentum: 0.8, close_mosaic: 10,
+  mosaic: 1.0, mixup: 0.05, multi_scale: 0.25, amp: true, workers: 4, seed: 0, deterministic: true,
+  project: results}
+modules: [DualAttention, STAL, wiou, MuSGD]

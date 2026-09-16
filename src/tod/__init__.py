@@ -6,8 +6,22 @@
 
 from tod.registry import catalog, get, has, install, list_specs, register
 
-__all__ = ["register", "install", "bootstrap", "catalog", "get", "has", "list_specs"]
+__all__ = ["register", "install", "bootstrap", "import_libraries", "catalog", "get",
+           "has", "list_specs"]
 __version__ = "0.0.1"
+
+
+def import_libraries() -> None:
+    """导入所有注册库（触发 ``@register``），但**不**注入框架命名空间。
+
+    需要"拿到完整注册表"但不该依赖 ultralytics 的场景（变体卡片、模块总表）
+    用这个；训练入口用 ``bootstrap()``。
+    """
+    import tod.assigner  # noqa: F401
+    import tod.engine.distill  # noqa: F401
+    import tod.loss  # noqa: F401
+    import tod.modules  # noqa: F401
+    import tod.optim  # noqa: F401
 
 
 def bootstrap() -> None:
@@ -21,10 +35,5 @@ def bootstrap() -> None:
     早期版本只导入了 ``tod.modules``，结果 EP6/EP9 的模块（STAL、MuSGD、
     FeatureAlignKD）虽然注册了，却不在 parse_model 命名空间里。
     """
-    import tod.assigner  # noqa: F401  （导入即触发 @register）
-    import tod.engine.distill  # noqa: F401
-    import tod.loss  # noqa: F401
-    import tod.modules  # noqa: F401
-    import tod.optim  # noqa: F401
-
+    import_libraries()
     install()

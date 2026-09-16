@@ -323,6 +323,26 @@ class Variant:
         else:
             lines.append("| - | - | 未做任何魔改（纯基线） |")
 
+        # 模型图级改造（P2 注入 / 下采样替换 / 类型替换）不走 EP 覆盖，单列一节，
+        # 否则卡片上会看不到"加了 P2 头"这种最关键的改动。
+        if self.model_cfg:
+            lines += ["", "## 模型图改造（model 段）", "", "| 键 | 值 |", "|---|---|"]
+            for key, value in self.model_cfg.items():
+                lines.append(f"| `{key}` | `{value}` |")
+            derived = []
+            if self.model_cfg.get("add_p2"):
+                derived.append(
+                    "**P2 检测头（EP5/EP2）**：`inject_p2_head` 注入 stride=4 分支 —— "
+                    f"上采样(P3) ⊕ backbone 节点 {self.model_cfg.get('p2_idx', 2)} → "
+                    f"`{self.model_cfg.get('p2_fuse_block', 'C2f')}` 融合 → Detect(P2,P3,P4,P5)")
+            if self.model_cfg.get("downsample"):
+                derived.append(f"**主干下采样替换（EP1）**：`{self.model_cfg['downsample']}`"
+                               f"（索引 {self.model_cfg.get('downsample_indices', '默认 1/3/5/7')}）")
+            if self.model_cfg.get("type_map"):
+                derived.append(f"**节点类型替换**：`{self.model_cfg['type_map']}`")
+            if derived:
+                lines += [""] + [f"- {d}" for d in derived]
+
         lines += ["", "## 引用模块来源", ""]
         used = self.used_modules()
         if used:

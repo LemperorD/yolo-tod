@@ -37,4 +37,4 @@ model:
 train: {optimizer: SGD, epochs: 200, batch: 8, imgsz: 640, lr0: 0.01, lrf: 0.01, momentum: 0.937,
   weight_decay: 0.0005, warmup_epochs: 3.0, warmup_momentum: 0.8, close_mosaic: 10,
   workers: 4, seed: 0, deterministic: true, amp: true, project: results}
-modules: []
+modules: [ADown, Efficient_UAVDet, siou]

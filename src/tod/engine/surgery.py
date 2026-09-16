@@ -199,6 +199,9 @@ def apply_spec(model: Any, spec: dict[str, Any]) -> list[str]:
 
 
 def _apply_head(model: Any, head_name: str, ep5: dict[str, Any]) -> list[str]:
+    head = find_head(model)
+    if getattr(head, "_tod_ep5", None):
+        return [f"EP5: {head._tod_ep5} 已存在，跳过（幂等）"]
     if head_name not in ("Efficient_UAVDet", "EfficientUAVDet", "EfficientUAVDetHead"):
         raise CompatError(
             f"EP5 头 {head_name!r} 还没有建模后手术的实现。"
@@ -209,5 +212,6 @@ def _apply_head(model: Any, head_name: str, ep5: dict[str, Any]) -> list[str]:
 
     per_group = int(ep5.get("per_group", 16))
     channels = str(ep5.get("channels", "native"))
-    head = swap_detect_head(find_head(model), per_group=per_group, channels=channels)
+    head = swap_detect_head(head, per_group=per_group, channels=channels)
+    head._tod_ep5 = head_name        # 幂等标记：resume 时不会二次换头
     return [f"EP5: {head_name}(per_group={per_group}, channels={channels})", describe(head)]

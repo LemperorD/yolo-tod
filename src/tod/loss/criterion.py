@@ -134,14 +134,14 @@ def bbox_criteria(criterion: Any) -> list[Any]:
     return subs
 
 
-def build_detection_loss(model, kind: str = "siou", theta: float = 4.0,
+def build_detection_loss(model, kind: str | None = "siou", theta: float = 4.0,
                          use_dfl: bool | None = None, stal: bool | None = None,
                          **kind_kwargs: Any):
     """构造检测训练准则：框架原生准则 + 我们的回归损失（+ 可选的 EP6 分配器/无 DFL）。
 
     Args:
         model: 已构建的 ``DetectionModel``（必须是 de-parallel 的）。
-        kind: 回归损失名。
+        kind: 回归损失名；``None`` 表示**保留框架默认的 IoU 项**，只做其它改动。
         use_dfl: 见 ``TODBboxLoss``。
         stal: ``None`` = 保留框架自带分配器；``True`` = 换成 STAL（小目标感知，
             框架 < 8.4 时由本库补上）；``False`` = 显式退回经典 TAL（消融）。
@@ -158,11 +158,12 @@ def build_detection_loss(model, kind: str = "siou", theta: float = 4.0,
         )
     criterion = init()
     report: list[str] = []
-    for sub in bbox_criteria(criterion):
-        sub.bbox_loss = TODBboxLoss(sub.bbox_loss, kind=kind, theta=theta,
-                                    use_dfl=use_dfl, **kind_kwargs)
-        report.append(f"bbox_loss -> {kind}"
-                      + ("" if use_dfl is None else f" (use_dfl={use_dfl})"))
+    if kind is not None:
+        for sub in bbox_criteria(criterion):
+            sub.bbox_loss = TODBboxLoss(sub.bbox_loss, kind=kind, theta=theta,
+                                        use_dfl=use_dfl, **kind_kwargs)
+            report.append(f"bbox_loss -> {kind}"
+                          + ("" if use_dfl is None else f" (use_dfl={use_dfl})"))
     if stal is not None:
         from tod.assigner.stal import install_assigner
 

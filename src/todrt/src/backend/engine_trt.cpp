@@ -1036,18 +1036,8 @@ std::unique_ptr<Detector> CreateTrtDetector(const std::string& model_name,
       new TrtDetector(model_name, o, trt_builder->engine(), std::move(pre), std::move(post)));
 }
 
-bool backend_available(std::string* reason) {
-  int device = 0;
-  if (cudaGetDevice(&device) != cudaSuccess) {
-    if (reason) *reason = "无法访问 CUDA 设备";
-    return false;
-  }
-  if (reason) {
-    *reason = std::string("TensorRT ") + std::to_string(NV_TENSORRT_MAJOR) + "." +
-              std::to_string(NV_TENSORRT_MINOR);
-  }
-  return true;
-}
+// backend_available 统一在 backend_dispatch.cpp 实现（它知道所有后端的编译状态）
+
 
 }  // namespace todrt
 

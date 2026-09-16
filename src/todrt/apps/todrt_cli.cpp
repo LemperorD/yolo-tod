@@ -20,6 +20,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -341,30 +342,78 @@ int CmdDryRun(const std::string& cfg_path, const Options& cli) {
 
 int CmdProbe() {
   std::cout << "== 部署环境探测 ==\n";
-  std::cout << "  后端 TensorRT : ";
   std::string reason;
   const bool avail = backend_available(&reason);
-  std::cout << (avail ? "可用" : "不可用") << " —— " << reason << "\n";
+  std::cout << "  已编译后端 : " << reason << "\n";
+
+  // 逐个后端报"能不能用"，而不是只报"编没编进来"——这两件事经常不一致
+  std::cout << "\n-- TensorRT（NVIDIA GPU / Jetson DLA）--\n";
 #if TODRT_HAVE_TENSORRT
-  const TrtEngine::PlanInfo info = TrtEngine::Probe(BuildConfig{});
-  std::cout << "  TensorRT 版本 : " << info.trt_version << "\n";
-  std::cout << "  CUDA 设备     : " << (info.device_name.empty() ? "(无)" : info.device_name)
-            << "  compute capability "
-            << (info.compute_capability.empty() ? "-" : info.compute_capability) << "\n";
-  std::cout << "  DLA core 数   : " << info.nb_dla_cores;
-  if (!info.dla_supported_build) {
-    std::cout << "  ← 当前 TensorRT 版本已移除 DLA，请用 TensorRT 10.x";
-  }
-  std::cout << "\n";
-  std::cout << "  DLA 最大 batch: " << info.max_batch << "\n";
-  if (info.nb_dla_cores > 0) {
-    std::cout << "\n建议：--preset=orin（DLA + FP16，固定 shape，开启 CUDA Graph）\n";
-  } else {
-    std::cout << "\n建议：--preset=dgp（FP16 + CUDA Graph）；x86 无 DLA。\n";
+  {
+    const TrtEngine::PlanInfo info = TrtEngine::Probe(BuildConfig{});
+    std::cout << "  TensorRT 版本 : " << info.trt_version << "\n";
+    std::cout << "  CUDA 设备     : " << (info.device_name.empty() ? "(无)" : info.device_name)
+              << "  compute capability "
+              << (info.compute_capability.empty() ? "-" : info.compute_capability) << "\n";
+    std::cout << "  DLA core 数   : " << info.nb_dla_cores;
+    if (!info.dla_supported_build) std::cout << "  ← 该版本已移除 DLA，请用 TensorRT 10.x";
+    std::cout << "\n";
+    if (info.nb_dla_cores > 0) {
+      std::cout << "  建议          : --preset=orin（DLA + FP16 + CUDA Graph）\n";
+    } else if (!info.device_name.empty()) {
+      std::cout << "  建议          : --preset=dgp（FP16 + CUDA Graph）；本机无 DLA\n";
+    }
   }
 #else
-  std::cout << "  （本次构建未启用 TensorRT：用 -DTODRT_WITH_TENSORRT=ON 重新构建即可）\n";
+  std::cout << "  未编译（-DTODRT_WITH_TENSORRT=ON）\n";
 #endif
+
+  std::cout << "\n-- RKNN（Rockchip NPU，RK3588）--\n";
+#if TODRT_HAVE_RKNN
+  {
+    std::ifstream dev0("/dev/rknpu0");
+    std::ifstream dev("/dev/rknpu");
+    const bool has_dev = dev0.good() || dev.good();
+    std::cout << "  librknnrt     : 已编译\n";
+    std::cout << "  /dev/rknpu*   : " << (has_dev ? "存在" : "未发现")
+              << (has_dev ? "" : "（非 Rockchip 板子，或当前用户不在 video/render 组）") << "\n";
+    std::cout << "  模型格式      : .rknn（由 rknn-toolkit2 在 x86 上转换，板上不编译）\n";
+    std::cout << "  建议          : --preset=rk3588（NPU + INT8 + uint8 NHWC 输入）\n";
+  }
+#else
+  std::cout << "  未编译（-DTODRT_WITH_RKNN=ON，需要 rknn_api.h + librknnrt.so）\n";
+#endif
+
+  std::cout << "\n-- ONNX Runtime（通用 CPU 后路 / AMD x86）--\n";
+#if TODRT_HAVE_ORT
+  {
+    std::string r;
+    std::unique_ptr<IModelBuilder> b = make_builder("ort");
+    if (b) {
+      b->Available(&r);
+      std::cout << "  " << r << "\n";
+    }
+    std::cout << "  建议          : --preset=amd --builder=ort（CPU EP；有 NVIDIA GPU 可换 cuda）\n";
+  }
+#else
+  std::cout << "  未编译（-DTODRT_WITH_ORT=ON，需要 libonnxruntime + 头文件）\n";
+#endif
+
+  std::cout << "\n-- OpenVINO（x86 CPU / Intel iGPU-NPU）--\n";
+#if TODRT_HAVE_OPENVINO
+  {
+    std::string r;
+    std::unique_ptr<IModelBuilder> b = make_builder("openvino");
+    if (b) {
+      b->Available(&r);
+      std::cout << "  " << r << "\n";
+    }
+    std::cout << "  建议          : --preset=amd --builder=openvino（CPU 插件对 x86 深度优化）\n";
+  }
+#else
+  std::cout << "  未编译（-DTODRT_WITH_OPENVINO=ON）\n";
+#endif
+
   std::cout << "\n== 已注册工厂 ==\n" << registry_catalog("");
   return avail ? 0 : 1;
 }

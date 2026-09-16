@@ -130,6 +130,17 @@ bool BuildConfig::set_flag(const std::string& name, bool on) {
     f = BuilderFlag::kProfilingVerbosity;
   } else if (k == "stronglytyped" || k == "strongtyping") {
     f = BuilderFlag::kStronglyTyped;
+  } else if (k == "rknnmulticore" || k == "multicore") {
+    f = BuilderFlag::kRknnMultiCore;
+  } else if (k == "rknnpacked" || k == "packedoutput") {
+    f = BuilderFlag::kRknnPacked;
+  } else if (k == "ortgraphoptimize" || k == "graphoptimize") {
+    f = BuilderFlag::kOrtGraphOptimize;
+  } else if (k == "ortdisablecpufallback" || k == "disablecpufallback" ||
+             k == "nofallback") {
+    f = BuilderFlag::kOrtDisableCpuFallback;
+  } else if (k == "ovcachecompiled" || k == "ovcache" || k == "cachecompiled") {
+    f = BuilderFlag::kOvCacheCompiled;
   } else {
     return false;
   }
@@ -163,7 +174,16 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   if (hw.is_object()) {
     if (hw.contains("device")) cfg.device = parse_device(hw["device"].as_string());
     if (hw.contains("precision")) cfg.precision = parse_precision(hw["precision"].as_string());
-    if (hw.contains("dla_core")) cfg.dla_core = hw["dla_core"].as_int(cfg.dla_core);
+    // 加速器核心：一个字段覆盖 DLA core（Orin）与 NPU core（RK3588）
+    if (hw.contains("accelerator_core")) {
+      cfg.accelerator_core = hw["accelerator_core"].as_int(cfg.accelerator_core);
+      cfg.dla_core = cfg.accelerator_core;
+    }
+    if (hw.contains("dla_core")) {
+      cfg.dla_core = hw["dla_core"].as_int(cfg.dla_core);
+      cfg.accelerator_core = cfg.dla_core;
+    }
+    if (hw.contains("npu_core")) cfg.accelerator_core = hw["npu_core"].as_int(cfg.accelerator_core);
     if (hw.contains("dla_memory_limit_mb")) {
       cfg.dla_memory_limit_mb = hw["dla_memory_limit_mb"].as_int(cfg.dla_memory_limit_mb);
     }
@@ -176,6 +196,47 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   }
   if (v.contains("precision")) cfg.precision = parse_precision(v["precision"].as_string());
   if (v.contains("device")) cfg.device = parse_device(v["device"].as_string());
+
+  // ---- RKNN（Rockchip NPU）----
+  const json::Value& rk = v["rknn"];
+  if (rk.is_object()) {
+    if (rk.contains("model")) cfg.rknn_model_path = rk["model"].as_string();
+    if (rk.contains("model_path")) cfg.rknn_model_path = rk["model_path"].as_string();
+    if (rk.contains("core_num")) cfg.rknn_core_num = rk["core_num"].as_int(cfg.rknn_core_num);
+    if (rk.contains("dequantize_output")) {
+      cfg.rknn_dequantize_output = rk["dequantize_output"].as_bool(true);
+    }
+  }
+  if (v.contains("rknn_model")) cfg.rknn_model_path = v["rknn_model"].as_string();
+
+  // ---- ONNX Runtime ----
+  const json::Value& ort = v["onnxruntime"];
+  if (ort.is_object()) {
+    if (ort.contains("provider")) cfg.ort_provider = ort["provider"].as_string(cfg.ort_provider);
+    if (ort.contains("intra_threads")) {
+      cfg.ort_intra_threads = ort["intra_threads"].as_int(cfg.ort_intra_threads);
+    }
+    if (ort.contains("inter_threads")) {
+      cfg.ort_inter_threads = ort["inter_threads"].as_int(cfg.ort_inter_threads);
+    }
+    if (ort.contains("optimization")) {
+      cfg.ort_optimization = ort["optimization"].as_string(cfg.ort_optimization);
+    }
+  }
+  if (v.contains("ort_provider")) cfg.ort_provider = v["ort_provider"].as_string(cfg.ort_provider);
+
+  // ---- OpenVINO ----
+  const json::Value& ov = v["openvino"];
+  if (ov.is_object()) {
+    if (ov.contains("device")) cfg.ov_device = ov["device"].as_string(cfg.ov_device);
+    if (ov.contains("cache_dir")) cfg.ov_cache_dir = ov["cache_dir"].as_string();
+    if (ov.contains("num_streams")) cfg.ov_num_streams = ov["num_streams"].as_int(cfg.ov_num_streams);
+    if (ov.contains("num_threads")) cfg.ov_num_threads = ov["num_threads"].as_int(cfg.ov_num_threads);
+    if (ov.contains("performance_hint")) {
+      cfg.ov_performance_hint = ov["performance_hint"].as_string(cfg.ov_performance_hint);
+    }
+  }
+  if (v.contains("ov_device")) cfg.ov_device = v["ov_device"].as_string(cfg.ov_device);
 
   // 资源
   const json::Value& r = v["resources"];
@@ -266,6 +327,31 @@ void from_json(const json::Value& v, PreprocessOptions& o) {
     o.pad_value = PadValue::kEdge;
   } else if (!pad.empty()) {
     o.pad_value = PadValue::kGray114;
+  }
+
+  // 输出契约：float32（TensorRT/ORT/OpenVINO）或 uint8（RKNN 量化模型）
+  const std::string out = lower_compact(v["output"].as_string());
+  if (!out.empty()) {
+    if (out == "uint8" || out == "u8" || out == "raw" || out == "rawuint8") {
+      o.output = PreprocOutput::kUint8Raw;
+    } else if (out == "float32" || out == "f32" || out == "float") {
+      o.output = PreprocOutput::kFloat32;
+    } else {
+      throw TritError("未知的前处理输出类型 output：" + v["output"].as_string() +
+                      "（可选 float32 / uint8）");
+    }
+  }
+  // 布局：nchw（TRT/ORT/OV）或 nhwc（RKNN 量化模型常见）
+  const std::string lay = lower_compact(v["layout"].as_string());
+  if (!lay.empty()) {
+    if (lay == "nhwc") {
+      o.layout = TensorLayout::kNhwc;
+    } else if (lay == "nchw") {
+      o.layout = TensorLayout::kNchw;
+    } else {
+      throw TritError("未知的前处理布局 layout：" + v["layout"].as_string() +
+                      "（可选 nchw / nhwc）");
+    }
   }
 }
 
@@ -547,6 +633,25 @@ json::Value DetectorOptions::ToJson() const {
   rt["verbose"] = verbose;
   rt["workspace_mb"] = static_cast<int64_t>(workspace_mb);
 
+  // 各后端的专属设置：把"实际生效值"一并存档，便于复现与排查
+  json::Object rk;
+  rk["model"] = deploy.build.rknn_model_path;
+  rk["core_num"] = deploy.build.rknn_core_num;
+  rk["dequantize_output"] = deploy.build.rknn_dequantize_output;
+
+  json::Object ortc;
+  ortc["provider"] = deploy.build.ort_provider;
+  ortc["intra_threads"] = deploy.build.ort_intra_threads;
+  ortc["inter_threads"] = deploy.build.ort_inter_threads;
+  ortc["optimization"] = deploy.build.ort_optimization;
+
+  json::Object ovc;
+  ovc["device"] = deploy.build.ov_device;
+  ovc["cache_dir"] = deploy.build.ov_cache_dir;
+  ovc["num_streams"] = deploy.build.ov_num_streams;
+  ovc["num_threads"] = deploy.build.ov_num_threads;
+  ovc["performance_hint"] = deploy.build.ov_performance_hint;
+
   json::Array strides;
   for (int s : deploy.strides) strides.push_back(json::Value(s));
   json::Array levels;
@@ -559,6 +664,8 @@ json::Value DetectorOptions::ToJson() const {
                     : (preproc_opts.mode == ResizeMode::kStretch ? "stretch" : "integer-scale");
   pre["width"] = preproc_opts.input_width;
   pre["height"] = preproc_opts.input_height;
+  pre["output"] = (preproc_opts.output == PreprocOutput::kUint8Raw) ? "uint8" : "float32";
+  pre["layout"] = to_string(preproc_opts.layout);
   pre["norm_scale"] = static_cast<double>(preproc_opts.norm_scale);
   pre["norm_bias"] = static_cast<double>(preproc_opts.norm_bias);
 
@@ -587,6 +694,9 @@ json::Value DetectorOptions::ToJson() const {
   root["hardware"] = json::Value(std::move(hw));
   root["shape"] = json::Value(std::move(shape));
   root["runtime"] = json::Value(std::move(rt));
+  root["rknn"] = json::Value(std::move(rk));
+  root["onnxruntime"] = json::Value(std::move(ortc));
+  root["openvino"] = json::Value(std::move(ovc));
   root["preprocess"] = json::Value(std::move(pre));
   root["postprocess"] = json::Value(std::move(post));
   if (!deploy.notes.empty()) root["notes"] = deploy.notes;
@@ -623,8 +733,43 @@ void DetectorOptions::ApplyPreset(const std::string& preset) {
   } else if (k == "int8") {
     device = Device::kGpu;
     precision = Precision::kINT8;
+  } else if (k == "rk3588" || k == "rknn" || k == "rockchip" || k == "rk3588s") {
+    // RK3588：NPU（3 个 core）+ INT8 量化模型。
+    // 输入固定尺寸、batch=1（.rknn 的 batch 是转换期固定的）。
+    device = Device::kNpu;
+    precision = Precision::kINT8;
+    dynamic_shape = false;
+    dynamic_batch = false;
+    max_batch = 1;
+    cuda_graphs = false;
+    // 前处理：归一化已烧进量化模型 → 必须给原始 uint8（NHWC）
+    preproc_opts.output = PreprocOutput::kUint8Raw;
+    preproc_opts.layout = TensorLayout::kNhwc;
+    // 模型来源与多核：由用户填 engine.path（.rknn）或 rknn.model；core 数默认用满 3 个
+    deploy.build.rknn_core_num = 3;
+    if (deploy.build.rknn_model_path.empty() && deploy.build.engine_path.empty()) {
+      log_info(
+          "preset=rk3588：请在部署配置里给出 engine.path（.rknn）或 rknn.model。"
+          "未给出时会在创建 Detector 时报错并附上转换命令。");
+    }
+  } else if (k == "amd" || k == "amdcpu" || k == "x86cpu" || k == "intel" ||
+             k == "intelcpu") {
+    // 通用 CPU 后路（AMD x86 的典型场景）：不依赖 GPU/NPU。
+    // 具体走哪个后端由 builder 决定（openvino / ort），两者都是 CPU 友好的。
+    device = Device::kCpu;
+    precision = Precision::kFP32;  // CPU 上 FP16 通常更慢（模拟），保持 FP32
+    dynamic_shape = false;
+    dynamic_batch = false;
+    cuda_graphs = false;
+    preproc_opts.output = PreprocOutput::kFloat32;
+    preproc_opts.layout = TensorLayout::kNchw;
+    if (deploy.build.ov_cache_dir.empty()) {
+      deploy.build.ov_cache_dir = "ov_cache";  // OpenVINO 首次编译很慢，默认开缓存
+    }
   } else {
-    throw TritError("未知硬件预设：" + preset + "（可选 orin/dgp/x86/fp32/int8/none）");
+    throw TritError(
+        "未知硬件预设：" + preset +
+        "（可选 orin/dgp/x86/rk3588/amd/fp32/int8/none）");
   }
 }
 

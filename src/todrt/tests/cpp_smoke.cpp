@@ -181,6 +181,56 @@ void TestConfig() {
   CheckThrows([] { (void)json::parse("{ \"a\": }"); }, "JSON 语法错误报错");
   CheckThrows([] { (void)parse_precision("fp8ish"); }, "未知精度报错");
 
+  Section("2b-2. 多后端预设与配置字段");
+  {
+    // RK3588：NPU + INT8 + uint8 NHWC 前处理（归一化烧进量化模型）
+    DetectorOptions rk;
+    rk.ApplyPreset("rk3588");
+    Check(rk.device == Device::kNpu, "preset=rk3588 → device=npu");
+    Check(rk.precision == Precision::kINT8, "preset=rk3588 → INT8");
+    Check(rk.preproc_opts.output == PreprocOutput::kUint8Raw, "preset=rk3588 → 前处理输出 uint8");
+    Check(rk.preproc_opts.layout == TensorLayout::kNhwc, "preset=rk3588 → NHWC");
+    Check(rk.max_batch == 1 && !rk.dynamic_shape, "preset=rk3588 → 固定尺寸 batch=1");
+
+    // AMD/通用 CPU：走 CPU 后路（builder 决定是 ORT 还是 OpenVINO）
+    DetectorOptions amd;
+    amd.ApplyPreset("amd");
+    Check(amd.device == Device::kCpu, "preset=amd → device=cpu");
+    Check(amd.preproc_opts.output == PreprocOutput::kFloat32, "preset=amd → float32 输入");
+    Check(!amd.deploy.build.ov_cache_dir.empty(), "preset=amd → 默认开启 OpenVINO 编译缓存");
+
+    // 多后端字段的 JSON 解析
+    const std::string multi = R"({
+      "model": "SPAE_YOLOv8n",
+      "builder": "rknn",
+      "engine": { "path": "exports/spae.rk3588.rknn", "onnx": "exports/spae.onnx" },
+      "hardware": { "device": "npu", "precision": "int8", "accelerator_core": 1 },
+      "rknn": { "core_num": 3, "dequantize_output": true },
+      "onnxruntime": { "provider": "cpu", "intra_threads": 4 },
+      "openvino": { "device": "CPU", "cache_dir": "ov_cache", "num_streams": 2 },
+      "preprocess": { "output": "uint8", "layout": "nhwc", "width": 640, "height": 640 }
+    })";
+    DetectorOptions mo = DetectorOptions::FromJson(json::parse(multi));
+    Check(mo.device == Device::kNpu, "device=npu 解析正确");
+    Check(mo.deploy.build.accelerator_core == 1, "accelerator_core 解析正确");
+    Check(mo.deploy.build.dla_core == 1, "accelerator_core 同步到 dla_core 别名");
+    Check(mo.deploy.build.rknn_core_num == 3, "rknn.core_num 解析正确");
+    Check(mo.deploy.build.engine_path == "exports/spae.rk3588.rknn", "engine.path 解析正确");
+    Check(mo.deploy.build.ort_provider == "cpu", "onnxruntime.provider 解析正确");
+    Check(mo.deploy.build.ort_intra_threads == 4, "onnxruntime.intra_threads 解析正确");
+    Check(mo.deploy.build.ov_device == "CPU", "openvino.device 解析正确");
+    Check(mo.deploy.build.ov_cache_dir == "ov_cache", "openvino.cache_dir 解析正确");
+    Check(mo.preproc_opts.output == PreprocOutput::kUint8Raw, "preprocess.output=uint8 解析正确");
+    Check(mo.preproc_opts.layout == TensorLayout::kNhwc, "preprocess.layout=nhwc 解析正确");
+
+    // 新的 builder flags
+    BuildConfig bc;
+    Check(bc.set_flag("rknn_multi_core"), "flag rknn_multi_core 可识别");
+    Check(bc.set_flag("rknn_packed"), "flag rknn_packed 可识别");
+    Check(bc.set_flag("ort_disable_cpu_fallback"), "flag ort_disable_cpu_fallback 可识别");
+    Check(bc.set_flag("ov_cache"), "flag ov_cache 可识别");
+    Check(!bc.set_flag("no_such_flag"), "未知 flag 返回 false");
+  }
   Section("2c-2. JSON 布尔值（曾经踩过的坑：Value(bool) 只写 num_ 不写 bool_）");
   {
     const json::Value jb = json::parse(R"({"t": true, "f": false, "n": 1})");
@@ -231,14 +281,14 @@ void TestPreprocess() {
   CheckNear(r.pad_x[0], 0.f, 0.5f, "pad_x = 0（宽已占满）");
   CheckNear(r.pad_y[0], 140.f, 0.5f, "pad_y = (640-360)/2 = 140");
   Check(r.batch == 1 && r.width == 640 && r.height == 640, "输出张量形状 1×3×640×640");
-  Check(r.tensor.size() == static_cast<size_t>(3) * 640 * 640, "张量元素数正确");
+  Check(r.elems() == static_cast<size_t>(3) * 640 * 640, "张量元素数正确");
 
   const size_t plane = 640u * 640u;
-  CheckNear(r.tensor[0], 114.f / 255.f, 1e-5f, "顶部 padding 值为 114/255");
+  CheckNear(r.float_ptr()[0], 114.f / 255.f, 1e-5f, "顶部 padding 值为 114/255");
   const size_t cy = 320, cx = 320;
-  CheckNear(r.tensor[0 * plane + cy * 640 + cx], 50.f / 255.f, 2e-3f, "BGR→RGB：R = 50/255");
-  CheckNear(r.tensor[1 * plane + cy * 640 + cx], 100.f / 255.f, 2e-3f, "G = 100/255");
-  CheckNear(r.tensor[2 * plane + cy * 640 + cx], 200.f / 255.f, 2e-3f, "B = 200/255");
+  CheckNear(r.float_ptr()[0 * plane + cy * 640 + cx], 50.f / 255.f, 2e-3f, "BGR→RGB：R = 50/255");
+  CheckNear(r.float_ptr()[1 * plane + cy * 640 + cx], 100.f / 255.f, 2e-3f, "G = 100/255");
+  CheckNear(r.float_ptr()[2 * plane + cy * 640 + cx], 200.f / 255.f, 2e-3f, "B = 200/255");
 
   Section("3b. 坐标反变换与越界裁剪");
   const BBox back =
@@ -266,12 +316,62 @@ void TestPreprocess() {
   gi.height = H;
   gi.channels = 1;
   const PreprocessResult rg = pre->Run({gi});
-  CheckNear(rg.tensor[0 * plane + 320 * 640 + 320], 128.f / 255.f, 2e-3f, "灰度图 → 三通道复制");
+  CheckNear(rg.float_ptr()[0 * plane + 320 * 640 + 320], 128.f / 255.f, 2e-3f, "灰度图 → 三通道复制");
 
   Section("3d. 无效输入必须报错");
   ImageView bad;
   CheckThrows([&] { (void)pre->Run({bad}); }, "空图像报错");
   CheckThrows([&] { (void)pre->Run({}); }, "空批次报错");
+
+  Section("3e. uint8 + NHWC 输出（RKNN 量化模型的输入契约）");
+  {
+    // RKNN 把归一化烧进量化模型，所以宿主机必须给原始 uint8 —— 双重归一化不会报错，
+    // 只会给出全错的框。这一段就是把这个契约钉死在测试里。
+    PreprocessOptions qo = PreprocessOptions::ForRknnQuantized(640, 640);
+    Check(qo.output == PreprocOutput::kUint8Raw && qo.layout == TensorLayout::kNhwc,
+          "ForRknnQuantized 给出 uint8 + NHWC");
+    auto pre_q = make_detect_preprocessor(qo);
+    const PreprocessResult q = pre_q->Run({img});
+
+    Check(q.dtype == DataType::kU8, "输出 dtype 是 uint8");
+    Check(q.layout == TensorLayout::kNhwc, "输出布局是 NHWC");
+    Check(q.bytes.size() == static_cast<size_t>(640) * 640 * 3, "uint8 输出字节数正确");
+    Check(q.sample_bytes() == static_cast<size_t>(640) * 640 * 3, "单图字节数正确");
+    // 几何必须与 float 版本完全一致（否则坐标反变换会错）
+    CheckNear(q.scale[0], r.scale[0], 1e-6f, "uint8 与 float 的 letterbox scale 一致");
+    CheckNear(q.pad_y[0], r.pad_y[0], 0.5f, "uint8 与 float 的 pad_y 一致");
+
+    // NHWC 索引 = (y*W + x)*3 + c
+    auto at = [&](int y, int x, int c) -> size_t {
+      return (static_cast<size_t>(y) * 640 + static_cast<size_t>(x)) * 3 +
+             static_cast<size_t>(c);
+    };
+    Check(q.bytes[at(0, 320, 0)] == 114, "padding 值是原始 114（未归一化）");
+    // 中心像素：BGR(200,100,50) → NHWC 顺序应为 R=50, G=100, B=200
+    Check(q.bytes[at(320, 320, 0)] == 50, "NHWC[0] = R = 50");
+    Check(q.bytes[at(320, 320, 1)] == 100, "NHWC[1] = G = 100");
+    Check(q.bytes[at(320, 320, 2)] == 200, "NHWC[2] = B = 200");
+
+    // 少数 RKNN 模型是 NCHW + uint8，也应可用
+    PreprocessOptions no = qo;
+    no.layout = TensorLayout::kNchw;
+    const PreprocessResult n = make_detect_preprocessor(no)->Run({img});
+    const size_t plane_u8 = 640u * 640u;
+    Check(n.bytes[0 * plane_u8 + 320 * 640 + 320] == 50, "NCHW uint8：R 平面");
+    Check(n.bytes[2 * plane_u8 + 320 * 640 + 320] == 200, "NCHW uint8：B 平面");
+
+    // 数值读取保护：uint8 输出不能按 float 读
+    CheckThrows([&] { (void)q.float_ptr(); }, "uint8 输出按 float 读取时报错");
+  }
+
+  Section("3f. 工厂里的 uint8 前处理条目");
+  {
+    auto p = make_preprocessor("detect_letterbox_uint8");
+    Check(p != nullptr, "detect_letterbox_uint8 已注册");
+    Check(p->options().output == PreprocOutput::kUint8Raw, "该条目默认输出 uint8");
+    auto p2 = make_preprocessor("rknn");
+    Check(p2 != nullptr && p2->options().layout == TensorLayout::kNhwc, "别名 rknn 也可用");
+  }
 }
 
 // ------------------------------------------------------------------ 4. 解码

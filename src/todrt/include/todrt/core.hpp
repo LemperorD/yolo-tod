@@ -29,10 +29,16 @@ class TritError : public std::runtime_error {
   explicit TritError(const std::string& what) : std::runtime_error(what) {}
 };
 
-/// 设备类型。DLA 是 Jetson/Orin 上的固定功能加速器（硬件加速的主力）。
-enum class Device { kAuto = 0, kGpu = 1, kDla = 2 };
+/// 目标设备。**加速器统一用"设备 + core 编号"表达**，具体是哪种加速器由所选
+/// builder 决定（见 BUILD.md 的构建矩阵）：
+///
+///   kGpu   — NVIDIA GPU（TensorRT / ONNX Runtime CUDA EP）
+///   kDla   — Jetson/Orin 的固定功能加速器（TensorRT DLA）
+///   kNpu   — Rockchip RK3588 的 NPU（RKNN，3 个 core）；也用于未来其它 NPU
+///   kCpu   — 纯 CPU（ONNX Runtime CPU EP，作为参考基线）
+enum class Device { kAuto = 0, kGpu = 1, kDla = 2, kNpu = 3, kCpu = 4 };
 
-/// 数值精度。DLA 只支持 FP16 / INT8。
+/// 数值精度。DLA 只支持 FP16/INT8；RKNN 量化模型通常就是 INT8。
 enum class Precision { kFP32 = 0, kFP16 = 1, kINT8 = 2 };
 
 namespace detail {

@@ -263,6 +263,12 @@ class Detector {
   virtual std::vector<TensorView> last_outputs() const = 0;
 
  protected:
+  /// 子类用：设置模型名（注册名，与 Python variant 对应）
+  void set_model_name(std::string n) { model_name_ = std::move(n); }
+  /// 子类用：读取模型名
+  const std::string& model_name_impl() const { return model_name_; }
+
+  // ---- 异步骨架：子类只实现 RunBatch()，队列/线程/计时由基类兜底 ----
   /// **子类唯一需要实现的方法**：一次前处理结果 → 引擎推理 + 解码 + 坐标反变换。
   ///
   /// 为什么返回 `vector<Detection>` 而不是 `vector<vector<Detection>>`：
@@ -281,6 +287,9 @@ class Detector {
 
   /// 只读的原型配置（构造时传入的那份，尚未被后端补全）；用于诊断输出。
   const DetectorOptions& prototype_options() const { return opts_; }
+
+  /// 模型名（protected：子类在 Describe/model_name 里用）
+  std::string model_name_;
 
  private:
   DetectorOptions opts_;

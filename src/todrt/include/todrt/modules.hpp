@@ -105,10 +105,25 @@ enum class ResizeMode {
 
 enum class PadValue { kGray114 = 0, kZero = 1, kEdge = 2 };
 
-/// 前处理结果：一批图 → NCHW RGB float 缓冲 + 可逆变换记录。
+/// 张量内存布局。决定 `PreprocessResult::bytes` 里元素的排列方式，
+/// **必须与所选运行时的输入张量格式一致**：
+///
+///   kNchw — 通道在前：索引 = ((n*C + c)*H + y)*W + x   （TensorRT / ONNX Runtime）
+///   kNhwc — 通道在后：索引 = ((n*H + y)*W + x)*C + c   （RKNN 量化模型、TFLite）
+enum class TensorLayout { kNchw = 0, kNhwc = 1 };
+
+const char* to_string(TensorLayout l);
+
+/// 前处理输出：一批图 → 一个连续张量 + 可逆变换记录。
+///
+/// 为什么数据放裸字节而不是 `vector<float>`：RKNN 的量化模型输入是 **uint8**，
+/// TensorRT 是 FP16/FP32。用裸字节 + 显式的 dtype/layout，一个前处理器就能同时
+/// 服务两条完全不同的推理链路，不必为每种运行时各写一份 letterbox。
 struct PreprocessResult {
-  /// NCHW float：索引 = ((n*3 + c)*H + y)*W + x
-  std::vector<float> tensor;
+  /// 实际字节数（= batch * H * W * C * dtype_size(dtype)）
+  std::vector<uint8_t> bytes;
+  DataType dtype = DataType::kF32;
+  TensorLayout layout = TensorLayout::kNchw;
   int width = 0;
   int height = 0;
   int batch = 0;
@@ -121,10 +136,37 @@ struct PreprocessResult {
   std::vector<int> src_w;
   std::vector<int> src_h;
 
-  size_t sample_stride() const {
+  /// 单张图的字节数
+  size_t sample_bytes() const {
+    return static_cast<size_t>(channels) * static_cast<size_t>(height) *
+           static_cast<size_t>(width) * dtype_size(dtype);
+  }
+  /// 单张图的元素个数
+  size_t sample_elems() const {
     return static_cast<size_t>(channels) * static_cast<size_t>(height) *
            static_cast<size_t>(width);
   }
+  bool empty() const { return bytes.empty(); }
+
+  /// float32 输出时的只读视图（断言 dtype 后使用；uint8 输出下会抛错）。
+  const float* float_ptr() const {
+    if (dtype != DataType::kF32) {
+      throw TritError("前处理输出是 " + std::string(to_string(dtype)) +
+                      "，不能按 float 读取（RKNN 量化输入是 uint8）");
+    }
+    return reinterpret_cast<const float*>(bytes.data());
+  }
+  /// 元素个数（float 或 uint8 都按"元素"计）
+  size_t elems() const { return bytes.size() / dtype_size(dtype); }
+};
+
+/// 前处理要产出什么。**这一项决定引擎那边怎么读输入**，配错会直接报错或给出错框。
+enum class PreprocOutput {
+  /// float32 归一化张量：value = pixel * norm_scale + norm_bias（TensorRT / ORT 常用）
+  kFloat32 = 0,
+  /// uint8 原始像素（0–255），不归一化 —— RKNN 量化模型专属：
+  /// 归一化被"烧"进了量化模型，宿主机再归一化就成了双重归一化。
+  kUint8Raw = 1
 };
 
 struct PreprocessOptions {
@@ -134,15 +176,34 @@ struct PreprocessOptions {
   int pad_multiple = 32;
   ResizeMode mode = ResizeMode::kLetterbox;
   PadValue pad_value = PadValue::kGray114;
-  /// 归一化：value = pixel * norm_scale + norm_bias（默认 1/255，0）
+  /// 归一化：value = pixel * norm_scale + norm_bias（仅 kFloat32 输出时生效）
   float norm_scale = 1.f / 255.f;
   float norm_bias = 0.f;
   bool to_rgb = true;
+  /// 输出类型与布局：RKNN 走 kUint8Raw + kNhwc，TensorRT/ORT 走 kFloat32 + kNchw
+  PreprocOutput output = PreprocOutput::kFloat32;
+  TensorLayout layout = TensorLayout::kNchw;
+
+  /// 输出 dtype（由 output 推导，供引擎侧断言用）
+  DataType output_dtype() const {
+    return output == PreprocOutput::kUint8Raw ? DataType::kU8 : DataType::kF32;
+  }
+  /// 是否是 RKNN 量化模型所需的那条路径
+  bool is_quantized_input() const { return output == PreprocOutput::kUint8Raw; }
 
   static PreprocessOptions ForInput(int w, int h) {
     PreprocessOptions o;
     o.input_width = w;
     o.input_height = h;
+    return o;
+  }
+  /// RK3588 上 RKNN 量化模型的典型配置：640×640 letterbox，uint8 NHWC。
+  static PreprocessOptions ForRknnQuantized(int w, int h) {
+    PreprocessOptions o;
+    o.input_width = w;
+    o.input_height = h;
+    o.output = PreprocOutput::kUint8Raw;
+    o.layout = TensorLayout::kNhwc;
     return o;
   }
 };
@@ -272,20 +333,25 @@ class IPostprocessor {
 enum class BuilderFlag : uint32_t {
   kNone = 0,
   kFp16Fallback = 1u << 0,    ///< 允许 FP16 层（TensorRT < 11 用；10.x 起为强类型）
-  kInt8Fallback = 1u << 1,
+  kInt8Fallback = 1u << 1,    ///< 允许 INT8 层（TensorRT < 11 用）
   kDlaGpuFallback = 1u << 2,  ///< DLA 不支持的层退回 GPU（Orin 上基本必须）
   kDlaStandalone = 1u << 3,   ///< 只保留 DLA 支持的层（要求全部算子可上 DLA）
   kCudaGraphs = 1u << 4,      ///< 运行期 CUDA Graph（小 batch 降 CPU 开销）
   kSparsity = 1u << 5,
   kProfilingVerbosity = 1u << 6,
-  kStronglyTyped = 1u << 7
+  kStronglyTyped = 1u << 7,
+  kRknnMultiCore = 1u << 8,   ///< RKNN：把模型拆到多个 NPU core 上（RK3588 有 3 个）
+  kRknnPacked = 1u << 9,      ///< RKNN：让输出在 NPU 侧打包（减少 D2H 拷贝，需版本支持）
+  kOrtGraphOptimize = 1u << 10,  ///< ONNX Runtime：开启图优化（默认开）
+  kOrtDisableCpuFallback = 1u << 11,  ///< ONNX Runtime：EP 不可用时直接失败，不静默退 CPU
+  kOvCacheCompiled = 1u << 12  ///< OpenVINO：启用 model cache（第二次启动省编译时间）
 };
 
 struct BuildConfig {
   // --- 来源 ---
-  std::string onnx_path;
-  std::string engine_path;    ///< 非空 = 直接反序列化（engine 与硬件/TRT 版本绑定）
-  std::string serialize_out;  ///< 构建后落盘的 engine 路径
+  std::string onnx_path;      ///< ONNX 模型（TensorRT / ONNX Runtime 用）
+  std::string engine_path;    ///< 已构建产物：.engine（TRT）/ .rknn（RKNN）
+  std::string serialize_out;  ///< 构建后把产物落盘的路径
   std::string input_name;     ///< 空 = 自动探测
   std::string output_name;
   std::string fallback_input_name = "images";
@@ -293,9 +359,36 @@ struct BuildConfig {
   // --- 精度与硬件 ---
   Precision precision = Precision::kFP16;
   Device device = Device::kAuto;
-  int dla_core = 0;
+  /// 加速器核心编号：DLA core（Orin）/ NPU core（RK3588，0–2）。
+  /// 统一成一个字段，避免每接一种加速器就多一个 core 选项。
+  int accelerator_core = 0;
+  int dla_core = 0;  ///< accelerator_core 的别名（旧配置兼容）
   int dla_memory_limit_mb = 512;
   bool allow_gpu_fallback = true;
+
+  // --- RKNN（Rockchip NPU）---
+  /// .rknn 模型路径；为空时用 engine_path，再为空则尝试同目录同名 .rknn。
+  std::string rknn_model_path;
+  /// 多核模式：每核一个 context（见 kRknnMultiCore）。
+  int rknn_core_num = 1;
+  /// 输出是否为"量化后反量化"的 float（RKNN 默认给 float 输出）。
+  bool rknn_dequantize_output = true;
+
+  // --- ONNX Runtime ---
+  /// 执行提供者："auto" / "cpu" / "cuda" / "tensorrt" / "xnnpack" / "acl" / "openvino"
+  std::string ort_provider = "auto";
+  int ort_intra_threads = 0;  ///< 0 = ORT 自行决定
+  int ort_inter_threads = 0;
+  std::string ort_optimization = "all";  ///< disabled / basic / extended / all
+
+  // --- OpenVINO ---
+  /// 目标设备："auto" / "CPU" / "GPU" / "NPU"（OpenVINO 自己的命名，大写不敏感）
+  std::string ov_device = "CPU";
+  /// 编译缓存目录（首次编译较慢，缓存后启动快很多）
+  std::string ov_cache_dir;
+  int ov_num_streams = 0;      ///< 0 = 插件自行决定（CPU 上常设为物理核数）
+  int ov_num_threads = 0;      ///< 0 = 插件自行决定
+  std::string ov_performance_hint = "LATENCY";  ///< LATENCY / THROUGHPUT / CUMULATIVE_THROUGHPUT
 
   // --- shape ---
   bool dynamic_batch = false;

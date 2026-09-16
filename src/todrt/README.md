@@ -1,11 +1,27 @@
 # todrt —— yolo-tod 的 C++ 推理运行时
 
 > **一句话**：把 `tod/` 训练出来的魔改变体，用**一个名字 + 一份 JSON** 部署到实机
-> （TensorRT / Jetson Orin DLA / dGPU），并且让"新增一个变体"的代价保持在**一个文件 + 两行宏**。
+> （TensorRT / RKNN / ONNX Runtime / OpenVINO），并且让"新增一个变体"的代价保持在
+> **一个文件 + 两行宏**、"新增一个后端"的代价保持在**一个 .cpp + 一个分派分支**。
 
 `src/tod` 是训练侧（Python，ultralytics 插件化魔改库）；
-`src/todrt` 是部署侧（C++17，无第三方依赖，TensorRT 可选）。
+`src/todrt` 是部署侧（C++17，无第三方依赖，推理后端全部可选）。
 两者**唯一**的耦合是一份部署配置 JSON，由 `tools/export_onnx.py` 生成。
+
+## 四个后端
+
+同一份部署配置换个 `builder` 就能落到不同硬件上：
+
+| 后端 | 目标硬件 | 模型产物 | 输入契约 | 构建开关 |
+|---|---|---|---|---|
+| **TensorRT** | NVIDIA dGPU / Jetson DLA | `.engine`（板上构建，不可移植） | `float32 + nchw` | `-DTODRT_WITH_TENSORRT=ON` |
+| **RKNN** | Rockchip RK3588 NPU（3 核） | `.rknn`（x86 离线转换，可移植） | **`uint8 + nhwc`** | `-DTODRT_WITH_RKNN=ON` |
+| **ONNX Runtime** | 任意 CPU（AMD x86 主力） | 无（直接读 `.onnx`） | `float32 + nchw` | `-DTODRT_WITH_ORT=ON` |
+| **OpenVINO** | x86 CPU / Intel iGPU-NPU | 无（可缓存编译产物） | `float32 + nchw` | `-DTODRT_WITH_OPENVINO=ON` |
+
+> **输入契约是硬约束**：RKNN 的量化模型把归一化烧进了模型，宿主机必须给原始 uint8。
+> 配错不会报错，只会让所有框都错。所以 `resolve_preprocess_options()` 以**引擎声明**
+> 为准，并在冲突时打 warn；`preprocess.cpp` 用同一个几何核心同时支持两条输出路径。
 
 ```
 Python 训练端                         C++ 部署端
@@ -39,9 +55,14 @@ int nc = 10;  // 从训练脚本里抄来的，抄错了也没人知道
 | 工厂 | 回答什么问题 | 注册宏 | 现有实现 |
 |---|---|---|---|
 | `model`（变体配方） | 这个变体用哪条链路、什么解码参数 | `TOD_RT_DEFINE_RECIPE` | `SPAE_YOLOv8n`、`YOLOv8n_baseline` |
-| `builder` | 引擎从哪来（ONNX 构建 / engine 反序列化） | `TOD_RT_REGISTER_BUILDER` | `yolov8-trt`、`trt` |
-| `preproc` | 图 → 张量（letterbox / stretch / integer-scale） | `TOD_RT_REGISTER_PREPROC` | `detect_letterbox` |
+| `builder` | 引擎从哪来（TRT 构建 / RKNN 加载 / ORT 会话 / OV 编译） | `TOD_RT_REGISTER_BUILDER` | `yolov8-trt`、`rknn`、`ort`、`openvino` |
+| `preproc` | 图 → 张量（letterbox / stretch / integer-scale；float 或 uint8） | `TOD_RT_REGISTER_PREPROC` | `detect_letterbox`、`detect_letterbox_uint8` |
 | `postproc` | 张量 → 检测框（NMS / soft-NMS / 插件输出） | `TOD_RT_REGISTER_POSTPROC` | `detect_nms` |
+
+后端之间**共享**的装配逻辑只有一份（`backend_support.cpp` + `simple_detector.cpp`）：
+定契约 → 建引擎 → 配前处理 → 配后处理 → 解码 → 坐标反变换。
+每个后端只需实现 `IEngineRunner`（"跑一次"），于是不会出现
+"TRT 用 conf 0.25、RKNN 用 0.2"这类不可追溯的错配。
 
 于是**调用方只需要两行**：
 
@@ -138,21 +159,25 @@ cmake --build build/todrt -j
 四种输出布局对拍、NMS、坐标反变换、以及**错误配置必须报错**的路径。
 它不覆盖：引擎构建、DLA 归属、真实延迟 —— 那些只能在目标机上验证。
 
-### 3.2 实机（Jetson Orin / dGPU，**Linux**）
+### 3.2 实机（**Linux**）：按目标硬件选后端
 
 ```bash
-# JetPack 6.x 上 TensorRT/CUDA 已随系统安装在 /usr
-cmake -S src/todrt -B build/todrt -DTODRT_WITH_TENSORRT=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build/todrt -j$(nproc)
-sudo cmake --install build/todrt --prefix /usr/local     # 可选
+# Jetson Orin / Xavier / dGPU（TensorRT 随 JetPack 装在 /usr）
+cmake -S src/todrt -B build/orin -DTODRT_WITH_TENSORRT=ON && cmake --build build/orin -j$(nproc)
+
+# RK3588（librknnrt.so + rknn_api.h 已在 /usr/{lib,include}）
+cmake -S src/todrt -B build/rk3588 -DTODRT_WITH_RKNN=ON && cmake --build build/rk3588 -j$(nproc)
+
+# AMD/Intel x86（CPU 后路；两个都开，实测取快的）
+cmake -S src/todrt -B build/x86 -DTODRT_WITH_ORT=ON -DTODRT_WITH_OPENVINO=ON \
+      -DTODRT_ORT_ROOT=/opt/onnxruntime-linux-x64-1.18.0
+cmake --build build/x86 -j$(nproc)
+
+sudo cmake --install build/orin --prefix /usr/local     # 可选
 ```
 
-TensorRT 不在默认路径时：
-
-```bash
-cmake -S src/todrt -B build/todrt -DTODRT_WITH_TENSORRT=ON \
-      -DTensorRT_ROOT=/path/to/TensorRT -DCUDAToolkit_ROOT=/usr/local/cuda
-```
+同一个构建里可以同时开多个后端（`probe` 会逐个报可用性）。SDK 不在默认路径时用
+`-DTensorRT_ROOT=` / `-DTODRT_RKNN_ROOT=` / `-DTODRT_ORT_ROOT=` / `-DTODRT_OPENVINO_ROOT=`。
 
 ### 3.3 x86 构建机交叉编译到 Jetson
 
@@ -237,3 +262,37 @@ cmake -S src/todrt -B build/aarch64 \
 
 **唯一契约**：`configs/deploy/*.json`。字段定义见 `src/todrt/src/config_io.cpp`，
 由 `tools/export_onnx.py --deploy-config` 生成。schema 版本不匹配会被拒绝启动。
+
+---
+
+## 7. 版本敏感点（首次上实机时优先看这里）
+
+三个非 TensorRT 后端的代码都按各自 SDK 的公开 API 写，并用编译期开关隔离
+（`TODRT_HAVE_RKNN` / `TODRT_HAVE_ORT` / `TODRT_HAVE_OPENVINO`），
+但 SDK 小版本之间确实有漂移。首次接入时若编译不过，按此表定位：
+
+| 后端 | 敏感 API | 说明 |
+|---|---|---|
+| RKNN | `rknn_init(ctx, data, size, flag, rknn_init_extend*)` | 用 5 参数带 extend 的形式（rknpu2 现行版本）。更老的 SDK 只有 4 参数 —— 删掉最后一个实参即可，`core_mask` 也就无法指定 |
+| RKNN | `rknn_dup_context` | 多核必需；若该符号不存在说明 SDK 过旧，先退回单核（`rknn_core_num: 1`） |
+| RKNN | 头文件位置 | `rknn_api.h` 与 `librknnrt.so` 都在 rknpu2 的 `runtime/Linux/librknn_api/aarch64/` |
+| ONNX Runtime | `OrtCUDAProviderOptions` | 新版倾向 `AppendExecutionProvider_CUDA_V2`；只影响 CUDA EP，CPU EP 各版本都稳 |
+| ONNX Runtime | `GetInputNameAllocated` | ≥ 1.13 才有；更老的用 `GetInputName(i, alloc)`（代码里已按 `ORT_API_VERSION` 分支） |
+| ONNX Runtime | `AppendExecutionProvider("XNNPACK"/"ACL")` | 字符串版 EP 接口，各构建带哪些 EP 取决于发行包 |
+| OpenVINO | `Model::get_shape()` | 2024.x 起为 `get_input_shape()`/`get_output_shape()` —— 代码里用 `TODRT_OV_AT_LEAST_2024` 收敛在这个文件内 |
+| OpenVINO | `ov::hint::performance_mode` | 2.0 起稳定；更老的 Inference Engine API 不在支持范围 |
+
+> 这三份实现里**没有**任何"只有真机能编"的语法技巧：它们的 CMake 探测一旦成功
+> 就会参与编译，编译错误会立刻暴露版本不匹配，而不是留到运行时。
+
+### 怎么在没有对应硬件时先验证接线
+
+```bash
+# 装配链路（工厂 + 配置 + 前处理契约 + 解码器配置）完全不依赖 SDK：
+todrt_cli dryrun cfg.json --preset=rk3588 --builder=rknn
+#   → 会报告：前处理自动切成 uint8/NHWC、预期 anchor 数、构建器是否可用
+#   → 只差"把模型喂给 NPU"这一步，配置错误这时就能发现
+```
+
+这一点是本库把"装配"与"执行"分开的原因：配置错误（strides/nc/前处理类型）
+在开发机上就能全部抓出来，实机上只剩硬件相关问题。

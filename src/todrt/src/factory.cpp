@@ -304,7 +304,7 @@ class AsyncDetectorBase : public Detector {
 
   ~AsyncDetectorBase() override { StopWorker(); }
 
-  const std::string& model_name() const override { return model_; }
+  const std::string& model_name() const override { return model_name_; }
   const DetectorOptions& options() const override { return prototype_options(); }
 
   uint64_t Submit(const ImageView& image) override {
@@ -388,7 +388,6 @@ class AsyncDetectorBase : public Detector {
   }
 
  protected:
-  void set_model_name(std::string n) { model_ = std::move(n); }
   void set_preprocessor(std::unique_ptr<IPreprocessor> p) { pre_ = std::move(p); }
 
   std::unique_ptr<IPreprocessor> pre_;
@@ -471,7 +470,6 @@ class AsyncDetectorBase : public Detector {
     return true;
   }
 
-  std::string model_;
   std::thread worker_;
   mutable std::mutex mu_;
   std::condition_variable cv_;

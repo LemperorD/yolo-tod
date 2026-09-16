@@ -73,7 +73,16 @@ const char* to_string(Device d) {
   switch (d) {
     case Device::kGpu: return "gpu";
     case Device::kDla: return "dla";
+    case Device::kNpu: return "npu";
+    case Device::kCpu: return "cpu";
     default: return "auto";
+  }
+}
+
+const char* to_string(TensorLayout l) {
+  switch (l) {
+    case TensorLayout::kNhwc: return "nhwc";
+    default: return "nchw";
   }
 }
 
@@ -119,14 +128,20 @@ const char* to_string(OutputLayout l) {
 }
 
 namespace {
+/// 归一化枚举文本：只保留 ASCII 字母数字并转小写。
+/// 刻意**不用 std::tolower**：它在 MSVC + /utf-8 + 含非 ASCII 注释的源文件里
+/// 被观测到会漏掉字母（见 config_io.cpp 里同款说明），而配置字段是人手写的，
+/// 一个字母被吃掉就会变成"无法识别的 device"。
 std::string lower(std::string s) {
-  std::transform(s.begin(), s.end(), s.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   std::string out;
   out.reserve(s.size());
   for (char c : s) {
-    if (c == '-' || c == '_' || c == ' ') continue;  // 容忍 "no-gpu-fallback"
-    out.push_back(c);
+    if (c >= 'A' && c <= 'Z') {
+      out.push_back(static_cast<char>(c - 'A' + 'a'));
+    } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      out.push_back(c);
+    }
+    // 连字符/下划线/空格等一律丢弃，容忍 "no-gpu-fallback"、"rk3588 npu"
   }
   return out;
 }
@@ -137,7 +152,9 @@ Device parse_device(const std::string& s) {
   if (k.empty() || k == "auto" || k == "default") return Device::kAuto;
   if (k == "gpu" || k == "cuda" || k == "dgpu") return Device::kGpu;
   if (k == "dla" || k == "nvdla") return Device::kDla;
-  throw TritError("无法识别的 device：" + s + "（可选 auto/gpu/dla）");
+  if (k == "npu" || k == "rknn" || k == "rknnnpu" || k == "rockchip") return Device::kNpu;
+  if (k == "cpu" || k == "x86" || k == "amd" || k == "arm" || k == "host") return Device::kCpu;
+  throw TritError("无法识别的 device：" + s + "（可选 auto/gpu/dla/npu/cpu）");
 }
 
 Precision parse_precision(const std::string& s) {
@@ -220,7 +237,7 @@ std::string registry_catalog(const std::string& family) {
     std::vector<const RegistryEntry*> rows;
     for (const auto& n : detail::registry_order()) {
       const auto& e = detail::registry()[n];
-      if (e.family == fam) rows.push_back(&e);
+      if (e.family == fam && e.canonical) rows.push_back(&e);
     }
     if (rows.empty()) continue;
     oss << "\n## " << fam << "（" << rows.size() << " 项）\n";

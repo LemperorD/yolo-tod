@@ -29,6 +29,7 @@ def import_modules() -> None:
     try:
         import tod.loss  # noqa: F401
         import tod.modules  # noqa: F401
+        import tod.optim  # noqa: F401
     except ImportError as exc:
         print(f"[warn] 未能导入模块库（{exc}）：总表不完整。\n", file=sys.stderr)
 

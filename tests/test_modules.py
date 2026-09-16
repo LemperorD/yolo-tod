@@ -612,6 +612,106 @@ def test_end_to_end_build(fast: bool = False) -> None:
           f"，换头减少 {n_yaml - n_final:,}，头输入尺寸 {getattr(head, 'f', None)}")
 
 
+# ---------------------------------------------------------- 尺度分层评测
+
+
+def _dummy_dataset(n_train: int = 6, n_val: int = 3) -> Path:
+    """生成（或复用）合成数据集，返回 dataset.yaml。"""
+    import importlib.util
+
+    path = ROOT / "tests" / ".tmp" / "tiny-eval" / "dataset.yaml"
+    if not path.is_file():
+        tool = ROOT / "tools" / "make_dummy_dataset.py"
+        spec = importlib.util.spec_from_file_location("_tod_tool_dummy", tool)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        path = module.build(ROOT / "tests" / ".tmp" / "tiny-eval", n_train, n_val, seed=3)
+    return path
+
+
+def test_scale_eval() -> None:
+    """尺度分层评测：AP 数学、匹配规则，以及"分层真的能区分小/大目标"。"""
+    torch = _need_torch()
+    if torch is None:
+        return skip("尺度分层评测", "未安装 torch")
+    import importlib.util
+
+    if importlib.util.find_spec("PIL") is None:
+        return skip("尺度分层评测", "未安装 pillow")
+
+    from tod.eval.scales import (average_precision, bins_from_edges, evaluate, load_labels,
+                                 match_image)
+
+    # ---- 单元：分层边界 ----
+    bins = bins_from_edges([8, 16, 32, 96])
+    check("分层数为 5（<8 / 8-16 / 16-32 / 32-96 / >=96）", len(bins) == 5,
+          f"实际 {[b.name for b in bins]}")
+    check("分层边界正确",
+          [b.name for b in bins] == ["lt8", "8-16", "16-32", "32-96", "ge96"])
+    check("lt8 只含边长 <8", bins[0].contains(7.9) and not bins[0].contains(8.0))
+    check("ge96 无上界", bins[-1].contains(1e6) and not bins[-1].contains(95.0))
+
+    # ---- 单元：AP 数学 ----
+    check("AP：全对 → 1", abs(average_precision([True] * 5, [False] * 5, 5) - 1.0) < 1e-9)
+    check("AP：全错 → 0", abs(average_precision([False] * 5, [True] * 5, 5)) < 1e-9)
+    check("AP：部分命中介于 0/1 之间",
+          0 < average_precision([True, False], [False, True], 2) < 1)
+
+    # ---- 单元：匹配 ----
+    gts = [(0, (0, 0, 10, 10)), (0, (20, 20, 30, 30))]
+    preds = [(0, 0.9, (0, 0, 10, 10)), (0, 0.8, (21, 21, 31, 31)), (1, 0.7, (0, 0, 10, 10))]
+    matched = match_image(preds, gts, 0.5)
+    check("匹配：按置信度降序", [m[1] for m in matched] == [0.9, 0.8, 0.7])
+    check("匹配：同类命中", matched[0][2] == 0 and matched[1][2] == 1)
+    check("匹配：类别不同算 FP", matched[2][2] == -1)
+    dup = match_image([(0, 0.9, (0, 0, 10, 10)), (0, 0.8, (0, 0, 10, 10))], gts[:1], 0.5)
+    check("匹配：同一 GT 不会被匹配两次", dup[1][2] == -1)
+
+    # ---- 端到端：注入"完美预测器"，检验分层是否真的区分尺度 ----
+    data_yaml = _dummy_dataset()
+    from PIL import Image
+
+    def perfect(image: Path):
+        with Image.open(image) as im:
+            w, h = im.size
+        boxes, classes = load_labels(image, w, h)
+        return [(classes[i], 0.9, boxes[4 * i:4 * i + 4]) for i in range(len(classes))]
+
+    full = evaluate(data_yaml, predictor=perfect, split="val", verbose=False)
+    check("完美预测：整体 AP50 = 1", abs(full["overall"]["ap50"] - 1.0) < 1e-9,
+          f"实际 {full['overall']['ap50']}")
+    check("完美预测：每个非空尺度层 AP50 = 1",
+          all(abs(full["bins"][b]["ap50"] - 1.0) < 1e-9
+              for b in full["bins"] if full["bins"][b]["n_gt"] > 0),
+          f"{ {b: round(full['bins'][b]['ap50'], 3) for b in full['bins']} }")
+    check("合成数据的尺度分布覆盖小目标层与大目标层",
+          full["bins"]["lt8"]["n_gt"] > 0 and full["bins"]["ge96"]["n_gt"] == 0
+          and full["bins"]["16-32"]["n_gt"] + full["bins"]["32-96"]["n_gt"] > 0,
+          f"{ {b: full['bins'][b]['n_gt'] for b in full['bins']} }")
+
+    def only_large(image: Path):
+        return [p for p in perfect(image) if p[0] == 1]
+
+    partial = evaluate(data_yaml, predictor=only_large, split="val", verbose=False)
+    check("只预测大目标：整体 AP50 < 1（小目标漏检被计入）",
+          partial["overall"]["ap50"] < 1.0, f"实际 {partial['overall']['ap50']:.4f}")
+    small_keys = [b for b in partial["bins"] if b in ("lt8", "8-16", "16-32")
+                  and partial["bins"][b]["n_gt"] > 0]
+    check("只预测大目标：小目标层（含 16-32 里的小目标类）AP50 = 0",
+          bool(small_keys) and all(partial["bins"][b]["ap50"] <= 1e-9 for b in small_keys),
+          f"{ {b: round(partial['bins'][b]['ap50'], 3) for b in small_keys} }")
+    check("只预测大目标：大目标所在的 32-96 层仍是满分",
+          partial["bins"]["32-96"]["n_gt"] > 0
+          and abs(partial["bins"]["32-96"]["ap50"] - 1.0) < 1e-9,
+          f"n_gt={partial['bins']['32-96']['n_gt']} ap50={partial['bins']['32-96']['ap50']}")
+
+    empty = evaluate(data_yaml, predictor=lambda image: [], split="val", verbose=False)
+    check("空预测：整体 AP50 = 0", abs(empty["overall"]["ap50"]) < 1e-9)
+    check("结果带 meta（划分/图数/尺度边界）",
+          empty["meta"]["images"] == 3 and empty["meta"]["size_bins_px"] == [8, 16, 32, 96],
+          f"实际 {empty['meta']}")
+
+
 # ------------------------------------------------------- SDD-YOLO26n 端到端
 
 
@@ -713,6 +813,7 @@ def _load_recipe_variant(path: Path):
     spec.loader.exec_module(module)
     return module.variant
 
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="跳过端到端建图")
@@ -720,6 +821,7 @@ def main() -> int:
 
     tests = [test_adown, test_siou, test_dual_attention, test_wise_iou, test_stal,
              test_musgd, test_namespace_injection, test_efficient_uavdet_surgery,
+             test_scale_eval,
              test_kd]
     failures: list[str] = []
     for fn in tests:

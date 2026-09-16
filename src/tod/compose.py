@@ -67,10 +67,15 @@ class Variant:
     def without(self, target: str) -> "Variant":
         """剥离某个模块名或配置键（消融 / leave-one-out 用）。
 
-        同时匹配"键名"与"值"：``v.without("DySample")`` 与 ``v.without("upsample")``
-        都能让 EP3 的 DySample 覆盖失效。
+        同时匹配"键名"与"值"，并且覆盖 **EP 覆盖、model 段、训练段**：
+        ``v.without("DySample")`` / ``v.without("upsample")`` / ``v.without("add_p2")`` /
+        ``v.without("C3")``（P2 融合块）/ ``v.without("MuSGD")`` 都能生效。
+
+        为什么必须包含 model 段：P2 注入这类结构性改动记在 ``model_cfg`` 里
+        （``add_p2=True``、``p2_fuse_block="C3"``），早期版本只扫 ``eps``，
+        于是 ``v.without("add_p2")`` **静默什么都不做**，消融会得出假结论。
         """
-        for cfg in self.eps.values():
+        for cfg in (*self.eps.values(), self.model_cfg, self.train_cfg):
             for key in [k for k in cfg if k == target]:
                 cfg.pop(key)
             for key, value in list(cfg.items()):
@@ -78,6 +83,8 @@ class Variant:
                     cfg.pop(key)
                 elif isinstance(value, (list, tuple)) and target in value:
                     cfg[key] = [x for x in value if x != target]
+                elif isinstance(value, dict) and target in value:
+                    cfg[key] = {k: v for k, v in value.items() if k != target}
         return self
 
     def data(self, dataset: str, **kwargs: Any) -> "Variant":

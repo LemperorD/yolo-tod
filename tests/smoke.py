@@ -104,6 +104,21 @@ def test_compose() -> None:
     depth.without("_Dummy")
     check("without 可剥离模块", depth.used_modules() == [])
 
+    # 消融必须覆盖 model 段与 train 段：P2 注入这类结构性改动记在 model_cfg 里，
+    # 早期只扫 eps 会让 v.without("add_p2") 静默失效（消融会得出假结论）
+    ablation = (Variant("abl", base="yolov8n")
+                .model(add_p2=True, p2_fuse_block="C3")
+                .strategy(optimizer="MuSGD"))
+    ablation.without("add_p2")
+    check("without 能剥离 model 段开关（add_p2）", "add_p2" not in ablation.model_cfg,
+          f"实际 {ablation.model_cfg}")
+    ablation.without("C3")
+    check("without 能按值剥离 model 段（p2_fuse_block=C3）",
+          "p2_fuse_block" not in ablation.model_cfg, f"实际 {ablation.model_cfg}")
+    ablation.without("MuSGD")
+    check("without 能剥离 train 段（optimizer=MuSGD）",
+          "optimizer" not in ablation.train_cfg, f"实际 {ablation.train_cfg}")
+
     try:
         v.patch("EP99")
         raise AssertionError("[FAIL] 未知 EP 未报错")

@@ -54,6 +54,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from tod.compat import CompatError
 from tod.registry import register
 
 
@@ -79,7 +80,7 @@ def _valid_groups(c_in: int, c_out: int, per_group: int) -> int:
          "代价是 mAP@0.5 −0.4pp（论文明确承认是压缩/加速手段而非涨点手段）",
     notes="两层连续 3x3 分组卷积替换分支 stem，g=x//16（每组 16 通道），"
           "末端 1x1 保持普通卷积；不含 channel shuffle",
-    aliases=("EfficientUAVDet", "EfficientUAVDetHead"),
+    aliases=("EfficientUAVDet", "EfficientUAVDetHead", "Efficient_UAVDet"),
 )
 class GroupedStem(nn.Module):
     """检测头分支 stem：两层连续的 3x3 分组卷积（k=3, s=1, p=1，组内约 16 通道）。
@@ -181,6 +182,11 @@ def swap_detect_head(head: nn.Module, per_group: int = 16, channels: str = "nati
     if not (hasattr(head, "cv2") and hasattr(head, "cv3")):
         raise TypeError("传入的对象不是检测头（缺少 cv2/cv3 分支）。")
 
+    # 记录替换前分支 stem 的卷积层数（框架版本差异会体现在这里）
+    stem_convs = {attr: count_stem_convs(getattr(head, attr)[0][0])
+                  for attr in ("cv2", "cv3")}
+    head._tod_ep5_stem_convs = stem_convs
+
     for attr in ("cv2", "cv3"):
         branches = getattr(head, attr)
         new_branches = nn.ModuleList()
@@ -203,14 +209,45 @@ def swap_detect_head(head: nn.Module, per_group: int = 16, channels: str = "nati
     return head
 
 
+def _leaf(module: nn.Module, first: bool) -> nn.Module:
+    """钻到嵌套 ``Sequential`` 的最前/最后一个卷积（8.4 的分类分支是嵌套结构）。"""
+    for _ in range(8):                                # 防御性上限，避免意外深递归
+        if hasattr(module, "conv") or not isinstance(module, nn.Sequential) or not len(module):
+            return module
+        module = module[0] if first else module[-1]
+    return module
+
+
 def _in_channels(module: nn.Module) -> int:
-    conv = getattr(module, "conv", module)
+    conv = getattr(_leaf(module, True), "conv", _leaf(module, True))
+    if not hasattr(conv, "in_channels"):
+        raise CompatError(
+            f"无法从 {type(module).__name__} 推断输入通道："
+            "框架的检测头分支结构可能已变化，请在 tod/modules/head/efficient_uavdet.py 适配。"
+        )
     return int(conv.in_channels)
 
 
 def _out_channels(module: nn.Module) -> int:
-    conv = getattr(module, "conv", module)
+    conv = getattr(_leaf(module, False), "conv", _leaf(module, False))
+    if not hasattr(conv, "out_channels"):
+        raise CompatError(
+            f"无法从 {type(module).__name__} 推断输出通道："
+            "框架的检测头分支结构可能已变化。"
+        )
     return int(conv.out_channels)
+
+
+def count_stem_convs(module: nn.Module) -> int:
+    """统计分支 stem 里的卷积层数（用于暴露框架结构差异）。
+
+    8.2/8.3 的分类分支 stem 是 2 层卷积（与论文 Efficient_UAVDet 的"两层"对应）；
+    8.4 起分类分支变成**嵌套 Sequential**（层数更多）。本库的换头仍然只放两层分组
+    卷积，因此在新框架上属于"比论文更激进的压缩"，这个计数会被记录到日志/卡片里。
+    """
+    if isinstance(module, nn.Sequential):
+        return sum(count_stem_convs(m) for m in module)
+    return 1 if hasattr(module, "conv") or hasattr(module, "weight") else 0
 
 
 def describe(head: nn.Module) -> str:
@@ -227,4 +264,8 @@ def describe(head: nn.Module) -> str:
             c_mid = _out_channels(stem.cv2)
             lines.append(f"{attr}[{i}] {role}: in={c_in} -> mid={c_mid} (g={g}, "
                          f"{c_in / g if isinstance(g, int) and g else 0:.1f} ch/group)")
+    stem_convs = getattr(head, "_tod_ep5_stem_convs", {})
+    lines.append("本库把分支 stem 换成 2 层分组卷积（论文 §3.4）；替换前原始 stem 卷积层数："
+                 f"cv2={stem_convs.get('cv2', '?')}、cv3={stem_convs.get('cv3', '?')}"
+                 "（8.2/8.3 为 2；8.4 的分类分支是嵌套结构、层数更多 → 属更激进压缩）")
     return "\n".join(lines)

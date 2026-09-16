@@ -168,12 +168,17 @@ def install() -> None:
     """把注册的模块注入框架的模型解析命名空间，使其可在 YAML 中按名引用。
 
     这是本库**唯一**需要触碰框架内部的动作，全部实现收敛在 ``tod.compat``。
+    别名（aliases）也一并注入：变体配置与论文里常用别名（如 ``Efficient_UAVDet``），
+    只注入规范名会让这些名字在模型图里解析不到。注意注册表只能挡住**本库内部**
+    的重名；与框架自带同名符号的冲突用 ``compat.framework_has()`` 自查。
     """
     from tod import compat
 
     ns = compat.model_globals()
     for spec in list_specs():
         ns[spec.name] = spec.obj
+        for alias in spec.aliases:
+            ns[alias] = spec.obj
 
 
 def catalog() -> str:

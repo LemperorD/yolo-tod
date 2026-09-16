@@ -88,11 +88,17 @@ def test_compose() -> None:
          .data("visdrone2019-det", imgsz=1280, slicing={"patch": 1024, "overlap": 0.2})
          .upsample("_Dummy")
          .loss(box="_Dummy")
+         .attention("DualAttention", levels=[2, 3, 4, 5])
+         .assigner("STAL", small_target_aware=True)
+         .strategy(optimizer="MuSGD", teacher="teacher.pt", distill="FeatureAlignKD")
          .train(epochs=10, batch=4, amp=True)
          .model(add_p2=True, nc=10))
 
     check("EP 归属正确", v.spec()["eps"]["EP3"]["upsample"] == "_Dummy")
-    check("引用模块被识别", set(v.used_modules()) == {"_Dummy"})
+    check("EP4 注意力落到 EP4", v.spec()["eps"]["EP4"]["attention"] == "DualAttention")
+    check("EP6 分配器落到 EP6", v.spec()["eps"]["EP6"]["assigner"] == "STAL")
+    check("EP9 蒸馏落到 EP9", v.spec()["eps"]["EP9"]["distill"] == "FeatureAlignKD")
+    check("引用模块被识别（未注册的不会出现）", set(v.used_modules()) == {"_Dummy"})
 
     depth = Variant("x").upsample("_Dummy")
     depth.without("_Dummy")
@@ -223,6 +229,8 @@ def test_downsample_replacement() -> None:
     check("主干下采样替换 4 处", len(cfg["_downsample_replaced"]) == 4,
           f"实际 {cfg['_downsample_replaced']}")
     check("索引 1（P2/4）已替换", cfg["backbone"][1][2] == "ADown")
+    check("节点参数已裁剪到 ADown 的 arity（[128,3,2] -> [128]）",
+          cfg["backbone"][1][3] == [128], f"实际 {cfg['backbone'][1][3]}")
     check("索引 3/5/7 已替换",
           [cfg["backbone"][i][2] for i in (3, 5, 7)] == ["ADown"] * 3)
     check("索引 0 的 stem 未被替换（输入通道为奇数）", cfg["backbone"][0][2] == "Conv")
@@ -257,6 +265,9 @@ def test_from_spec_roundtrip() -> None:
          .upsample("_Dummy")
          .head("Efficient_UAVDet", per_group=16)
          .loss(box="_Dummy")
+         .attention("DualAttention", levels=[2, 3, 4, 5], reduction=16)
+         .assigner("STAL", small_target_aware=True)
+         .strategy(optimizer="MuSGD", kd_lambda=0.5, temperature=3.0)
          .model(add_p2=True, p2_channels=128)
          .train(epochs=1))
     data = v.spec()
@@ -282,6 +293,30 @@ def test_real_model_if_available() -> None:
     check("真实 base 图读取成功", "backbone" in cfg or "model" in cfg)
     detect = (cfg.get("head") or cfg.get("model"))[-1]
     check("真实图 P2 头注入成功", len(detect[0]) == 4)
+
+    # 所选规模必须显式生效：框架的 yaml_model_load 用**文件名**猜规模，猜不到就把
+    # d["scale"] 置空，parse_model 于是退化为 next(iter(scales.keys()))。
+    # 我们生成的 model.yaml 靠 compose 把所选规模排在首位来保证正确。
+    scales = cfg.get("scales")
+    if isinstance(scales, dict) and scales:
+        check("生成图的 scales 首位 = 所选规模", next(iter(scales)) == "n",
+              f"实际 {list(scales)[:3]}")
+
+    # YOLO26 base：原生 DFL-free（reg_max=1）+ NMS-free（end2end）—— SDD-YOLO 依赖这两点
+    try:
+        compat.base_model_yaml("yolo26")
+    except compat.CompatError:
+        PASSED.append("SKIP YOLO26 base 检查（该框架版本没有 yolo26.yaml）")
+    else:
+        cfg26 = (Variant("RealSDD", base="yolo26n")
+                 .model(nc=10, add_p2=True, p2_idx=2, p2_channels=128, p2_fuse_block="C3")
+                 .model_yaml(write=False))
+        check("YOLO26 base：end2end=True（NMS-free 图）", cfg26.get("end2end") is True)
+        check("YOLO26 base：reg_max=1（无 DFL 分支）", cfg26.get("reg_max") == 1)
+        detect26 = (cfg26.get("head") or cfg26.get("model"))[-1]
+        check("YOLO26 图 P2 头注入为 4 路", len(detect26[0]) == 4, f"实际 {detect26[0]}")
+        check("P2 融合块按论文 §4.2 用 C3",
+              any(str(n[2]) == "C3" for n in cfg26["head"]))
 
     # 检测头不做 YAML 改名，而是记录为建模后手术
     cfg2 = (Variant("RealHead", base="yolov8n")

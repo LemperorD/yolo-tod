@@ -58,10 +58,27 @@ def test_adown() -> None:
         y = m(torch.randn(2, 64, 40, 40))
     check("ADown 输出形状", tuple(y.shape) == (2, 128, 20, 20), f"实际 {tuple(y.shape)}")
 
-    # 非方形输入
+    # 非方形输入：输出尺寸是**下取整**的一半（33x41 -> 16x20），
+    # 与 ultralytics 自带 ADown 逐形状一致（下面做等价性对照）
     with torch.no_grad():
         y = m(torch.randn(1, 64, 33, 41))
-    check("ADown 非方形输入", tuple(y.shape) == (1, 128, 17, 21), f"实际 {tuple(y.shape)}")
+    check("ADown 非方形输入", tuple(y.shape) == (1, 128, 16, 20), f"实际 {tuple(y.shape)}")
+
+    import importlib.util
+
+    if importlib.util.find_spec("ultralytics") is not None:
+        from tod import compat
+
+        compat.ensure_runtime_env()
+        from ultralytics.nn.modules import ADown as _FrameworkADown
+
+        fm = _FrameworkADown(64, 128).eval()
+        with torch.no_grad():
+            for shape in ((2, 64, 40, 40), (1, 64, 33, 41)):
+                ours = m(torch.zeros(*shape)).shape
+                theirs = fm(torch.zeros(*shape)).shape
+                check(f"ADown 形状与框架一致 {shape}", tuple(ours) == tuple(theirs),
+                      f"{tuple(ours)} vs {tuple(theirs)}")
 
     # 奇数输入通道必须报错（要沿通道一分为二）
     try:
@@ -131,7 +148,194 @@ def _plain_iou(a, b):
     return inter / union
 
 
-# ----------------------------------------------------------------- 命名空间注入
+# ------------------------------------------------------------------ DualAttention
+
+
+def test_dual_attention() -> None:
+    torch = _need_torch()
+    if torch is None:
+        return skip("DualAttention", "未安装 torch")
+
+    import tod.modules  # noqa: F401  触发注册
+    from tod.modules.attention.dual_attention import DualAttention
+
+    m = DualAttention(64, reduction=16).eval()
+    x = torch.randn(2, 64, 20, 20)
+    with torch.no_grad():
+        y = m(x)
+    check("DualAttention 形状/通道不变", tuple(y.shape) == tuple(x.shape), f"实际 {tuple(y.shape)}")
+    check("DualAttention 不是直通", not torch.allclose(y, x))
+    # σ(·)·σ(·) ∈ (0,1) ⇒ 逐元素放大系数 < 1
+    check("DualAttention 输出幅度被抑制", bool((y.abs() <= x.abs() + 1e-6).all()))
+
+    try:
+        DualAttention(64, 32)
+        raise AssertionError("[FAIL] DualAttention 未拒绝 c2 != c1")
+    except ValueError:
+        PASSED.append("DualAttention 拒绝改变通道数")
+
+    xg = torch.randn(1, 32, 8, 8, requires_grad=True)
+    DualAttention(32)(xg).sum().backward()
+    check("DualAttention 梯度可达", xg.grad is not None and bool(xg.grad.abs().sum() > 0))
+
+    n = sum(p.numel() for p in DualAttention(64).parameters())
+    check("DualAttention 参数极少（<1k）", n < 1000, f"实际 {n}")
+
+
+# ---------------------------------------------------------------------- WIoU
+
+
+def test_wise_iou() -> None:
+    torch = _need_torch()
+    if torch is None:
+        return skip("WIoU", "未安装 torch")
+
+    from tod.loss.box import WiseIoU, box_loss
+
+    box = torch.tensor([[10.0, 10.0, 20.0, 20.0]])
+    for v in (1, 2, 3):
+        sim = WiseIoU(variant=v)(box, box.clone(), xywh=True)
+        check(f"WIoU v{v} 完全重合≈1", bool((sim - 1).abs().max() < 1e-5),
+              f"实际 {float(sim):.6f}")
+
+    v3 = WiseIoU(variant=3)
+    a = torch.tensor([[50.0, 50.0, 8.0, 8.0]])
+    b = torch.tensor([[51.0, 50.0, 8.0, 8.0]])
+    sim = v3(a, b, xywh=True)
+    check("WIoU v3 数值有限", bool(torch.isfinite(sim).all()), f"实际 {float(sim)}")
+
+    # v1 是无状态的，用它做 xywh/xyxy 一致性检查（v2/v3 会改 iou_mean，跨调用不可比）
+    v1 = WiseIoU(variant=1)
+    a_xyxy = _xywh2xyxy(a)
+    b_xyxy = _xywh2xyxy(b)
+    check("WIoU xywh/xyxy 一致",
+          bool((v1(a, b, xywh=True) - v1(a_xyxy, b_xyxy, xywh=False)).abs().max() < 1e-5))
+
+    mean_before = float(v3.iou_mean)
+    v3(torch.tensor([[0.0, 0.0, 4.0, 4.0]]), torch.tensor([[40.0, 40.0, 4.0, 4.0]]), xywh=True)
+    check("WIoU 跨 batch 滑动均值在更新", float(v3.iou_mean) != mean_before,
+          f"{mean_before} -> {float(v3.iou_mean)}")
+
+    x = torch.tensor([[50.0, 50.0, 8.0, 8.0]], requires_grad=True)
+    (1 - v3(x, b, xywh=True)).sum().backward()
+    check("WIoU 梯度可达", x.grad is not None and bool(x.grad.abs().sum() > 0))
+
+    check("box_loss('wiou') 返回有状态实例", isinstance(box_loss("wiou"), WiseIoU))
+    check("box_loss('siou') 返回无状态函数", not isinstance(box_loss("siou"), WiseIoU))
+
+
+# ---------------------------------------------------------------------- STAL
+
+
+def test_stal() -> None:
+    torch = _need_torch()
+    if torch is None:
+        return skip("STAL", "未安装 torch")
+    from tod import compat
+
+    if not compat.installed():
+        return skip("STAL", "未安装 ultralytics")
+    compat.ensure_runtime_env()
+
+    from tod.assigner.stal import small_target_assigner_class
+
+    strides = [8, 16, 32]
+    grid = torch.stack(torch.meshgrid(torch.arange(20) + 0.5, torch.arange(20) + 0.5,
+                                      indexing="ij"), -1).view(-1, 2) * 8
+    tiny = torch.tensor([[[80.0, 80.0, 84.0, 84.0]]])        # 4x4 < stride[0]=8
+    normal = torch.tensor([[[70.0, 70.0, 130.0, 130.0]]])     # 60x60
+    gt = torch.cat((tiny, normal), dim=1)
+    mask_gt = torch.ones(1, 2, 1)
+
+    def run(cls):
+        return cls(10, 2, 0.5, 6.0, strides).select_candidates_in_gts(grid, gt.clone(), mask_gt)
+
+    fw = run(compat.tal_assigner())
+    on = run(small_target_assigner_class(True))
+    off = run(small_target_assigner_class(False))
+
+    check("STAL 让极小目标拿到正样本（经典 TAL 为 0）",
+          int(on[0, 0].sum()) > 0 and int(off[0, 0].sum()) == 0,
+          f"STAL={int(on[0, 0].sum())} 经典={int(off[0, 0].sum())}")
+    check("STAL 放大幅度与框架一致", torch.equal(on[0, 0], fw[0, 0]))
+    check("小目标规则不影响普通目标", torch.equal(on[0, 1], off[0, 1]))
+    if hasattr(compat.tal_assigner()(10, 2, 0.5, 6.0, strides), "stride_val"):
+        check("本库 STAL 与框架实现逐元素一致", torch.equal(fw, on))
+
+    from tod.registry import get
+
+    built = get("STAL").obj(topk=10, num_classes=2, alpha=0.5, beta=6.0, stride=strides)
+    check("注册表工厂可构造 STAL", getattr(built, "small_target_aware", False) is True)
+
+
+# --------------------------------------------------------------------- MuSGD
+
+
+def test_musgd() -> None:
+    torch = _need_torch()
+    if torch is None:
+        return skip("MuSGD", "未安装 torch")
+
+    import copy
+
+    import torch.nn as nn
+
+    from tod.optim.musgd import (MuSGD, build, native_musgd, param_groups,
+                                 zeropower_newton_schulz)
+
+    ortho = zeropower_newton_schulz(torch.randn(32, 16))
+    sv = torch.linalg.svdvals(ortho)
+    check("NS 正交化形状不变", tuple(ortho.shape) == (32, 16))
+    check("NS 奇异值落在 [0.5, 1.5]（5 步放宽正交）",
+          bool((sv > 0.5).all() and (sv < 1.5).all()),
+          f"范围 [{float(sv.min()):.3f}, {float(sv.max()):.3f}]")
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = nn.Conv2d(3, 8, 3, padding=1)
+            self.bn = nn.BatchNorm2d(8)
+            self.fc = nn.Linear(8 * 4 * 4, 2)
+
+        def forward(self, x):
+            return self.fc(torch.relu(self.bn(self.conv(x))).flatten(1))
+
+    torch.manual_seed(0)
+    base = Net()
+    groups = param_groups(base, lr=0.02, momentum=0.9, weight_decay=0.01)
+    check("MuSGD 参数分组含 muon 组", any(g["use_muon"] for g in groups))
+    check("bias/BN 组不施加 weight decay",
+          all(g["weight_decay"] == 0.0 for g in groups if g["param_group"] in ("bias", "bn")))
+
+    def train_with(optimizer, model, steps=5):
+        torch.manual_seed(1)
+        data = [(torch.randn(4, 3, 4, 4), torch.randint(0, 2, (4,))) for _ in range(steps)]
+        for x, y in data:
+            optimizer.zero_grad()
+            nn.functional.cross_entropy(model(x), y).backward()
+            optimizer.step()
+
+    ref, mine = copy.deepcopy(base), copy.deepcopy(base)
+    native = native_musgd()
+    if native is not None:
+        train_with(native(params=param_groups(ref, lr=0.02, momentum=0.9, weight_decay=0.01),
+                          muon=0.2, sgd=1.0), ref)
+    train_with(MuSGD(params=param_groups(mine, lr=0.02, momentum=0.9, weight_decay=0.01),
+                     muon=0.2, sgd=1.0), mine)
+    if native is not None:
+        diff = max(float((p - q).abs().max()) for p, q in zip(ref.parameters(), mine.parameters()))
+        check("本库 MuSGD 与框架原生数值一致（<1e-3）", diff < 1e-3, f"实际 {diff:.2e}")
+
+    opt, source = build(mine, lr=0.01, prefer_native=False)
+    check("框架缺失时的兜底实现可用", isinstance(opt, MuSGD), source)
+    before = mine.conv.weight.detach().clone()
+    opt.zero_grad()
+    nn.functional.cross_entropy(mine(torch.randn(2, 3, 4, 4)), torch.randint(0, 2, (2,))).backward()
+    opt.step()
+    check("兜底实现能更新参数", not torch.equal(before, mine.conv.weight))
+
+
+# ---------------------------------------------------------------- 命名空间注入
 
 
 def test_namespace_injection() -> None:
@@ -143,13 +347,19 @@ def test_namespace_injection() -> None:
 
     if not compat.installed():
         return skip("命名空间注入", "未安装 ultralytics")
+    compat.ensure_runtime_env()
     try:
         tod.bootstrap()
+        import tod.assigner  # noqa: F401
+        import tod.engine.distill  # noqa: F401
+        import tod.loss  # noqa: F401
+        import tod.optim  # noqa: F401
     except ImportError as exc:
         return skip("命名空间注入", f"模块库导入失败：{exc}")
 
     ns = compat.model_globals()
-    for name in ("ADown", "Efficient_UAVDet", "siou"):
+    for name in ("ADown", "Efficient_UAVDet", "siou", "wiou", "DualAttention",
+                 "STAL", "MuSGD", "FeatureAlignKD"):
         check(f"命名空间含 {name}", name in ns)
 
 
@@ -190,9 +400,17 @@ def test_efficient_uavdet_surgery() -> None:
 
     head.train()
     x = [torch.randn(1, c, s, s) for c, s in zip(ch, (160, 80, 40, 20))]
-    y = head(x)
-    check("换头后前向可跑通", isinstance(y, (list, tuple)) and len(y) == 4)
-    check("前向输出通道 = nc + 4*reg_max", y[0].shape[1] == 10 + 64, f"实际 {y[0].shape[1]}")
+    out = head(x)
+    # 框架 8.4 起检测头训练模式的返回是 dict（end2end 时再套一层 one2many/one2one），
+    # 不再是老版本的 4 元素 list；这里按新契约取逐层 logits。
+    logits = out[1] if isinstance(out, tuple) else out
+    if isinstance(logits, dict) and "one2many" in logits:
+        logits = logits["one2many"]
+    check("换头后前向可跑通（返回 dict 契约）", isinstance(logits, dict) and "scores" in logits,
+          f"实际 {type(out).__name__}")
+    check("前向输出通道 = nc + 4*reg_max",
+          logits["boxes"].shape[1] + logits["scores"].shape[1] == 10 + 64,
+          f"实际 boxes={logits['boxes'].shape[1]} scores={logits['scores'].shape[1]}")
     print("       ↳ " + describe(head).replace("\n", "\n         "))
 
     # 另一种通道策略（in=out=x）也必须可用
@@ -200,6 +418,135 @@ def test_efficient_uavdet_surgery() -> None:
     swap_detect_head(head2, per_group=16, channels="input")
     check("input 策略：stem 内 in=out=x",
           head2.cv2[1][0].cv1.conv.in_channels == head2.cv2[1][0].cv2.conv.out_channels == 64)
+
+
+# --------------------------------------------------------- 知识蒸馏（EP9 §4.7）
+
+_SDD_CACHE: dict = {}
+
+
+def _sdd_model():
+    """构建一次并复用：yolo26n + P2 分支 + DualAttention（SDD 配方的最小骨架）。"""
+    if "model" in _SDD_CACHE:
+        return _SDD_CACHE["model"]
+    import importlib.util
+
+    for pkg in ("torch", "ultralytics"):
+        if importlib.util.find_spec(pkg) is None:
+            return None
+
+    import tod
+    from tod.compat import dump_yaml
+    from tod.compose import Variant
+
+    tod.bootstrap()
+    from ultralytics import YOLO
+    from ultralytics.cfg import get_cfg
+
+    from tod.engine.surgery import apply_spec
+
+    spec = (Variant("unit-sdd", base="yolo26n")
+            .model(nc=10, add_p2=True, p2_idx=2, p2_channels=128, p2_fuse_block="C3")
+            .attention("DualAttention", levels=[2, 3, 4, 5]))
+    path = ROOT / "tests" / ".tmp" / "unit_sdd_model.yaml"
+    dump_yaml(spec.model_yaml(write=False), path)
+    model = YOLO(str(path)).model
+    model.args = get_cfg()
+    apply_spec(model, spec.spec())
+    model.train()
+    _SDD_CACHE["model"] = model
+    return model
+
+
+def _unit_batch(imgsz: int = 320):
+    torch = _need_torch()
+    return {
+        "img": torch.rand(2, 3, imgsz, imgsz),
+        "cls": torch.tensor([[0.0], [1.0]]),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.06, 0.06], [0.3, 0.3, 0.02, 0.02]]),
+        "batch_idx": torch.tensor([0.0, 1.0]),
+    }
+
+
+def test_kd() -> None:
+    torch = _need_torch()
+    if torch is None:
+        return skip("FeatureAlignKD", "未安装 torch")
+    from tod import compat
+
+    if not compat.installed():
+        return skip("FeatureAlignKD", "未安装 ultralytics")
+    compat.ensure_runtime_env()
+
+    import copy
+
+    from tod.engine.distill import FeatureAlignKD, build_kd, head_strides, level_logits
+    from tod.loss.criterion import build_detection_loss
+
+    # ---- 单元：相同 logits 时 KL 必须为 0；combine 就是式 (6) ----
+    logits = {2: torch.randn(2, 64, 10), 3: torch.randn(2, 16, 10)}
+    kd = FeatureAlignKD(lambda_=0.5, temperature=3.0)
+    same = kd(logits, {k: v.clone() for k, v in logits.items()})
+    check("KD：相同 logits → 0", abs(float(same)) < 1e-5, f"实际 {float(same):.2e}")
+    check("KD：combine 即 (1-λ)L_task + λL_KD",
+          abs(float(kd.combine(torch.tensor(2.0), torch.tensor(4.0))) - 3.0) < 1e-6)
+    try:
+        kd({2: logits[2]}, {7: torch.randn(2, 64, 10)})
+        raise AssertionError("[FAIL] 无共同蒸馏层未报错")
+    except compat.CompatError:
+        PASSED.append("KD 拒绝无共同蒸馏层")
+
+    model = _sdd_model()
+    if model is None:
+        return skip("FeatureAlignKD 端到端", "未安装 torch/ultralytics")
+    teacher = copy.deepcopy(model).eval()          # 必须在注册 hook 前深拷贝
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    captured: dict = {}
+    model.model[-1].register_forward_hook(lambda mod, inp, out: captured.update(out=out))
+    batch = _unit_batch()
+
+    rec: dict = {}
+
+    class _Spy:                                     # 记录 combine 的入参，复核式 (6)
+        def __init__(self, inner):
+            self.inner = inner
+            self.lambda_ = inner.lambda_
+
+        def __call__(self, s, t):
+            out = self.inner(s, t)
+            rec["kd"] = float(out)
+            return out
+
+        def combine(self, task, kd_loss):
+            rec["task"], rec["kd_arg"] = float(task), float(kd_loss)
+            out = self.inner.combine(task, kd_loss)
+            rec["total"] = float(out)
+            return out
+
+    criterion = build_kd(build_detection_loss(model, kind="siou"), model, teacher)
+    criterion.kd = _Spy(criterion.kd)
+    model.criterion = criterion
+    total, _items = model(batch)
+
+    check("KD：式 (6) 逐值成立",
+          abs(rec["total"] - (0.5 * rec["task"] + 0.5 * rec["kd_arg"])) < 1e-4,
+          f"total={rec['total']:.6f} task={rec['task']:.6f} kd={rec['kd_arg']:.6f}")
+    check("KD：KD 项非零（教师 BN 统计与学生不同）", rec["kd_arg"] > 0)
+    check("KD：教师不混进学生参数表",
+          not ({id(p) for p in model.parameters()} & {id(p) for p in teacher.parameters()}))
+
+    levels = level_logits(captured["out"], head_strides(model))
+    check("KD：拆层键为 P2–P5", sorted(levels) == [2, 3, 4, 5], f"实际 {sorted(levels)}")
+    check("KD：逐层形状为 (b, A_l, nc)",
+          all(t.shape[0] == 2 and t.shape[2] == 10 for t in levels.values()))
+
+    total.sum().backward()
+    head_idx = model.model[-1].f[0]
+    check("KD：梯度到达注意力层",
+          model.model[head_idx].channel[2].weight.grad is not None)
+    check("KD：梯度不流向教师", all(p.grad is None for p in teacher.parameters()))
 
 
 # ---------------------------------------------------------------------- 端到端
@@ -277,8 +624,9 @@ def main() -> int:
     ap.add_argument("--fast", action="store_true", help="跳过端到端建图")
     args = ap.parse_args()
 
-    tests = [test_adown, test_siou, test_namespace_injection,
-             test_efficient_uavdet_surgery]
+    tests = [test_adown, test_siou, test_dual_attention, test_wise_iou, test_stal,
+             test_musgd, test_namespace_injection, test_efficient_uavdet_surgery,
+             test_kd]
     failures: list[str] = []
     for fn in tests:
         try:

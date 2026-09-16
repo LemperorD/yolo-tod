@@ -484,12 +484,45 @@ def inject_p2_head(
     return cfg
 
 
+def _module_arity(name: str) -> int | None:
+    """模块 ``__init__`` 的**必需**位置参数个数（不含 self）；拿不到返回 None。
+
+    用于把 Conv 节点改型成别的模块时裁剪参数：YAML 里 stride-2 Conv 的
+    ``[c2, k, s]`` 对 ``ADown(c1, c2)`` 来说是超编的（8.4 会直接 TypeError）。
+    """
+    import inspect
+
+    obj = None
+    try:
+        from tod.compat import model_globals
+
+        obj = model_globals().get(name)
+    except Exception:  # noqa: BLE001 - 未安装框架时退回注册表查找
+        obj = None
+    if obj is None:
+        try:
+            from tod.registry import get as _get
+
+            obj = _get(name).obj
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        params = list(inspect.signature(obj.__init__).parameters.values())[1:]
+    except (TypeError, ValueError):
+        return None
+    required = [p for p in params
+                if p.default is p.empty
+                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return len(required)
+
+
 def replace_downsample(
     cfg: dict,
     *,
     module: str = "ADown",
     indices: Sequence[int] | None = None,
     segments: Sequence[str] = ("backbone",),
+    trim_args: bool = True,
 ) -> dict:
     """把主干中的 stride-2 下采样卷积换成给定模块（如 ADown）。
 
@@ -502,12 +535,17 @@ def replace_downsample(
             —— YOLOv8 主干的 P2/P3/P4/P5 下采样点（索引 0 是 stem，
             输入通道为 3（奇数），ADown 这类需要通道一分为二的模块不能放）。
         segments: 在哪些段里替换，默认只改 backbone。
+        trim_args: 是否把节点参数裁剪到目标模块的必需参数个数（默认 True）。
+            原节点的参数是 Conv 的 ``[c2, k, s]``，而 ``ADown(c1, c2)`` 只吃两个位置参数
+            （c1 由 ``parse_model`` 自动补），不裁剪会在建图时报
+            ``ADown.__init__() takes 3 positional arguments but 5 were given``。
 
     Returns:
         就地修改后的 cfg，并写入 ``_downsample_replaced`` 供核查。
     """
     indices = tuple(indices) if indices is not None else (1, 3, 5, 7)
     replaced: dict[int, str] = {}
+    arity = _module_arity(module) if trim_args else None
 
     for segment in segments:
         if segment not in cfg:
@@ -519,11 +557,15 @@ def replace_downsample(
             if global_i not in indices:
                 continue
             old = str(node[2])
-            if old != module:                     # 幂等
-                new_node = list(node)
-                new_node[2] = module
-                seg_nodes[local_i] = new_node
-                replaced[global_i] = f"{old} -> {module}"
+            if old == module:                     # 幂等
+                continue
+            new_node = list(node)
+            new_node[2] = module
+            if arity is not None and len(new_node) > 3 and new_node[3]:
+                keep = max(1, arity - 1)          # parse_model 会补 c1
+                new_node[3] = list(new_node[3])[:keep]
+            seg_nodes[local_i] = new_node
+            replaced[global_i] = f"{old} -> {module}"
 
     cfg["_downsample_replaced"] = replaced
     return cfg

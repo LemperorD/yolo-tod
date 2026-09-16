@@ -5,7 +5,8 @@
 而不必改动 DFL 与分类分支。
 
 已实现：
-  * ``siou`` —— SPAE-YOLOv8 采用的回归损失（角度 + 距离 + 形状三部分代价）
+  * ``siou``  —— SPAE-YOLOv8 采用的回归损失（角度 + 距离 + 形状三部分代价）
+  * ``wiou``  —— SDD-YOLO §4.3 式 (3) 采用的 Wise-IoU v3（动态非单调聚焦）
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import math
 from typing import Callable
 
 import torch
+import torch.nn as nn
 
 from tod.registry import register
 
@@ -103,15 +105,122 @@ def siou(
     return iou - 0.5 * (distance_cost + shape_cost) + eps
 
 
-#: 名字 → 相似度函数。新增损失请同时在这里登记，训练准则按名查找。
-BOX_LOSSES: dict[str, Callable[..., torch.Tensor]] = {
+@register(
+    name="wiou",
+    ep="EP7",
+    paper="Wise-IoU: Bounding Box Regression Loss with Dynamic Focusing Mechanism "
+          "(SDD-YOLO §4.3 式 (3) 用它替换 DFL 分支的回归项)",
+    url="https://arxiv.org/abs/2301.10051",
+    year=2023,
+    license="官方实现 MIT；本文件为按论文公式独立重写",
+    cost="与 IoU 同量级（多一次 exp 与跨 batch 标量均值）；无额外参数、"
+         "只多 1 个不参与梯度的滑动均值 buffer",
+    notes="v3 的非单调聚焦系数 r 会同时压低极易/极难样本的权重；"
+          "对小目标（IoU 抖动大）比 CIoU 稳",
+    aliases=("WiseIoU", "WIoU", "wiou_v3", "WiseIoUv3"),
+)
+class WiseIoU(nn.Module):
+    """Wise-IoU v1/v2/v3 的**相似度**形式（返回值越大越好，loss = 1 - 返回值）。
+
+    论文（arXiv 2301.10051）把 WIoU 写成损失，这里按本库约定取 ``1 - L``：
+
+    ==========  ====================================================================
+    v1           ``L = R_WIoU · (1 - IoU)``，``R_WIoU = exp(Δ² / (Wg² + Hg²))``
+                 距离注意力系数，**detach**（不参与反传）；Δ 为中心点欧氏距离，
+                 Wg/Hg 为最小外接框宽高
+    v2           在 v1 上乘离群度 ``β = L*_IoU / L̄_IoU``（均 detach），
+                 抑制低质量样本的梯度
+    v3           ``r = β / (δ·α^(β-δ))``，非单调聚焦系数（α=1.9、δ=3.0）；
+                 β=δ 时 r 最大，极易与极难样本都被压低
+    ==========  ====================================================================
+
+    ``L̄_IoU``（``iou_mean``）是跨 batch 的滑动均值（momentum=0.99，官方实现同款），
+    首个 batch 用 1.0 初始化 —— 因此**前若干步的 β 不可信**，属于该方法固有行为。
+
+    Args:
+        variant: 1 / 2 / 3。
+        alpha, delta: v3 的非单调聚焦超参（论文取 1.9 / 3.0）。
+        momentum: ``iou_mean`` 的滑动平均系数。
+    """
+
+    def __init__(self, variant: int = 3, alpha: float = 1.9, delta: float = 3.0,
+                 momentum: float = 0.99, eps: float = 1e-7):
+        super().__init__()
+        if variant not in (1, 2, 3):
+            raise ValueError(f"WiseIoU 只支持 variant ∈ {{1,2,3}}，实际 {variant}。")
+        self.variant = int(variant)
+        self.alpha = float(alpha)
+        self.delta = float(delta)
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+        # 注册成 buffer：换设备/存 checkpoint 时一起走，且不参与梯度
+        self.register_buffer("iou_mean", torch.tensor(1.0))
+
+    def forward(self, box1: torch.Tensor, box2: torch.Tensor, xywh: bool = True,
+                theta: float | None = None, **_: object) -> torch.Tensor:
+        """返回 ``1 - L_WIoU``（theta 仅为与 siou 等损失统一调用签名而存在，此处忽略）。"""
+        if xywh:
+            (cx1, cy1, w1, h1), (cx2, cy2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+            b1x1, b1x2 = cx1 - w1 / 2, cx1 + w1 / 2
+            b1y1, b1y2 = cy1 - h1 / 2, cy1 + h1 / 2
+            b2x1, b2x2 = cx2 - w2 / 2, cx2 + w2 / 2
+            b2y1, b2y2 = cy2 - h2 / 2, cy2 + h2 / 2
+        else:
+            b1x1, b1y1, b1x2, b1y2 = box1.chunk(4, -1)
+            b2x1, b2y1, b2x2, b2y2 = box2.chunk(4, -1)
+            cx1, cy1 = (b1x1 + b1x2) / 2, (b1y1 + b1y2) / 2
+            cx2, cy2 = (b2x1 + b2x2) / 2, (b2y1 + b2y2) / 2
+
+        inter = (torch.min(b1x2, b2x2) - torch.max(b1x1, b2x1)).clamp(0) * (
+            torch.min(b1y2, b2y2) - torch.max(b1y1, b2y1)
+        ).clamp(0)
+        union = ((b1x2 - b1x1) * (b1y2 - b1y1) + (b2x2 - b2x1) * (b2y2 - b2y1)
+                 - inter + self.eps)
+        loss = 1.0 - inter / union                        # L_IoU
+
+        # --- R_WIoU：距离注意力（detach，只调权重不改梯度方向）---
+        wg = torch.max(b1x2, b2x2) - torch.min(b1x1, b2x1)
+        hg = torch.max(b1y2, b2y2) - torch.min(b1y1, b2y1)
+        dist2 = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
+        r_w = torch.exp(dist2 / (wg.pow(2) + hg.pow(2) + self.eps)).detach()
+        loss = r_w * loss                                  # L_WIoUv1
+
+        if self.variant >= 2:
+            mean = self._update_mean(loss)
+            beta = (loss.detach() / mean)                   # 离群度 β
+            if self.variant == 2:
+                loss = beta * loss
+            else:
+                r = beta / (self.delta * self.alpha ** (beta - self.delta))
+                loss = r.detach() * loss
+        return 1.0 - loss
+
+    @torch.no_grad()
+    def _update_mean(self, loss: torch.Tensor) -> torch.Tensor:
+        """用当前 batch 的均值更新滑动均值 ``L̄_IoU``，返回更新后的值。"""
+        self.iou_mean.mul_(self.momentum).add_(
+            loss.detach().mean().to(self.iou_mean) * (1.0 - self.momentum)
+        )
+        return self.iou_mean.clamp(min=self.eps)
+
+
+#: 名字 → 相似度函数/可调用对象（类会被实例化，见 ``box_loss``）。
+BOX_LOSSES: dict[str, Callable[..., torch.Tensor] | type[nn.Module]] = {
     "siou": siou,
+    "wiou": WiseIoU,
 }
 
 
-def box_loss(name: str) -> Callable[..., torch.Tensor]:
-    """按名字取回归损失函数。"""
+def box_loss(name: str, **kwargs: object):
+    """按名字取回归损失。
+
+    Returns:
+        可调用对象：``fn(box1, box2, xywh=False, **kw) -> similarity``。
+        注册为类的损失（如 ``WiseIoU``）会在这里实例化，以便持有跨 batch 状态。
+    """
     key = name.lower()
     if key not in BOX_LOSSES:
         raise KeyError(f"未实现的回归损失 {name!r}；已有：{sorted(BOX_LOSSES)}")
-    return BOX_LOSSES[key]
+    entry = BOX_LOSSES[key]
+    return entry(**kwargs) if isinstance(entry, type) else entry
+

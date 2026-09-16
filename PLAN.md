@@ -561,7 +561,7 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ## 12. 落地进展
 
-### M0 架构层（已完成，`python tests/smoke.py` 51 项检查全绿）
+### M0 架构层（已完成，`python tests/smoke.py` 63 项 + `python tests/test_modules.py` 71 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
@@ -569,14 +569,19 @@ planned → reproducing → reproduced → (promoted | dropped)
 | `src/tod/compat.py` | 唯一触碰 ultralytics 内部的兼容层：命名空间注入、基础 Conv/Detect 获取、内置模型 YAML 定位、版本区间校验 | ✅ |
 | `src/tod/compose.py` | 变体 DSL：`patch/without/data/train/model` → 变体配置、模型 YAML、变体卡片；含 **P2 头注入**、**主干下采样替换**、节点类型替换 | ✅ |
 | `src/tod/runtime.py` | 变体 spec 的运行时上下文（避免污染框架的训练参数校验） | ✅ |
-| `src/tod/loss/box.py` + `criterion.py` | **SIoU** 与训练准则接入：只替换 IoU 项、复用框架 DFL | ✅ |
-| `src/tod/engine/trainer.py` + `surgery.py` | 自定义 Trainer（换准则 + 检测头手术） | ✅ |
+| `src/tod/loss/box.py` + `criterion.py` | **SIoU / Wise-IoU v3** 与训练准则接入：只替换 IoU 项、复用框架回归分支；无 DFL 开关；覆盖 YOLO26 `E2ELoss` 的 O2M/O2O **两套**子准则 | ✅ |
+| `src/tod/engine/trainer.py` + `surgery.py` | 自定义 Trainer（EP4·EP5 建模后手术 + EP6/EP7/EP9 接线；修正了"Trainer.init_criterion 从不被调用"的死代码）；注意力**插入式**手术（颈部零改动） | ✅ |
 | `src/tod/modules/conv/adown.py` | **ADown** 双分支自适应下采样（EP1） | ✅ |
+| `src/tod/modules/attention/dual_attention.py` | **DualAttention** 通道⊗空间双注意力（EP4，SDD-YOLO 式 4） | ✅ |
+| `src/tod/assigner/stal.py` | **STAL** 小目标感知分配 + 可消融开关（EP6） | ✅ |
+| `src/tod/optim/musgd.py` | **MuSGD**（Muon 式 Newton–Schulz + SGD 分量，优先框架原生）（EP9） | ✅ |
+| `src/tod/engine/distill.py` | **特征对齐蒸馏** P2–P5 逐层 KL（EP9，SDD-YOLO 式 6/7） | ✅ |
 | `src/tod/modules/head/efficient_uavdet.py` | **Efficient_UAVDet** 轻量检测头，两组通道策略（EP5） | ✅ |
-| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**51 项**） | ✅ |
-| `tests/test_modules.py` | 形状 / 数值 / 换头 / 端到端建图测试（需 torch） | ✅ |
+| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**63 项**） | ✅ |
+| `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 端到端建图测试（需 torch，**71 项**） | ✅ |
 | `tools/make_variant.py` / `train.py` / `catalog.py` | 变体物化、训练入口（含 `--dry-run` 结构自检）、文档生成 | ✅ |
-| `variants/SPAE-YOLOv8n/` | 首个完整变体：`recipe.py` + `variant.yaml` + `card.md` + `paper-notes.md` + `evidence/` | ✅ |
+| `variants/SPAE-YOLOv8n/` | 变体 1：`recipe.py` + `variant.yaml` + `model.yaml` + `card.md` + `paper-notes.md` | ✅ |
+| `variants/SDD-YOLO26n/` | 变体 2：同上（+ 论文矛盾/推断清单、本库实测数据表） | ✅ |
 
 **已验证的关键逻辑**（对官方 yolov8 同构图做单元验证）：
 
@@ -604,19 +609,44 @@ planned → reproducing → reproduced → (promoted | dropped)
 3. **论文自身的数据需要交叉验证**：Table 3 的 x=32/64/128/256 反向确定了 P2 融合块应为 128 通道
    （width=0.25 → 32），这同时验证了 P2 注入与检测头分组配置的一致性。
 
+### 已实现变体：SDD-YOLO26n（arXiv:2603.25218，空对地反无人机）
+
+论文四大贡献的可复现部分全部落地：P2 高分辨率头（EP5/EP2，§4.2 的 C3 瓶颈融合）+
+双注意力（EP4，§4.5 式 4）+ DFL-free（§4.3，`dfl=0.0` + Wise-IoU v3）+ NMS-free（§4.4，底座
+`end2end`）+ MuSGD（EP9，§4.6 式 5）+ STAL（EP6）+ 特征对齐 KD（EP9，§4.7 式 6/7，默认关闭）。
+取证笔记见 `variants/SDD-YOLO26n/paper-notes.md`（含原文摘录、**论文内部矛盾 10 处**、
+未标注项 9 处、与论文的刻意差异、本库实测数据表）。
+
+**本变体带来的三个框架/方法学结论：**
+
+1. **论文的"YOLO26 创新"在 ultralytics 8.4 里已内建**：`yolo26.yaml` 自带 `end2end: True` 与
+   `reg_max: 1`；`E2ELoss.update()` 就是论文所说的 ProgLoss；`TaskAlignedAssigner` 已含
+   小目标先验（即 STAL）。本库的贡献是把这些接进**可消融配置**并逐项验证，而不是重新发明。
+   相应地，`compat.MAX_TESTED_VERSION` 从 8.3 上探到 **8.4**。
+2. **"加模块零成本"不成立，且方向依赖 `nc`**：`Detect` 的分类分支宽度取
+   `c3 = max(ch[0], min(nc,100))`，P2 头把 `ch[0]` 由 64 降到 32，于是分支变窄、
+   总参数反而 −20,900，而 FLOPs 明确 +3.60 G（imgsz=1024：14.83 → 18.43）。
+   论文 Table 2/4 声称 Params/FLOPs 完全不变，与框架行为矛盾。
+3. **论文没定义的地方必须自己拍定并写下来**：式 (7) 的锚点维归一化（求和时 KD=2017.8 会压垮
+   L_task=22.8；本库默认取均值 → KD≈0.44）、STAL 的具体形式（论文仅一句话）、
+   式 (4) 的 `W_c`/r（取 CBAM 惯例）、以及 σ 是 softmax 而检测头其实是 sigmoid 多标签。
+
 ### 尚未完成（阻塞项）
 
-1. **训练环境未装**：本机只有 numpy + pyyaml，缺 torch / ultralytics（用户正在建 conda 环境）。
-   环境就绪后 `tests/smoke.py` 与 `tests/test_modules.py` 的 SKIP 项会自动变为真实校验。
+1. **精度类数字尚未产生**：本机训练环境（Python 3.13 + torch 2.11 + ultralytics 8.4.60 + RTX 5060 8 GB）
+   刚刚可用，SPAE/SDD 的首轮训练与消融属于 M1；当前所有"验证"都是**结构与数值级**的。
 2. **`inject_p2_head` 只覆盖直连式 P2 头**：完整 P2 双向融合 / BiFPN / AFPN 重拓扑属于 M1。
-3. **论文未说明的部分**：是否用预训练权重、§3.2 的 "feature calibration" 具体算子、
-   P2 拼接后的模块、检测头跨尺度是否共享权重 —— 均已在 paper-notes §5 标注为推断。
+3. **论文未说明的部分**：SPAE 的 "feature calibration"、SDD 的 STAL 公式与 KD 锚点归一化、
+   是否用预训练权重、epoch/batch 设置 —— 均已在各自 paper-notes 里标注为推断。
+4. **SPAE 在 8.4 上的头结构差异**：8.4 的分类分支是嵌套 Sequential（层数多于 8.2/8.3 的 2 层），
+   本库换头仍只放两层分组卷积 → 属"更激进压缩"，已在 `describe()` 里输出替换前的 stem 层数。
 
 ### M1 剩余任务（下一步）
 
-- [ ] conda 环境装好后跑 `python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --dry-run`，
-      确认 P2 头 / ADown / Efficient_UAVDet 三处改造生效并记录参数量（论文换头 −0.6M 可作对照）
 - [ ] `tools/val.py` / `tools/ablation.py`
 - [ ] 尺度分层评测（`src/tod/eval/`）：固定输出 `AP_small` / `AP_tiny` / 分层召回
 - [ ] 路线 1 干净基线：`YOLOv8n + P2 + imgsz=640`，记录 AP/显存/延迟作为锚点
+- [ ] 路线 2 干净基线：`YOLO26n + P2 + imgsz=1024`（SDD 的锚点；结构自检已通过）
 - [ ] SPAE 四组件的单模块消融，复现论文的贡献排序（预期 P2 占绝对主导）
+- [ ] SDD 补齐论文 Table 3 捆在一起的四列消融：`¬DFL / NMS-free / MuSGD / STAL` 各自贡献
+- [ ] SDD 打开蒸馏（需本地 YOLO26x 权重或更小的教师）验证 λ=0.5/T=3.0 的增益

@@ -3,13 +3,17 @@
 收集、复现并**可归因地**对比针对小目标检测（Tiny/Small Object Detection）的 YOLO 魔改。
 完整方案见 [`PLAN.md`](PLAN.md)：架构设计、值得收录的魔改清单、优先级、评测协议。
 
-**当前状态：M0 骨架已完成（51 项冒烟检查全绿）；首个变体 SPAE-YOLOv8n 已实现，待环境就绪后验证。
+**当前状态：M0 骨架已完成（`tests/smoke.py` 63 项全绿，`tests/test_modules.py` 71 项全绿）；
+两个论文级变体已实现 —— SPAE-YOLOv8n（VisDrone 待验证）与 SDD-YOLO26n（结构自检已通过，训练待跑）。
 推理端（C++/TensorRT）工厂化骨架已落地：`src/todrt/`，CPU 自检 107 项全绿。**
 
-- 主干框架：**ultralytics**（AGPL-3.0）
+- 主干框架：**ultralytics**（AGPL-3.0；本库实测区间 8.2 → **8.4**，8.4 才自带
+  `end2end`/`MuSGD`/TAL 小目标先验，SDD-YOLO 依赖这三项）
 - 第一主战场：**VisDrone2019-DET**（航拍小目标）
 - 本机：RTX 5060 Laptop **8 GB** ／ Python 3.14.5 → 建议另建 **Python 3.12** 虚拟环境
-- 部署端：**Linux + TensorRT 10.x**（Jetson Orin 优先，DLA + FP16）；见 [`docs/DEPLOY.md`](docs/DEPLOY.md)
+- 部署端：**Linux**，四个可选后端 —— TensorRT（NVIDIA / Jetson DLA）、**RKNN（RK3588 NPU）**、
+  **ONNX Runtime（通用 CPU，AMD x86 主力）**、**OpenVINO（x86 CPU / Intel iGPU）**；
+  见 [`docs/DEPLOY.md`](docs/DEPLOY.md)
 
 ## 已实现的变体
 
@@ -41,6 +45,32 @@ python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --data config
 > ⚠️ 两个必须知道的结论：① 论文消融显示 **P2 贡献 +7.5pp 是绝对主力**，而 Efficient_UAVDet 是
 > **−0.4pp 的"降本不涨点"**（参数 −20%、FPS +28%），论文自己也承认；② 论文用 Det-Fly
 > 空对空数据集，本库换成 VisDrone 空对地，**论文的 mAP 数字不可直接引用**。
+
+### SDD-YOLO26n —— 空对地反无人机小目标检测（arXiv:2603.25218）
+
+论文 [SDD-YOLO](https://arxiv.org/abs/2603.25218) 的四大贡献中，可复现部分全部落地：
+
+| 组件 | 论文 | 本库落点 | 说明 |
+|---|---|---|---|
+| **P2 高分辨率头** | §4.2 式 (1) | `model(add_p2=True, p2_fuse_block="C3")`（EP5/EP2） | 4× 下采样；**C3 瓶颈融合是原文用词** |
+| **双注意力** | §4.5 式 (4) | `modules/attention/dual_attention.py`（EP4） | `σ(W_c·GAP) ⊗ σ(Conv7×7([Avg;Max]))`，通道不变、原位插入 |
+| **DFL-free** | §4.3 式 (3) | `train(dfl=0.0)` + `loss(box="wiou")`（EP7） | 底座已是 `reg_max=1`；增益为 0 时连计算都省掉 |
+| **NMS-free** | §4.4 | 底座 `end2end=True` + `E2ELoss` | 本库把**两套**准则（O2M/O2O）的 IoU 项都替换掉 |
+| **MuSGD** | §4.6 式 (5) | `optim/musgd.py`（EP9） | 优先用框架原生；二者数值对照 <1e-3 |
+| **ProgLoss / STAL** | §4.6 | 底座 `E2ELoss.update` / `TaskAlignedAssigner` | 论文未给 STAL 公式，本库显式化为可消融开关 |
+| **特征对齐 KD** | §4.7 式 (6)(7) | `engine/distill.py`（EP9） | λ=0.5、T=3.0；默认关闭（YOLO26x 教师 8 GB 放不下） |
+
+```powershell
+python tools\make_variant.py variants\SDD-YOLO26n\recipe.py
+python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
+```
+
+> ⚠️ 引用前必读 `variants/SDD-YOLO26n/paper-notes.md`：论文用**未公开**的 DroneSOD-30K
+> （且三个子集相加 47 750 ≠ 摘要"约 30K"），本库换 VisDrone，**86.0 mAP@0.5 不可引用**；
+> 论文 Table 3 与 Table 2 的同一配置给了三组不同数字；论文声称"加 P2 后 Params/FLOPs 完全不变"，
+> 本库实测（`get_flops`，imgsz=1024）为 **+3.60 GFLOPs（18.43 vs 基线 14.83）**、参数方向取决于
+> `ch[0]` 与 `nc`（nc=10 时反而 −20,900）；式 (4) 的空间分支与正文"运动区域"描述不符；
+> 式 (7) 未定义锚点维归一化（按锚点求和时 KD=2017.8 会压垮 L_task=22.8，本库默认取均值）。
 
 ## 核心思想
 
@@ -88,30 +118,35 @@ v.card("variants/visdrone-yolov8n-p2-dysample-nwd/card.md")
 
 ```
 src/tod/            训练侧（Python）
-├─ registry.py      魔改注册表（强制元数据）
+├─ registry.py      魔改注册表（强制元数据；规范名与别名都会注入框架命名空间）
 ├─ compose.py       变体 DSL + 模型图改造（P2 注入 / 下采样替换 / 类型替换）
-├─ compat.py        唯一触碰 ultralytics 内部的地方
+├─ compat.py        唯一触碰 ultralytics 内部的地方（含只读配置目录回退）
 ├─ runtime.py       变体 spec 的运行时上下文
 ├─ modules/
 │  ├─ conv/adown.py            ADown（EP1）
+│  ├─ attention/dual_attention.py DualAttention（EP4，SDD-YOLO §4.5）
 │  └─ head/efficient_uavdet.py Efficient_UAVDet（EP5）
-├─ loss/box.py + criterion.py  SIoU 与训练准则接入（EP7）
-└─ engine/trainer.py + surgery.py  自定义 Trainer 与检测头"建模后手术"
+├─ assigner/stal.py  STAL 小目标感知分配（EP6，可消融开关）
+├─ optim/musgd.py    MuSGD（EP9，Muon 式 NS 正交化 + SGD 分量）
+├─ loss/box.py + criterion.py  SIoU / Wise-IoU v3 与训练准则接入（EP7）
+└─ engine/           trainer.py（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
+                    / distill.py（EP9 特征对齐蒸馏）
 
-src/todrt/          部署侧（C++17 / TensorRT）—— 与 src/tod 并列，可独立复用
+src/todrt/          部署侧（C++17，四个后端可选）—— 与 src/tod 并列，可独立复用
 ├─ include/todrt/   core（注册表）/ json / modules / factory / backend
 ├─ src/models/      ★ 变体配方（一个变体一个文件，两行宏）
-├─ src/             factory / preprocess / decode / nms / config_io
-├─ src/backend/     TensorRT 引擎构建与执行（无 TRT 时走 stub）
+├─ src/             factory / preprocess（float 或 uint8）/ decode / nms / config_io
+├─ src/backend/     四后端：engine_trt / engine_rknn / engine_ort / engine_openvino
+│                   + backend_dispatch（唯一分派处）+ simple_detector（共用外壳）
 ├─ apps/todrt_cli   部署工具（list/info/dryrun/probe/bench/run）
-└─ tests/cpp_smoke  架构自检（**不需要 GPU**，107 项）
+└─ tests/cpp_smoke  架构自检（**不需要任何后端**，148 项）
 
 configs/_base_/     数据集等基础配置
 configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 C++ 的唯一契约）
 variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
-tools/              make_variant.py / train.py / catalog.py / export_onnx.py
-docs/DEPLOY.md      部署流程与硬件加速（DLA / FP16 / INT8）说明
-tests/              smoke.py（无 torch 依赖，51 项）+ test_modules.py（形状/换头/端到端）
+tools/              make_variant.py / train.py / catalog.py / export_onnx.py / convert_rknn.py
+docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
+tests/              smoke.py（无 torch 依赖，63 项）+ test_modules.py（形状/数值/手术/蒸馏/端到端，71 项）
 ```
 
 ## 部署（推理端）
@@ -124,29 +159,45 @@ python tools\export_onnx.py --variant variants\SPAE-YOLOv8n\variant.yaml `
 ```
 
 ```bash
-# 实机（Linux/Jetson）：构建 + 自检 + 实测
-cmake -S src/todrt -B src/todrt/build -DTODRT_WITH_TENSORRT=ON && cmake --build src/todrt/build -j
-./src/todrt/build/todrt_cli probe                              # 看 TensorRT 版本 / DLA core 数
-./src/todrt/build/todrt_cli dryrun configs/deploy/xxx.json     # 配置装配自检（不需要 GPU）
-./src/todrt/build/todrt_cli bench  configs/deploy/xxx.json sample.ppm 200
+# 按目标硬件选一个后端构建（Linux）
+cmake -S src/todrt -B build/x -DTODRT_WITH_TENSORRT=ON      # Jetson Orin / dGPU
+cmake -S src/todrt -B build/x -DTODRT_WITH_RKNN=ON          # RK3588 NPU（librknnrt.so）
+cmake -S src/todrt -B build/x -DTODRT_WITH_ORT=ON           # 通用 CPU（AMD x86）
+cmake -S src/todrt -B build/x -DTODRT_WITH_OPENVINO=ON      # x86 CPU / Intel iGPU
+cmake --build build/x -j$(nproc)
+
+./build/x/todrt_cli probe                              # 逐后端报可用性
+./build/x/todrt_cli dryrun configs/deploy/xxx.json     # 配置装配自检（不需要模型/设备）
+./build/x/todrt_cli bench  configs/deploy/xxx.json sample.ppm 200
 ```
 
-调用方只有两行：
+RK3588 的 `.rknn` 在 **x86 主机**上转换（板上不转换）：
+
+```bash
+pip install rknn-toolkit2
+python tools/convert_rknn.py --onnx exports/SPAE-YOLOv8n.onnx --target rk3588 \
+    --out exports/spae.rk3588.rknn --dataset exports/calib.txt \
+    --deploy-config configs/deploy/spae-yolov8n.json   # 自动切 uint8 NHWC 前处理
+```
+
+调用方只有两行（换后端不改业务代码）：
 
 ```cpp
 auto det = todrt::Detector::CreateFromFile("configs/deploy/xxx.json");
 auto results = det->Run(bgr_image);          // 坐标已是原图像素
 ```
 
-详见 [`docs/DEPLOY.md`](docs/DEPLOY.md) 与 [`src/todrt/README.md`](src/todrt/README.md)（工厂模式的设计说明）。
+详见 [`docs/DEPLOY.md`](docs/DEPLOY.md)（各后端的构建/转换/坑）与
+[`src/todrt/README.md`](src/todrt/README.md)（工厂模式设计说明）。
 
 ## 下一步（M1）
 
-1. 装好环境（conda + Python 3.12 + torch/ultralytics），跑
-   `python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --dry-run`，
-   确认 P2 头、ADown、Efficient_UAVDet 三处改造全部生效并记录参数量；
-2. 准备 VisDrone，跑通「YOLOv8n + P2 + imgsz=640」干净基线作为锚点；
-3. 把 SPAE 的四个组件做单模块消融（`v.without(...)`），复现论文的贡献排序；
+1. 准备 VisDrone，跑通「YOLOv8n + P2 + imgsz=640」与「YOLO26n + P2 + imgsz=1024」两条**干净基线**
+   作为锚点（后者的结构自检已通过：2.50 M 参数、nl=4、stride=[4,8,16,32]）；
+2. 单模块消融（`v.without(...)`）：SPAE 复现论文的贡献排序；
+   SDD 则补齐论文 Table 3 **捆绑在一起**的 `¬DFL / NMS-free / MuSGD / STAL` 四列各自贡献；
+3. 验证 SDD 的三项"底座自带"能力在真实训练中的行为：ProgLoss 的 O2M 权重衰减、
+   STAL 对小目标召回的影响、MuSGD 与 SGD/AdamW 的收敛对比；
 4. 再按 `PLAN.md §5` 的 P0 清单补模块（SAHI、Copy-Paste、SPD-Conv、BiFPN/ASFF、NWD…）。
 
 部署侧（`src/todrt/`）待实机验证的清单：

@@ -28,6 +28,7 @@ def import_modules() -> None:
     """
     try:
         import tod.assigner  # noqa: F401
+        import tod.engine.distill  # noqa: F401
         import tod.loss  # noqa: F401
         import tod.modules  # noqa: F401
         import tod.optim  # noqa: F401

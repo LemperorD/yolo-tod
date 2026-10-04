@@ -316,14 +316,37 @@ python tools/convert_rknn.py \
 
 ### 6.1 构建
 
+**在你自己的 x86_64（含 AMD）Linux 笔记本上直接构建即可，不需要交叉编译。**
+CMake 会按 `CMAKE_SYSTEM_PROCESSOR` 自动选指令集基线与 SDK 的 `lib/` 子目录
+（x86_64 用 AVX2/FMA，aarch64 用 armv8.2-a+fp16；OpenVINO 在 x86 是 `lib/intel64`、
+aarch64 是 `lib/aarch64`）。
+
 ```bash
-# ONNX Runtime：下载官方预编译包（含头文件与 .so）
+# ONNX Runtime：下载**对应架构**的官方预编译包（含头文件与 .so）
 #   https://github.com/microsoft/onnxruntime/releases
+#   x86_64  → onnxruntime-linux-x64-<版本>
+#   aarch64 → onnxruntime-linux-aarch64-<版本>
 cmake -S src/todrt -B build/x86 \
+      -DTODRT_NATIVE=ON \
       -DTODRT_WITH_ORT=ON -DTODRT_ORT_ROOT=/opt/onnxruntime-linux-x64-1.18.0 \
       -DTODRT_WITH_OPENVINO=ON
-cmake --build build/x86 -j
+cmake --build build/x86 -j$(nproc)
 ```
+
+配置阶段会打印架构与后端摘要，先看它再谈别的：
+
+```
+-- todrt: 平台    = Linux/x86_64  x86_64（含 AMD）
+-- todrt: 编译器  = GNU 13.2.0  构建类型 = Release  库类型 = STATIC
+-- todrt: 后端    = TensorRT:0  RKNN:0  ORT:1  OpenVINO:1
+```
+
+> `-DTODRT_NATIVE=ON` 用 `-march=native` 换更好的 CPU 性能，但**产物会绑定本机 CPU**，
+> 别把这份 build 拷到别的机器（默认关闭就是为这个）。
+>
+> 想装到系统里给别的项目用：加 `-DTODRT_BUILD_SHARED=ON` 后
+> `sudo cmake --install build/x86 --prefix /usr/local`，
+> 下游就能 `find_package(todrt)` 或 `pkg-config --libs todrt`。
 
 > AMD 机器上装 `onnxruntime`（CPU 包）即可，不需要 ROCm。
 > 装 `onnxruntime-gpu` 且机器有 NVIDIA GPU 时，`ort_provider=cuda` 会自动用上。

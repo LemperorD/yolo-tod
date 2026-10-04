@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: todrt
+Description: yolo-tod C++ inference runtime (backends selectable at build time)
+Version: @PROJECT_VERSION@
+# Backends are fixed at build time: TensorRT:@TODRT_HAVE_TENSORRT@ RKNN:@TODRT_HAVE_RKNN@ ORT:@TODRT_HAVE_ORT@ OpenVINO:@TODRT_HAVE_OPENVINO@
+Libs: -L${libdir} -ltodrt
+Cflags: -I${includedir}

@@ -26,10 +26,11 @@
 |---|---|---|---|---|---|
 | `STAL` | 2026 | [SDD-YOLO §4.6 的 STAL（Small-Target-Aware Label Assignment）；论文未给公式，本库按 ultralytics 8.4 的 TAL 小目标先验落地并标注为推断](https://arxiv.org/abs/2603.25218) | 本文件为独立实现；基类 TaskAlignedAssigner 来自 ultralytics（AGPL-3.0） | 与 TAL 同量级；只改中心采样区域，无额外参数与显存 | GT 宽/高 < 最小 stride（P3=8px）时把匹配区域放宽到次小 stride（16px），让小目标获得足够正样本；设 small_target_aware=False 即退回经典 TAL（消融） |
 
-## EP7 损失（2 项）
+## EP7 损失（3 项）
 
 | 模块 | 年份 | 论文 / 来源 | 许可证 | 成本提示 | 备注 |
 |---|---|---|---|---|---|
+| `TinyPoseLoss` | 2020 | [OKS（Object Keypoint Similarity，COCO）+ 本库的 sigma 策略显式化](https://cocodataset.org/#keypoints-eval) | OKS 公式为公开评测口径；本文件为独立实现 | 与框架 KeypointLoss 同量级（逐元素 exp 运算，参数量 0）；不改变关键点分支的显存占用 | 替换框架 KeypointLoss：sigma 策略 person/auto/balanced + σ 下限 + 可见性开关；默认参数下与框架逐元素一致（回归对照见 tests/test_pose.py） |
 | `siou` | 2022 | [SIoU Loss: More Powerful Learning for Bounding Box Regression](https://arxiv.org/abs/2205.12740) | MIT（参考实现）；本文件为按论文公式独立重写 | 计算量与 CIoU 同量级；无额外参数 | SPAE-YOLOv8 §3.1 用其替换 YOLOv8 默认 CIoU，提升小目标定位精度 |
 | `wiou` | 2023 | [Wise-IoU: Bounding Box Regression Loss with Dynamic Focusing Mechanism (SDD-YOLO §4.3 式 (3) 用它替换 DFL 分支的回归项)](https://arxiv.org/abs/2301.10051) | 官方实现 MIT；本文件为按论文公式独立重写 | 与 IoU 同量级（多一次 exp 与跨 batch 标量均值）；无额外参数、只多 1 个不参与梯度的滑动均值 buffer | v3 的非单调聚焦系数 r 会同时压低极易/极难样本的权重；对小目标（IoU 抖动大）比 CIoU 稳 |
 

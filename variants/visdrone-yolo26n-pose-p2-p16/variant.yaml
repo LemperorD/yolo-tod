@@ -1,0 +1,51 @@
+spec_version: 2
+id: visdrone-yolo26n-pose-p2-p16
+base: yolo26n
+task: pose
+status: planned
+dataset: visdrone2019-pose
+tags: [self-designed, keypoint, pose, small-object, uav, p2-head, oks, tiny-keypoint,
+  dataset-pending]
+notes: '本库自研变体（非论文复现）：把航拍小目标检测的能力延伸到**关键点**。
+
+
+  解决的核心问题：OKS 的分母含框面积，同一个像素误差在 8 px 行人上的 OKS 远低于 120 px 人体 —— 只报整体 OKS-AP 会把''小目标关键点全废''看成''基本没变''。因此本变体固定配套
+  tools/val_pose.py：整体 + 按目标边长分层 + **逐关键点尺度诊断**（≤1px 命中率 / 平均误差 / 平均 OKS）。
+
+
+  ⚠️ 数据集状态：VisDrone2019-DET 没有关键点标注，目标数据集 visdrone2019-pose 当前是**接口占位**（tod.kpt_annotation:
+  none）。在真实标注到位前，本变体只能做结构自检与合成数据回路自检，**卡片精度栏必须留空**。
+
+
+  与检测变体的可比性：框部分与 SDD-YOLO26n 同源（YOLO26 + P2 + Wise-IoU + STAL），但多了一路关键点输出，任务不同，AP
+  不可直接横向比较；可比的是框 AP 与''加关键点后框 AP 掉多少''。
+
+
+  与 FlyPose（WACV 2026, arXiv:2601.05747，航拍人体姿态）的关系：问题设定重叠，**非复现**（未采用其网络与训练策略，仅作为数据集/问题设定的参考）。
+
+
+  已知待验证：① P2 关键点头对 lt8 层 OKS-AP 的增益需要真实标注才能测；② 本变体**不用 EP5 换头**（保持原生 Pose26 头）—— 分组卷积压缩对
+  tiny 关键点精度的影响未知，若要用，把 ``.head("Efficient_UAVDet")`` 打开并用 ``keypoint_branches`` 做开关消融；③
+  Pose26 的归一化流（RealNVP + RLE 损失）在极小目标上是否稳定未知 —— rle 增益保留框架默认 1.0。'
+eps:
+  EP6: {assigner: STAL, small_target_aware: true}
+  EP7:
+    box: wiou
+    kind_kwargs: {variant: 3, alpha: 1.9, delta: 3.0}
+    pose: oks
+    sigma_strategy: person
+    min_sigma: 0.001
+  EP9: {prog_loss: framework, distill: null}
+data: {imgsz: 1024}
+model:
+  nc: 10
+  kpt_shape: [17, 3]
+  add_p2: true
+  p2_idx: 2
+  p2_channels: 128
+  p2_fuse_block: C3
+train: {dfl: 0.0, pose: 12.0, kobj: 1.0, rle: 1.0, epochs: 100, batch: 4, imgsz: 1024,
+  lr0: 0.01, lrf: 0.01, momentum: 0.9, weight_decay: 0.0005, warmup_epochs: 3.0, warmup_momentum: 0.8,
+  close_mosaic: 10, mosaic: 1.0, mixup: 0.05, multi_scale: 0.25, amp: true, workers: 4,
+  seed: 0, deterministic: true, project: results}
+modules: [wiou, STAL]

@@ -1,0 +1,32 @@
+@PACKAGE_INIT@
+
+# todrtConfig.cmake —— 供下游项目 find_package(todrt) 使用
+#
+#   find_package(todrt REQUIRED)
+#   target_link_libraries(your_app PRIVATE todrt::todrt)
+#
+# 该库是"插件化推理运行时"：后端在编译期就固定了（TODRT_HAVE_* 宏），
+# 所以下游只能使用本产物里已启用的后端。下面把实际启用的后端报出来，
+# 便于在配置阶段就给出明确提示，而不是等运行时报"后端没编译进来"。
+
+include(CMakeFindDependencyMacro)
+
+# 依赖：TensorRT / CUDA 若参与编译，需要在下游也能被找到。
+# 这里用 QUIET + 不硬失败：只用 CPU 后端的下游不应该被 NVIDIA 依赖卡住。
+if(@TODRT_HAVE_TENSORRT@)
+  find_dependency(TensorRT QUIET COMPONENTS nvinfer nvonnxparser)
+endif()
+if(@TODRT_HAVE_ORT@)
+  find_dependency(onnxruntime QUIET)
+endif()
+if(@TODRT_HAVE_OPENVINO@)
+  find_dependency(OpenVINO QUIET)
+endif()
+# RKNN 是纯 .so（librknnrt.so），没有 CMake 包，靠运行时动态链接，无需 find_dependency。
+
+include("${CMAKE_CURRENT_LIST_DIR}/todrtTargets.cmake")
+
+set(TODRT_BACKENDS "@TODRT_INSTALLED_BACKENDS@")
+set(TODRT_VERSION "@PROJECT_VERSION@")
+
+check_required_components(todrt)

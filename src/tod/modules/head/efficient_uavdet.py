@@ -165,16 +165,32 @@ class Efficient_UAVDet(nn.Module):
 # --------------------------------------------------------------------- 主路径
 
 
-def swap_detect_head(head: nn.Module, per_group: int = 16, channels: str = "native") -> nn.Module:
+def swap_detect_head(head: nn.Module, per_group: int = 16, channels: str = "native",
+                     keypoint_branches: bool = True) -> nn.Module:
     """就地替换一个**已构建**的检测头的分支卷积（本库采用的主路径）。
 
-    只替换 ``cv2``（回归）与 ``cv3``（分类）分支里**输出层之前的卷积**，
-    末端 1x1 输出卷积**原样复用**（因此预训练权重不受影响）。
+    只替换各分支里**输出层之前的卷积**，末端 1x1 输出卷积**原样复用**
+    （因此预训练权重不受影响）。
 
     Args:
-        head: 框架的 ``Detect``（或结构同构的）实例。
+        head: 框架的 ``Detect``（或结构同构的）实例；姿态头（``Pose``/``Pose26``）
+            也支持 —— 见 ``keypoint_branches``。
         per_group: 论文的每组通道数 16。
         channels: ``"native"`` 保持原生分支通道；``"input"`` 令分支内 in=out=x。
+        keypoint_branches: 姿态头是否**连关键点分支一起压缩**。
+            * ``True``（默认）：压缩 ``cv4``（以及 Pose26 的 ``cv4_kpts``/``cv4_sigma``，
+              但这两个是**单层 1×1 卷积、没有 stem**，实际无可压缩 —— 见下面说明）；
+            * ``False``：只压缩框/分类分支，关键点分支保持原生 —— 一个**可消融的分界**：
+              本库预期"关键点分支被分组卷积压扁"会损伤 tiny 关键点的定位精度
+              （局部通道交互被切断），所以把开关显式留出来，让实测来回答。
+
+    【关键点分支的结构差异（实测，务必注意）】
+        * **Pose**（YOLOv8 系）：``cv4[i] = Conv(x,c4,3) → Conv(c4,c4,3) → Conv2d(c4,nk,1)``，
+          是带 stem 的三层结构，``keypoint_branches`` 开关**真的有区别**；
+        * **Pose26**（YOLO26 系）：``cv4[i]`` 只是两层 3×3 卷积（无输出层），关键点输出由
+          **独立的单层 1×1** ``cv4_kpts`` / ``cv4_sigma`` 给出 —— 这类分支没有 stem 可换，
+          本函数只压缩其 ``cv4`` 特征块。因此在 YOLO26 底座上，``keypoint_branches=True``
+          压的是"关键点特征提取"，而不是"关键点输出卷积"。
 
     Returns:
         同一个 head 对象（就地修改）。
@@ -182,14 +198,30 @@ def swap_detect_head(head: nn.Module, per_group: int = 16, channels: str = "nati
     if not (hasattr(head, "cv2") and hasattr(head, "cv3")):
         raise TypeError("传入的对象不是检测头（缺少 cv2/cv3 分支）。")
 
-    # 记录替换前分支 stem（输出 1x1 之前的全部卷积）的卷积层数：
-    # 8.2/8.3 的 cv2/cv3 都是 2；8.4 的 cv3 变成 "DWConv+Conv" 嵌套两块 = 4 层
-    stem_convs = {attr: sum(count_stem_convs(m) for m in getattr(head, attr)[0][:-1])
-                  for attr in ("cv2", "cv3")}
+    attrs = ["cv2", "cv3"]
+    if keypoint_branches:
+        # Pose 系用 cv4；Pose26 把关键点预测与 sigma 各拆成一条卷积
+        attrs += [f"cv{name}" for name in ("4", "4_kpts", "4_sigma")
+                  if hasattr(head, f"cv{name}")]
+
+    # 记录替换前各分支 stem（输出 1x1 之前的全部卷积）的卷积层数：
+    # 8.2/8.3 的 cv2/cv3 都是 2；8.4 的 cv3 变成 "DWConv+Conv" 嵌套两块 = 4 层。
+    # 注意有些分支**根本不是 Sequential**（Pose26 的 ``cv4_kpts``/``cv4_sigma`` 是
+    # 单层 ``nn.Conv2d``），那种分支没有 stem 可换，直接跳过 —— 否则会
+    # ``TypeError: 'Conv2d' object is not subscriptable``。
+    stem_convs = {}
+    for attr in attrs:
+        branches = getattr(head, attr, None)
+        if branches and isinstance(branches[0], nn.Sequential):
+            stem_convs[attr] = sum(count_stem_convs(m) for m in branches[0][:-1])
     head._tod_ep5_stem_convs = stem_convs
 
-    for attr in ("cv2", "cv3"):
-        branches = getattr(head, attr)
+    for attr in attrs:
+        branches = getattr(head, attr, None)
+        if not branches:
+            continue
+        if not isinstance(branches[0], nn.Sequential):
+            continue               # 单层卷积分支（Pose26 的 kpts/sigma）没有 stem
         new_branches = nn.ModuleList()
         for branch in branches:
             stem = branch[0]
@@ -255,7 +287,9 @@ def count_stem_convs(module: nn.Module) -> int:
 def describe(head: nn.Module) -> str:
     """返回人类可读的头结构摘要（自检/卡片用）。"""
     lines = []
-    for attr, role in (("cv2", "回归"), ("cv3", "分类")):
+    roles = {"cv2": "回归", "cv3": "分类", "cv4": "关键点",
+             "cv4_kpts": "关键点(均值)", "cv4_sigma": "关键点(sigma)"}
+    for attr, role in roles.items():
         branches = getattr(head, attr, None)
         if branches is None:
             continue
@@ -268,7 +302,7 @@ def describe(head: nn.Module) -> str:
                          f"{c_in / g if isinstance(g, int) and g else 0:.1f} ch/group)")
     stem_convs = getattr(head, "_tod_ep5_stem_convs", {})
     lines.append("本库把分支 stem 换成 2 层分组卷积（论文 §3.4）；替换前 stem 的卷积层数："
-                 f"cv2={stem_convs.get('cv2', '?')}、cv3={stem_convs.get('cv3', '?')}"
-                 "（YOLOv8 系在 8.4 上仍是 2/2；而 YOLO26 系（非 legacy）的分类分支是"
+                 + "、".join(f"{k}={v}" for k, v in stem_convs.items())
+                 + "（YOLOv8 系在 8.4 上仍是 2/2；而 YOLO26 系（非 legacy）的分类分支是"
                  " DWConv+Conv 嵌套两块 = 4 层，被压成 2 层分组卷积属更激进压缩）")
     return "\n".join(lines)

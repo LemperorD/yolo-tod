@@ -387,11 +387,38 @@ ultralytics 内部 API 变动频繁（`parse_model`、`DetectionModel`、`v8Dete
 
 ---
 
+### 5.9b 姿态关键点（TOD 的第二条输出支路，横跨 EP0/EP5/EP7/EP8/EP9）
+
+> 为什么小目标库也要有这一类：本库的主战场是航拍小目标，而航拍行人/车辆的
+> **姿态与朝向**（关节、车角）是检测框之外的第二层信息，很多任务真正需要的是它。
+> 更重要的是：关键点检测有一套**自己的、会掩盖小目标退化的口径**（OKS 的分母含框面积），
+> 必须在库里显式处理，否则"整体 OKS-AP 涨了"会被当成好消息。
+
+| 优先级 | 组件 | 本库落点 | 关键点 |
+|---|---|---|---|
+| **P0** | **P2 关键点分支** | EP2/EP5（`add_p2=True`） | 关键点预测分辨率从 1/8 提到 1/4；Pose/Pose26 的关键点分支跟着多一层，不需要额外手术 |
+| **P0** | **OKS 损失显式化** | EP7 `loss/pose.py` | 与框架同签名的 `TinyPoseLoss`；sigma 策略 person/auto/balanced；**σ 下限**（tiny 目标上框架 OKS 会饱和）；可见性掩码规则写死并测试 |
+| **P0** | **OKS 分层评测** | EP8 `eval/pose.py` | OKS-AP 50:95 + 按**目标边长**分层 + 按**关键点尺度**的逐点诊断（≤1px 命中率/平均误差/平均 OKS）；同时报两套 sigma 口径 |
+| P0 | 姿态训练回路 | EP9 `engine/pose_trainer.py` | 用例程 `PoseModel`（数据集 `kpt_shape` 覆盖模型图）；O2M/O2O **两套**姿态准则的关键点项都要替换 |
+| P1 | 关键点分支压缩 | EP5 `Efficient_UAVDet` | 分组卷积压关键点分支可能伤 tiny 精度 → `keypoint_branches` 开关做消融 |
+| P1 | 合成关键点数据 | EP0 `make_dummy_dataset.py --task pose` | 火柴人 + COCO 17 点，双尺度；只用于回路自检，**不可用于任何精度结论** |
+| P2 | 关键点专用损失 | EP7 | RLE（Pose26 自带归一化流）、Wing Loss、Soft-Argmax 热图头、关键点 NWD |
+
+**三条必须记住的口径结论**（都写进了代码注释与评测输出里）：
+
+1. **OKS 的分母含框面积** → 同一个像素误差，小目标的 OKS 远低于大目标。
+   因此姿态评测**必须**同时报整体与最小两层，并附关键点尺度诊断。
+2. **框架 OKS 项在 tiny 目标上近似"全或无"**：`1−exp(−e)`，`e ∝ 1/(σ²·area)`，
+   极小框上一个像素的偏差就能把 e 推到 1e6 量级（本库有专门断言钉住这个现象）。
+3. 本库的 OKS-AP 用**框 IoU 匹配**（不是 COCO 的 OKS 匹配），
+   因此**不等于** COCO keypoints AP，两者不可直接比较。
+
 ### 5.10 论文级"整篇魔改"（值得作为完整变体收录）
 
 | 名称 | 赛道 | 核心卖点 | 收录方式 |
 |---|---|---|---|
 | **SPAE-YOLOv8** ([Sensors 2026](https://doi.org/10.3390/s26113424)) ✅ **已实现** | 空对空微小型无人机 | SIoU + P2 浅层 + ADown + Efficient_UAVDet；PARAMS −30%、FPS +28%，但精度主贡献来自 P2（+7.5pp），换头本身 −0.4pp | 全模块化（EP1/EP5/EP7 + P2 注入） |
+| **visdrone-yolo26n-pose-p2-p16** ⚠️ **已实现（数据集待标注）** | 航拍行人**关键点** | P2 关键点头 + TinyPoseLoss（EP7）+ OKS 分层评测（EP8）；本库自研，**非论文复现** | 变体 + EP7/EP8 新模块；数据集接口占位见 `configs/_base_/datasets/visdrone2019-pose.yaml` |
 | **TPH-YOLOv5 / TPH-YOLOv5++** | 航拍 VisDrone | Transformer 预测头 + 额外小目标头 + 复制粘贴增强 | 建议整仓 submodule + 适配器 |
 | **CEASC** ([CVPR 2023](https://openaccess.thecvf.com//content/CVPR2023/html/Du_Adaptive_Sparse_Convolutional_Networks_With_Global_Context_Enhancement_for_Faster_CVPR_2023_paper.html)) | 航拍 | 自适应稀疏卷积 + 全局上下文增强，加速密集小目标推理 | 模块化（EP1/EP4） |
 | **Gold-YOLO** (NeurIPS 2023) | 通用 | GD 汇聚-分发颈部，低延迟涨点 | 模块化（EP2） |
@@ -458,6 +485,11 @@ YOLOv8s
 
 - 常规：`AP50`、`AP50:95`、`Precision`、`Recall`、每类 AP。
 - **小目标专属**：`AP_small`（area<32²）、`AP_tiny`、**按尺度分层的 Recall**（<8px / 8–16 / 16–32 / 32–96）。
+- **姿态专属**（`tools/val_pose.py`）：整体 `OKS-AP` / `OKS-AP50` / `OKS≥0.5` 命中率，
+  按**目标边长**分层的同一组指标，**逐关键点尺度诊断**（平均误差 px / ≤1px 命中率 / 平均 OKS），
+  以及同一套预测在**自定义 sigma** 口径下的第二组 OKS-AP（用于判断"训练目标与评测目标是否对齐"）。
+  口径警告：本库的 OKS-AP 用**框 IoU 匹配**（不是 COCO 的 OKS 匹配），
+  **不等于** COCO keypoints AP；同一张表内部的对比才有效。
 - 成本：参数量、FLOPs、**实测延迟（目标设备，batch=1）**、峰值显存、训练 GPU 小时。
 - 部署视角：切片推理的端到端延迟、导出格式（ONNX/TensorRT）后的精度损失。
 
@@ -561,12 +593,13 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ## 12. 落地进展
 
-### M0 架构层（已完成，`python tests/smoke.py` 66 项 + `python tests/test_modules.py` 105 项检查全绿）
+### M0 架构层（已完成，`python tests/smoke.py` 77 项 + `python tests/test_modules.py` 105 项
++ `python tests/test_pose.py` 99 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
 | `src/tod/registry.py` | 注册表：强制登记 EP 归属 / 论文 / 许可证 / 成本；重复注册与非法 EP 直接报错；`catalog()` 自动生成模块总表 | ✅ |
-| `src/tod/compat.py` | 唯一触碰 ultralytics 内部的兼容层：命名空间注入、基础 Conv/Detect 获取、内置模型 YAML 定位、版本区间校验 | ✅ |
+| `src/tod/compat.py` | 唯一触碰 ultralytics 内部的兼容层：命名空间注入、基础 Conv/Detect 获取、内置模型 YAML 定位、版本区间校验、**PoseModel 获取**、**沙箱下的顺序标签缓存** | ✅ |
 | `src/tod/compose.py` | 变体 DSL：`patch/without/data/train/model` → 变体配置、模型 YAML、变体卡片；含 **P2 头注入**、**主干下采样替换**、节点类型替换 | ✅ |
 | `src/tod/runtime.py` | 变体 spec 的运行时上下文（避免污染框架的训练参数校验） | ✅ |
 | `src/tod/loss/box.py` + `criterion.py` | **SIoU / Wise-IoU v3** 与训练准则接入：只替换 IoU 项、复用框架回归分支；无 DFL 开关；覆盖 YOLO26 `E2ELoss` 的 O2M/O2O **两套**子准则 | ✅ |
@@ -577,14 +610,21 @@ planned → reproducing → reproduced → (promoted | dropped)
 | `src/tod/optim/musgd.py` | **MuSGD**（Muon 式 Newton–Schulz + SGD 分量，优先框架原生）（EP9） | ✅ |
 | `src/tod/engine/distill.py` | **特征对齐蒸馏** P2–P5 逐层 KL（EP9，SDD-YOLO 式 6/7） | ✅ |
 | `src/tod/modules/head/efficient_uavdet.py` | **Efficient_UAVDet** 轻量检测头，两组通道策略（EP5） | ✅ |
-| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**66 项**） | ✅ |
+| `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**77 项**） | ✅ |
 | `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 评测 / 端到端建图测试（需 torch，**105 项**） | ✅ |
+| `tests/test_pose.py` | 姿态模块测试（**104 项**）：OKS 损失与框架逐元素对照、σ 策略、OKS 指标与尺度敏感性、标签读写、合成关键点数据、DSL/建图/换头手术/双分支准则 | ✅ |
+| `tests/train_pose_smoke.py` | 姿态训练回路自检（合成关键点数据真训练，**21 项**） | ✅ |
 | `src/tod/eval/scales.py` + `tools/val.py` | 尺度分层评测（整体 AP + `AP_small`/`AP_tiny`，COCO 式 AP 与 ignore 语义） | ✅ |
 | `tools/ablation.py` | 消融流水线（leave-one-out、逐字段 diff、假消融识别、汇总 csv/md） | ✅ |
 | `tools/make_dummy_dataset.py` + `tests/train_smoke.py` | 合成数据集 + 训练回路自检（真训练/验证/EMA/存载权重/推理） | ✅ |
 | `tools/make_variant.py` / `train.py` / `catalog.py` | 变体物化、训练入口（含 `--dry-run` 结构自检）、文档生成 | ✅ |
 | `variants/SPAE-YOLOv8n/` | 变体 1：`recipe.py` + `variant.yaml` + `model.yaml` + `card.md` + `paper-notes.md` | ✅ |
 | `variants/SDD-YOLO26n/` | 变体 2：同上（+ 论文矛盾/推断清单、本库实测数据表） | ✅ |
+| `src/tod/loss/pose.py` | **TinyPoseLoss**（EP7）：OKS 关键点损失，sigma 策略 + σ 下限 + 可见性掩码 | ✅ |
+| `src/tod/eval/pose.py` | **姿态 OKS 评测**（EP8）：OKS-AP 50:95 + 目标尺度分层 + 关键点尺度诊断 + 双 sigma 口径 | ✅ |
+| `src/tod/engine/pose_trainer.py` | 姿态训练器（EP9）：继承检测侧全部接线，改用 PoseModel + 姿态准则（O2M/O2O 双分支） | ✅ |
+| `tools/val_pose.py` + `make_dummy_dataset.py --task pose` | 姿态评测入口 + 合成关键点数据（火柴人 + COCO 17 点） | ✅ |
+| `variants/visdrone-yolo26n-pose-p2-p16/` | 变体 3：姿态关键点（**数据集标注待准备**，卡片精度栏留空） | ✅ |
 
 **已验证的关键逻辑**（对官方 yolov8 同构图做单元验证）：
 
@@ -636,8 +676,8 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ### 尚未完成（阻塞项）
 
-1. **精度类数字尚未产生**：训练回路已用合成数据跑通（`tests/train_smoke.py`）并补齐了
-   尺度分层评测与消融流水线，但 VisDrone 上的真实基线/消融仍属 M1；
+1. **精度类数字尚未产生**：训练回路已用合成数据跑通（`tests/train_smoke.py`、`tests/train_pose_smoke.py`）
+   并补齐了尺度分层评测、姿态 OKS 分层评测与消融流水线，但 VisDrone 上的真实基线/消融仍属 M1；
    当前所有"验证"都是**结构、数值与流水线级**的。
 2. **`inject_p2_head` 只覆盖直连式 P2 头**：完整 P2 双向融合 / BiFPN / AFPN 重拓扑属于 M1。
 3. **论文未说明的部分**：SPAE 的 "feature calibration"、SDD 的 STAL 公式与 KD 锚点归一化、
@@ -645,9 +685,16 @@ planned → reproducing → reproduced → (promoted | dropped)
 4. **换头在不同主干上的压缩程度不同**：YOLOv8 系的分类分支 stem 是 2 层卷积（与论文一致），
    而 YOLO26 系（非 legacy）是 `DWConv+Conv` 嵌套两块 = 4 层 —— 本库换头仍只放两层分组卷积，
    在 YOLO26 上属"更激进压缩"。替换前的层数已由 `describe()` / `--dry-run` 输出，便于核对。
-5. **受限沙箱下跑不了真训练**：ultralytics 的标签缓存用 `multiprocessing.Pool`
-   （Windows 上是命名管道），在文件沙箱会话里会 `PermissionError [WinError 5]`。
-   这不是本库的 bug，但 CI 若要跑 `train_smoke.py` / `ablation.py` 需要放开该限制。
+5. **姿态变体的数据集不存在**：`visdrone2019-pose` 只是接口占位（VisDrone2019-DET 没有关键点标注），
+   候选标注来源与协议写在 `configs/_base_/datasets/visdrone2019-pose.yaml` 的注释里。
+   在标注到位前，该变体**只有结构自检与合成数据回路自检**，精度栏必须留空。
+6. **姿态的合成数据不能回答任何精度问题**：火柴人的 17 点是程序按固定比例画出来的，
+   与真实航拍行人分布无关；它只用来证明"回路跑通 + OKS 口径有判别力"。
+7. **受限沙箱下的真训练**：ultralytics 的标签缓存默认用 `ThreadPool`
+   （Windows 上会打开命名管道），在文件沙箱会话里会 `PermissionError [WinError 5]`。
+   这不是本库的 bug —— 本库用 `tod.compat.allow_threadless_label_cache()` 把它换成
+   **顺序**实现（语义一致、放弃并行），两个训练自检脚本默认启用，因此**沙箱里也能跑**；
+   `--allow-threaded-cache` 可恢复框架默认行为。
 
 ### M1 剩余任务（下一步）
 
@@ -657,9 +704,15 @@ planned → reproducing → reproduced → (promoted | dropped)
 - [x] `tools/ablation.py`：消融流水线（leave-one-out、逐字段 diff、假消融识别、汇总 csv/md）
 - [x] 训练回路自检：`tools/make_dummy_dataset.py` + `tests/train_smoke.py`
       → 真训练/验证/EMA/存载权重/推理全通（`dfl_loss` 恒为 0，证明无 DFL 分支真的生效）
+- [x] **姿态关键点回路**：`tod/loss/pose.py`（EP7）+ `tod/eval/pose.py`（EP8）+
+      `engine/pose_trainer.py`（EP9）+ `tools/val_pose.py` + `tests/test_pose.py` / `train_pose_smoke.py`
+      → 与框架 OKS 损失逐元素对照、O2M/O2O 双分支替换、OKS 分层口径的尺度敏感性全部有断言
+- [ ] **VisDrone-Pose 标注**（阻塞姿态变体的所有精度结论）：先做 500–1000 框子集，
+      用于量化"小目标层 OKS-AP 的塌缩幅度"与标注成本
 - [ ] 路线 1 干净基线：`YOLOv8n + P2 + imgsz=640`，记录 AP/显存/延迟作为锚点
 - [ ] 路线 2 干净基线：`YOLO26n + P2 + imgsz=1024`（SDD 的锚点；结构自检已通过）
 - [ ] SPAE 四组件的单模块消融，复现论文的贡献排序（预期 P2 占绝对主导）
 - [ ] SDD 补齐论文 Table 3 捆在一起的四列消融：`¬DFL / NMS-free / MuSGD / STAL` 各自贡献
 - [ ] SDD 打开蒸馏（需本地 YOLO26x 权重或更小的教师）验证 λ=0.5/T=3.0 的增益
+- [ ] 姿态消融：`EP7.pose=False`（框架原生 KeypointLoss）与 `sigma_strategy` 三档对比
 - [ ] 评测协议落实：3 个 seed × 同协议，报 `AP_small` 的同时给重复性（PLAN §7.4）

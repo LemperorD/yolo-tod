@@ -28,7 +28,11 @@ from typing import Any, Sequence
 from tod.registry import EXTENSION_POINTS, get, has
 
 #: 本库自有的变体配置 schema 版本，便于将来迁移。
-SPEC_VERSION = 1
+SPEC_VERSION = 2
+#: 支持的任务类型（与 ultralytics 一致）；目前只有 detect / pose 接了完整回路。
+TASKS = ("detect", "pose", "segment", "obb")
+#: 各任务的内置模型图后缀（``yolo26n`` + ``-pose`` → ``yolo26n-pose``）。
+TASK_MODEL_SUFFIX = {"detect": "", "pose": "-pose", "segment": "-seg", "obb": "-obb"}
 
 
 def _merge(dst: dict, src: dict) -> dict:
@@ -40,6 +44,28 @@ def _merge(dst: dict, src: dict) -> dict:
     return dst
 
 
+def _as_list(value: Any) -> list:
+    """把 tuple / list / 逗号字符串统一成 list（``(17,3)`` 与 ``"17,3"`` 都能吃）。
+
+    为什么需要：变体 spec 要 dump 成 YAML 再读回来，tuple 会变成 YAML 的
+    flow-list，而 ``--set kpt_shape=17,3`` 这种命令行覆盖拿到的是字符串。
+    """
+    if isinstance(value, str):
+        out: list = []
+        for chunk in value.replace(";", ",").split(","):
+            text = chunk.strip()
+            if not text:
+                continue
+            try:
+                out.append(int(text))
+            except ValueError:
+                out.append(text)
+        return out
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 @dataclass
 class Variant:
     """一个可复现的魔改变体 = 骨架 + 各 EP 的覆盖 + 数据 + 训练配置。"""
@@ -48,12 +74,21 @@ class Variant:
     base: str = "yolov8n"
     dataset: str = ""
     status: str = "planned"
+    #: 任务类型：``detect`` / ``pose`` / ``segment`` / ``obb``。
+    #: 为什么必须显式记录：ultralytics 靠**文件名**猜任务（``guess_model_task``），
+    #: 而本库生成的模型图叫 ``model.yaml``，猜不出来 —— 姿态变体不写明任务，
+    #: 训练时会静默按 detect 建图/建数据加载器（关键点列被当成"多余的列"丢掉）。
+    task: str = "detect"
     eps: dict[str, dict[str, Any]] = field(default_factory=dict)
     data_cfg: dict[str, Any] = field(default_factory=dict)
     train_cfg: dict[str, Any] = field(default_factory=dict)
     model_cfg: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.task not in TASKS:
+            raise ValueError(f"未知任务 {self.task!r}；可选 {sorted(TASKS)}")
 
     # ---------------------------------------------------------------- 构造
 
@@ -99,6 +134,31 @@ class Variant:
     def model(self, **kwargs: Any) -> "Variant":
         """模型图级别的参数（如 imgsz 无关的 nc、scale、P2 注入参数）。"""
         _merge(self.model_cfg, kwargs)
+        return self
+
+    def as_task(self, task: str) -> "Variant":
+        """设定任务类型（``detect`` / ``pose`` / …）。
+
+        与 ``model()`` 分开是因为任务决定的是**整条流水线**（模型 YAML 后缀、
+        数据集解析方式、Validator、导出头），不只是图里的一个参数：
+        compose 据此把 base 名改写成 ``*-pose`` 形式，并把任务写进 spec。
+        """
+        if task not in TASKS:
+            raise ValueError(f"未知任务 {task!r}；可选 {sorted(TASKS)}")
+        self.task = task
+        return self
+
+    def pose(self, **kwargs: Any) -> "Variant":
+        """姿态任务的快捷方式：``v.pose(kpt_shape=(17, 3))``。
+
+        等价于 ``v.as_task("pose").model(kpt_shape=(17, 3), **kwargs)``。
+        ``kpt_shape`` 写进模型图（``Pose26`` 的构造参数），**同时**要写进数据集
+        YAML —— 框架按数据集的 ``kpt_shape`` 覆盖模型图里的值（见
+        ``PoseModel.__init__``），两处不一致时以数据集为准并被框架打印一条 INFO。
+        """
+        self.task = "pose"
+        if kwargs:
+            _merge(self.model_cfg, kwargs)
         return self
 
     # 语义化快捷方式（等价于 patch）
@@ -155,6 +215,7 @@ class Variant:
             "spec_version": SPEC_VERSION,
             "id": self.name,
             "base": self.base,
+            "task": self.task,
             "status": self.status,
             "dataset": self.dataset,
             "tags": list(self.tags),
@@ -183,6 +244,7 @@ class Variant:
             base=str(data.get("base", "yolov8n")),
             dataset=str(data.get("dataset", "")),
             status=str(data.get("status", "planned")),
+            task=str(data.get("task", "detect")),
             tags=list(data.get("tags") or []),
             notes=str(data.get("notes", "")),
         )
@@ -195,25 +257,46 @@ class Variant:
     # ------------------------------------------------------------ 模型 YAML
 
     def _load_base_cfg(self) -> tuple[dict, str | None]:
-        """读取 base 模型图；支持 ``yolov8`` / ``yolov8n`` 两种写法。
+        """读取 base 模型图；支持 ``yolov8`` / ``yolov8n`` / ``yolo26n`` 三种写法。
 
         官方只提供 ``yolov8.yaml`` + ``scales``，规模由文件名尾字母决定，
         因此这里把 ``yolov8n`` 拆成 ``yolov8`` + ``scale='n'``。
+
+        **任务后缀的拼装规则**（姿态/分割/OBB 走这里）：
+        ``base="yolo26n"`` + ``task="pose"`` → 先试 ``yolo26n-pose``（官方确实
+        提供了无 scales 的 ``yolo26n-pose.yaml``），失败再退回
+        ``yolo26-pose`` + ``scale='n'``。两条路径都不会把规模猜错：前者文件名自带
+        规模字母，后者的 scales 会被排到首位（见 ``model_yaml`` 的说明）。
         """
         from tod import compat
 
         name, scale = self.base, self.model_cfg.get("scale")
-        try:
-            path = compat.base_model_yaml(name)
-        except compat.CompatError:
-            if len(name) > 1 and name[-1] in "nsmlx":
-                scale, name = name[-1], name[:-1]
-                path = compat.base_model_yaml(name)
-            else:
-                raise
-        cfg = deepcopy(compat.load_yaml(path))
-        cfg.pop("scale", None)      # 避免与 base 名冲突
-        return cfg, scale
+        suffix = TASK_MODEL_SUFFIX.get(self.task, "") if self.task != "detect" else ""
+        candidates = []
+        if suffix:
+            candidates.append(name if name.endswith(suffix) else f"{name}{suffix}")
+        candidates.append(name)
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                path = compat.base_model_yaml(candidate)
+            except compat.CompatError as exc:
+                last_error = exc
+                # 尾字母是规模时（yolo26n-pose → yolo26-pose + scale='n'）
+                if len(candidate) > 1 and candidate[-1] in "nsmlx":
+                    scale, base_name = candidate[-1], candidate[:-1]
+                    try:
+                        path = compat.base_model_yaml(f"{base_name}{suffix}")
+                    except compat.CompatError as exc2:
+                        last_error = exc2
+                        continue
+                else:
+                    continue
+            cfg = deepcopy(compat.load_yaml(path))
+            cfg.pop("scale", None)      # 避免与 base 名冲突
+            return cfg, scale
+        raise last_error if last_error else compat.CompatError(f"找不到 {name!r} 的模型图")
 
     def model_yaml(self, path: str | Path | None = None, *, write: bool = True) -> dict:
         """由 ``base`` 的内置模型 YAML 生成变体模型图。
@@ -235,6 +318,11 @@ class Variant:
 
         if self.model_cfg.get("nc") is not None:
             cfg["nc"] = self.model_cfg["nc"]
+        # 姿态的关键点形状：写在模型图里（Pose/Pose26 的构造参数）。
+        # 数据集 YAML 里的 kpt_shape 优先级更高（框架会覆盖并打印 INFO），
+        # 两处不一致时以数据集为准 —— 因此本库两个地方都写，并在卡片上同时列出。
+        if self.model_cfg.get("kpt_shape") is not None:
+            cfg["kpt_shape"] = _as_list(self.model_cfg["kpt_shape"])
         if scale:
             cfg["scale"] = scale
             # 为什么要把所选规模排到 scales 的**第一位**：
@@ -312,6 +400,8 @@ class Variant:
             "",
             f"- **id**: `{self.name}`",
             f"- **base**: `{self.base}`",
+            f"- **task**: `{self.task}`"
+            + ("" if self.task == "detect" else "（非检测任务：数据加载/准则/评测都与检测不同）"),
             f"- **dataset**: `{self.dataset or '未指定'}`",
             f"- **status**: `{self.status}`",
             f"- **tags**: {', '.join(self.tags) if self.tags else '-'}",
@@ -338,10 +428,20 @@ class Variant:
                 lines.append(f"| `{key}` | `{value}` |")
             derived = []
             if self.model_cfg.get("add_p2"):
+                head_kind = "Pose/Detect" if self.task == "pose" else "Detect"
                 derived.append(
                     "**P2 检测头（EP5/EP2）**：`inject_p2_head` 注入 stride=4 分支 —— "
                     f"上采样(P3) ⊕ backbone 节点 {self.model_cfg.get('p2_idx', 2)} → "
-                    f"`{self.model_cfg.get('p2_fuse_block', 'C2f')}` 融合 → Detect(P2,P3,P4,P5)")
+                    f"`{self.model_cfg.get('p2_fuse_block', 'C2f')}` 融合 → "
+                    f"{head_kind}(P2,P3,P4,P5)")
+                if self.task == "pose":
+                    derived.append(
+                        "**姿态分支跟着走**：注入 P2 后关键点分支（``cv4`` / Pose26 的 "
+                        "``cv4_kpts``+``cv4_sigma``）**自动多一层** —— 关键点分辨率随之翻倍，"
+                        "这是小目标关键点最直接的收益来源，不需要额外手术。")
+            if self.model_cfg.get("kpt_shape"):
+                derived.append(f"**关键点形状**：`kpt_shape={_as_list(self.model_cfg['kpt_shape'])}`"
+                               "（数据集 YAML 里的同名键优先级更高）")
             if self.model_cfg.get("downsample"):
                 derived.append(f"**主干下采样替换（EP1）**：`{self.model_cfg['downsample']}`"
                                f"（索引 {self.model_cfg.get('downsample_indices', '默认 1/3/5/7')}）")
@@ -363,18 +463,30 @@ class Variant:
         else:
             lines.append("_（无，或引用的模块尚未注册）_")
 
+        metric_rows = [
+            "| AP50:95 | | | |",
+            "| **AP_small** | | | |",
+            "| AP_tiny (<16px) | | | |",
+        ]
+        if self.task == "pose":
+            metric_rows += [
+                "| **OKS-AP**（本库口径，框 IoU 匹配） | | | |",
+                "| OKS-AP50 | | | |",
+                "| **OKS-AP_small / OKS-AP_tiny** | | | |",
+                "| 关键点平均误差 (px, ≤1px 命中率) | | | |",
+            ]
+        metric_rows += [
+            "| Params / FLOPs | | | |",
+            "| 延迟 (ms, batch=1) | | | |",
+            "| 峰值显存 (GB) | | | |",
+        ]
         lines += [
             "",
             "## 相对基线",
             "",
             "| 指标 | 基线 | 本变体 | Δ |",
             "|---|---|---|---|",
-            "| AP50:95 | | | |",
-            "| **AP_small** | | | |",
-            "| AP_tiny (<16px) | | | |",
-            "| Params / FLOPs | | | |",
-            "| 延迟 (ms, batch=1) | | | |",
-            "| 峰值显存 (GB) | | | |",
+            *metric_rows,
             "",
             "## 已知坑 / 冲突 / 结论",
             "",
@@ -404,11 +516,41 @@ def _node_lists(cfg: dict) -> tuple[list, list, int]:
 
 
 def _find_detect(nodes: Sequence) -> int:
-    """定位检测头节点（兼容 Detect / DetectP2 / Efficient_UAVDet 等命名）。"""
+    """定位检测头节点（Detect / Pose / Pose26 / Segment / OBB 等任意头）。
+
+    搜索顺序有讲究：**先找真正的 Detect 一族，再退回名字里带 head 的节点**。
+    直接匹配 ``"detect"`` 会漏掉 ``Pose26``（姿态头），直接匹配 ``"pose"`` 又会
+    误命中 ``C2PSA`` 这类骨干块的模块名（含 "psa" 不含 pose，但 ``RepPose`` 之类
+    的名字在别的库里出现过）——所以按"精确族名 → 模糊兜底"两段判断。
+    """
+    families = ("detect", "pose", "segment", "obb")
     for i in range(len(nodes) - 1, -1, -1):
-        if "detect" in str(nodes[i][2]).lower():
+        name = str(nodes[i][2]).lower()
+        if any(f in name for f in families):
             return i
-    raise ValueError("未在模型图中找到检测头节点（类型名含 'detect'）。")
+    raise ValueError(
+        "未在模型图中找到检测头节点（类型名应含 detect/pose/segment/obb 之一）。"
+    )
+
+
+def _head_inputs(node: Sequence) -> list:
+    """读出头节点的输入索引列表（兼容 ``[in, n, Type, args]`` 与省略 repeats 的写法）。"""
+    if len(node) == 4:
+        return list(node[0])
+    return [node[0]]
+
+
+def _rebuild_head_node(node: Sequence, inputs: list) -> list:
+    """把新的输入列表写回节点**而不丢其它参数**。
+
+    关键点：``Pose``/``Pose26`` 节点的 args 是 ``[nc, kpt_shape]``（``parse_model``
+    之后还会追加 reg_max/end2end/ch），而 ``Detect`` 是 ``[nc]``。早期实现只改了
+    ``updated[0]``，对 Detect 恰好正确；一旦换成 Pose 就会把 ``kpt_shape`` 留在原位，
+    参数错位（``Pose(nc, reg_max=17)``）—— 所以这里显式区分两种布局。
+    """
+    updated = list(node)
+    updated[0] = list(inputs)
+    return updated
 
 
 def apply_type_map(cfg: dict, type_map: dict[str, str]) -> dict:
@@ -466,13 +608,13 @@ def inject_p2_head(
     """
     nodes, base, _ = _node_lists(cfg)
     det_i = _find_detect(nodes)
-    src = list(nodes[det_i][0])
+    src = _head_inputs(nodes[det_i])
 
     if len(src) == 4:
         cfg["_p2_status"] = "already_present"
         return cfg
     if len(src) != 3:
-        raise ValueError(f"预期 Detect 有 3 个输入（P3,P4,P5），实际 {src}。")
+        raise ValueError(f"预期检测头有 3 个输入（P3,P4,P5），实际 {src}。")
 
     p3_idx, p4_idx, p5_idx = src
     det_global = base + det_i          # 插入后 Detect 自身将占用的全局索引
@@ -500,12 +642,12 @@ def inject_p2_head(
     nodes.insert(det_i + offset, [-1, repeats, fuse_block, [p2_channels]])
     offset += 1
 
-    # 5) Detect 输入扩展为 P2-P5
+    # 5) 检测头输入扩展为 P2-P5
     #    写回的是**新列表**而非就地修改：调用方可能传入浅拷贝的节点列表
     #    （例如 {"model": backbone + head}），就地改写会污染其原图。
-    updated = list(nodes[det_i + offset])
-    updated[0] = [fuse_idx, p3_idx, p4_idx, p5_idx]
-    nodes[det_i + offset] = updated
+    nodes[det_i + offset] = _rebuild_head_node(
+        nodes[det_i + offset], [fuse_idx, p3_idx, p4_idx, p5_idx]
+    )
     cfg["_p2_status"] = "injected"
     cfg["_p2_channels"] = p2_channels
     return cfg

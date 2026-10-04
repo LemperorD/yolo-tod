@@ -18,8 +18,11 @@
     python tests/train_smoke.py --device cpu --epochs 2
     python tests/train_smoke.py --keep          # 保留实验目录（默认清理）
 
-⚠️ 环境要求：ultralytics 的标签缓存用 ``multiprocessing.Pool``（Windows 上是命名管道），
-在**受限沙箱**会话里会以 ``PermissionError [WinError 5]`` 失败 —— 这是环境限制，不是本库的 bug。
+⚠️ 环境要求：ultralytics 的标签缓存默认用 ``ThreadPool`` 并行校验图片与标签，
+   而 Windows 上该池会打开**命名管道**，在受限沙箱会话里会 ``PermissionError [WinError 5]``。
+   本脚本默认调用 ``tod.compat.allow_threadless_label_cache()`` 把它换成**顺序**实现
+   （语义一致、只是放弃并行；合成数据本来就只有十几张图），因此**在沙箱里也能跑**。
+   加 ``--allow-threaded-cache`` 可恢复框架默认行为（用于对比/排查）。
 """
 
 from __future__ import annotations
@@ -61,6 +64,8 @@ def main() -> int:
     ap.add_argument("--variant", type=Path, default=ROOT / "variants" / "SDD-YOLO26n" / "variant.yaml")
     ap.add_argument("--work", type=Path, default=ROOT / "tests" / ".tmp" / "train-smoke")
     ap.add_argument("--keep", action="store_true", help="保留实验输出目录")
+    ap.add_argument("--allow-threaded-cache", action="store_true",
+                    help="保留框架默认的并行标签缓存（受限沙箱下会 WinError 5）")
     args = ap.parse_args()
 
     for pkg in ("torch", "ultralytics", "PIL"):
@@ -69,12 +74,17 @@ def main() -> int:
             return 0
 
     import tod
-    from tod import runtime
+    from tod import compat, runtime
     from tod.compat import load_yaml
     from tod.compose import Variant
     from tod.engine.trainer import TODDetectionTrainer
 
     tod.bootstrap()
+
+    # 受限沙箱（Windows 命名管道被禁）下必须换成顺序标签缓存，否则
+    # ``ThreadPool`` 建队列表就 PermissionError [WinError 5]（见 compat 的说明）。
+    if not args.allow_threaded_cache and compat.allow_threadless_label_cache():
+        print("[env ] 标签缓存已切换为顺序模式（沙箱兼容；--allow-threaded-cache 可关闭）")
 
     # ---- 1) 合成数据集 ----
     data_yaml = _load_tool("make_dummy_dataset").build(args.work / "data", 12, 4, seed=0)

@@ -212,6 +212,11 @@ def _apply_head(model: Any, head_name: str, ep5: dict[str, Any]) -> list[str]:
 
     per_group = int(ep5.get("per_group", 16))
     channels = str(ep5.get("channels", "native"))
-    head = swap_detect_head(head, per_group=per_group, channels=channels)
+    # 姿态头：关键点分支是否一起压缩（见 swap_detect_head 的说明）。
+    # 缺省 True 与检测头行为一致；显式 False 可做"关键点分支保精度"的消融。
+    kpt_branches = bool(ep5.get("keypoint_branches", True))
+    head = swap_detect_head(head, per_group=per_group, channels=channels,
+                            keypoint_branches=kpt_branches)
     head._tod_ep5 = head_name        # 幂等标记：resume 时不会二次换头
-    return [f"EP5: {head_name}(per_group={per_group}, channels={channels})", describe(head)]
+    return [f"EP5: {head_name}(per_group={per_group}, channels={channels}, "
+            f"keypoint_branches={kpt_branches})", describe(head)]

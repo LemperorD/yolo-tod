@@ -60,45 +60,45 @@ void PrintUsage() {
   std::cout <<
       R"(todrt_cli —— yolo-tod 的部署端工具（TensorRT / Jetson Orin）
 
-用法：
-  todrt_cli <命令> [参数...] [--key=value ...]
+  用法：
+    todrt_cli <命令> [参数...] [--key=value ...]
 
-命令：
-  list                          列出工厂里注册的变体（不需要 GPU）
-  models                        同上，但输出 JSON
-  info <模型名>                 打印该变体的工厂链路与关键参数（不需要 GPU）
-  dryrun <配置.json>            只做装配自检，不加载/构建引擎
-  probe                         探测本机的 TensorRT / CUDA / DLA 能力
-  catalog                       打印注册表总表（用于生成文档）
-  bench <配置.json> <图片> [n]  实测延迟（预热 10 次，默认 100 次取均值）
-  run   <配置.json> <图片> [out] 跑一次并存 JSON 结果
+  命令：
+    list                          列出工厂里注册的变体（不需要 GPU）
+    models                        同上，但输出 JSON
+    info <模型名>                 打印该变体的工厂链路与关键参数（不需要 GPU）
+    dryrun <配置.json>            只做装配自检，不加载/构建引擎
+    probe                         探测本机的 TensorRT / CUDA / DLA 能力
+    catalog                       打印注册表总表（用于生成文档）
+    bench <配置.json> <图片> [n]  实测延迟（预热 10 次，默认 100 次取均值）
+    run   <配置.json> <图片> [out] 跑一次并存 JSON 结果
 
-通用参数：
-  --model=<名字>                覆盖配置里的模型（如 SPAE-YOLOv8n）
-  --builder=<名字>              覆盖引擎构建器
-  --preproc=<名字> / --postproc=<名字>
-  --device=auto|gpu|dla         覆盖设备
-  --precision=fp32|fp16|int8    覆盖精度
-  --dla-core=<n>
-  --conf=<float> --iou=<float>  覆盖阈值（小目标常需要更低的 conf）
-  --input=<WxH>                 覆盖输入尺寸（例如 640x640）
-  --preset=orin|dgp|x86|fp32
-  --engine=<路径>               直接用已序列化的 engine
-  --onnx=<路径>                 指定 ONNX
-  --save-engine=<路径>          构建后把 engine 落盘
-  --save-config=<路径>          把"实际生效的配置"落盘（便于复现与归档）
-  --verbose
+  通用参数：
+    --model=<名字>                覆盖配置里的模型（如 SPAE-YOLOv8n）
+    --builder=<名字>              覆盖引擎构建器
+    --preproc=<名字> / --postproc=<名字>
+    --device=auto|gpu|dla         覆盖设备
+    --precision=fp32|fp16|int8    覆盖精度
+    --dla-core=<n>
+    --conf=<float> --iou=<float>  覆盖阈值（小目标常需要更低的 conf）
+    --input=<WxH>                 覆盖输入尺寸（例如 640x640）
+    --preset=orin|dgp|x86|fp32
+    --engine=<路径>               直接用已序列化的 engine
+    --onnx=<路径>                 指定 ONNX
+    --save-engine=<路径>          构建后把 engine 落盘
+    --save-config=<路径>          把"实际生效的配置"落盘（便于复现与归档）
+    --verbose
 
-示例：
-  # 1) 开发机上（无 GPU）先验证配置与工厂装配
-  todrt_cli dryrun configs/deploy/spae-yolov8n-orin.json
-  # 2) 实机上先看硬件能力
-  todrt_cli probe
-  # 3) Orin 上构建 FP16 + DLA 引擎并落盘
-  todrt_cli dryrun cfg.json --preset=orin --save-engine=spae_orin_fp16.engine
-  # 4) 实测延迟
-  todrt_cli bench cfg.json sample.ppm 200
-)";
+  示例：
+    # 1) 开发机上（无 GPU）先验证配置与工厂装配
+    todrt_cli dryrun configs/deploy/spae-yolov8n-orin.json
+    # 2) 实机上先看硬件能力
+    todrt_cli probe
+    # 3) Orin 上构建 FP16 + DLA 引擎并落盘
+    todrt_cli dryrun cfg.json --preset=orin --save-engine=spae_orin_fp16.engine
+    # 4) 实测延迟
+    todrt_cli bench cfg.json sample.ppm 200
+  )";
 }
 
 /// 解析 `--key=value` / `--key value` / `-k v`。

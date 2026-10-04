@@ -290,6 +290,20 @@ def test_from_spec_roundtrip() -> None:
     check("from_spec 往返一致", restored.spec() == data,
           f"\n{restored.spec()}\n!=\n{data}")
 
+    # 任务字段（task）也必须能往返：姿态变体丢了它就是静默按 detect 跑
+    pose = (Variant("RoundTripPose", base="yolo26n").pose(kpt_shape=(17, 3))
+            .loss(box="_Dummy", pose="oks").model(nc=10))
+    pose_data = pose.spec()
+    check("任务字段写入 spec", pose_data["task"] == "pose")
+    check("姿态往返保留任务与 kpt_shape",
+          Variant.from_spec(pose_data).task == "pose"
+          and list(Variant.from_spec(pose_data).model_cfg["kpt_shape"]) == [17, 3])
+    try:
+        Variant("BadTask", task="keypoint")
+        raise AssertionError("[FAIL] 非法任务未报错")
+    except ValueError:
+        PASSED.append("非法任务被拒绝")
+
 
 # ------------------------------------------------------------ 4. 可选：真模型
 
@@ -341,10 +355,71 @@ def test_real_model_if_available() -> None:
           str((cfg2.get("head") or cfg2.get("model"))[-1][2]) == "Detect")
 
 
+#: 与官方 yolo26-pose.yaml 同构的最小图（姿态头的 args 是 [nc, kpt_shape]，比 Detect 多一个参数）
+YOLO26_POSE_LIKE = {
+    "nc": 80,
+    "end2end": True,
+    "reg_max": 1,
+    "kpt_shape": [17, 3],
+    "scales": {"n": [0.50, 0.25, 1024]},
+    "backbone": [
+        [-1, 1, "Conv", [64, 3, 2]],         # 0  P1/2
+        [-1, 1, "Conv", [128, 3, 2]],        # 1  P2/4
+        [-1, 2, "C3k2", [256, False, 0.25]], # 2  ← P2 源
+        [-1, 1, "Conv", [256, 3, 2]],        # 3  P3/8
+        [-1, 2, "C3k2", [512, False, 0.25]], # 4
+        [-1, 1, "Conv", [512, 3, 2]],        # 5  P4/16
+        [-1, 2, "C3k2", [512, True]],        # 6
+        [-1, 1, "Conv", [1024, 3, 2]],       # 7  P5/32
+        [-1, 2, "C3k2", [1024, True]],       # 8
+    ],
+    "head": [
+        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],   # 9
+        [[-1, 6], 1, "Concat", [1]],                    # 10
+        [-1, 2, "C3k2", [512, True]],                   # 11
+        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],   # 12
+        [[-1, 4], 1, "Concat", [1]],                    # 13
+        [-1, 2, "C3k2", [256, True]],                   # 14 P3 → 头输入
+        [-1, 1, "Conv", [256, 3, 2]],                   # 15
+        [[-1, 11], 1, "Concat", [1]],                   # 16
+        [-1, 2, "C3k2", [512, True]],                   # 17 P4
+        [-1, 1, "Conv", [512, 3, 2]],                   # 18
+        [[-1, 8], 1, "Concat", [1]],                    # 19
+        [-1, 1, "C3k2", [1024, True, 0.5, True]],       # 20 P5
+        [[14, 17, 20], 1, "Pose26", [80, [17, 3]]],     # 21 Pose26(P3,P4,P5)
+    ],
+}
+
+
+def test_inject_p2_pose_head() -> None:
+    """P2 注入必须对**姿态头**同样正确，且不得破坏它的第二个参数（kpt_shape）。"""
+    import copy
+
+    cfg = copy.deepcopy(YOLO26_POSE_LIKE)
+    inject_p2_head(cfg, p2_idx=2, p2_channels=128, fuse_block="C3")
+
+    head = cfg["head"]
+    pose = head[-1]
+    check("姿态图 P2 分支已插入", cfg["_p2_status"] == "injected")
+    check("姿态头仍在末尾（类型为 Pose26）", str(pose[2]) == "Pose26")
+    check("姿态头输入变为 4 路", pose[0] == [23, 14, 17, 20], f"实际 {pose[0]}")
+    check("姿态头的 args 未被破坏（仍是 [nc, kpt_shape]）",
+          pose[3] == [80, [17, 3]], f"实际 {pose[3]}")
+    check("姿态图的 kpt_shape 未被改动", cfg["kpt_shape"] == [17, 3])
+    check("融合块按配置生成（C3，128 通道，紧邻头之前）",
+          head[-2][2] == "C3" and head[-2][3] == [128], f"实际 {head[-2]}")
+
+    # 幂等 + 浅拷贝不污染（与 Detect 版同样的回归要求）
+    inject_p2_head(cfg, p2_idx=2)
+    check("姿态图重复注入被识别", cfg["_p2_status"] == "already_present")
+    check("姿态图浅拷贝不污染原图", YOLO26_POSE_LIKE["head"][-1][0] == [14, 17, 20],
+          f"实际 {YOLO26_POSE_LIKE['head'][-1][0]}")
+
+
 def main() -> int:
-    tests = [test_registry, test_compose, test_inject_p2, test_type_map,
-             test_downsample_replacement, test_p2_pre_node, test_from_spec_roundtrip,
-             test_real_model_if_available]
+    tests = [test_registry, test_compose, test_inject_p2, test_inject_p2_pose_head,
+             test_type_map, test_downsample_replacement, test_p2_pre_node,
+             test_from_spec_roundtrip, test_real_model_if_available]
     for fn in tests:
         fn()
     print(f"\n全部通过：{len(PASSED)} 项检查\n")

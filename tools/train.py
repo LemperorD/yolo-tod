@@ -35,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--set", action="append", default=[], metavar="K=V",
                     help="覆盖任意训练参数（可重复），如 --set workers=0 --set plots=False")
     ap.add_argument("--dry-run", action="store_true", help="只建模型并前向一次，不训练")
+    ap.add_argument("--allow-threaded-cache", action="store_true",
+                    help="保留框架默认的并行标签缓存（受限沙箱下会 WinError 5）")
     return ap
 
 
@@ -80,16 +82,33 @@ def main() -> int:
 
     runtime.set_active(spec)
 
+    # 受限沙箱（Windows 命名管道被禁）下必须把标签缓存换成顺序实现，
+    # 否则 dataloader 一建就 PermissionError [WinError 5]（见 tod/compat.py 的说明）。
+    if not args.allow_threaded_cache:
+        from tod.compat import allow_threadless_label_cache
+
+        if allow_threadless_label_cache():
+            print("[env ] 标签缓存已切换为顺序模式（沙箱兼容；--allow-threaded-cache 可关闭）")
+
+    task = str(spec.get("task") or "detect")
+    if task not in _task_trainers():
+        raise SystemExit(
+            f"变体 {variant.name} 的 task={task!r} 还没有训练回路（可选 {sorted(TASK_TRAINERS)}）。"
+            "本库目前接了 detect 与 pose 两条；segment/obb 需要各自的 Validator 与准则接线。"
+        )
+
     from ultralytics import YOLO
 
-    model = YOLO(str(model_path))
+    # task 必须显式传给 YOLO：本库生成的模型图叫 model.yaml，而框架的
+    # ``guess_model_task`` **靠文件名**判任务（只认 *-pose 之类），不看网络结构。
+    model = YOLO(str(model_path), task=task)
 
     if args.dry_run:
         import torch
         from ultralytics.cfg import get_cfg
 
         from tod.engine.surgery import apply_spec
-        from tod.loss.criterion import build_detection_loss
+        from tod.loss.criterion import build_detection_loss, build_pose_criterion
 
         imgsz = args.imgsz or int(spec.get("data", {}).get("imgsz", 640))
         n_before = sum(p.numel() for p in model.model.parameters())
@@ -108,13 +127,20 @@ def main() -> int:
         from tod.engine.trainer import stal_flag
 
         dfl_gain = float(getattr(model.model.args, "dfl", 1.5) or 0.0)
-        use_dfl = False if (dfl_gain == 0.0 and ep7.get("box")) else None
-        criterion = build_detection_loss(
-            model.model, kind=ep7.get("box"),
-            theta=float(ep7.get("theta", 4.0) or 4.0), use_dfl=use_dfl,
-            stal=stal_flag(ep6), **(ep7.get("kind_kwargs") or {}),
-        )
-        print("[EP6/EP7] 训练准则：" + ("；".join(criterion._tod_patched) or "框架默认（未做替换）"))
+        box_kind = ep7.get("box")
+        use_dfl = False if (dfl_gain == 0.0 and box_kind) else None
+        if task == "pose":
+            criterion, report = build_pose_criterion(
+                model.model, ep7=ep7, stal=stal_flag(ep6), use_dfl=use_dfl,
+            )
+        else:
+            criterion = build_detection_loss(
+                model.model, kind=box_kind,
+                theta=float(ep7.get("theta", 4.0) or 4.0), use_dfl=use_dfl,
+                stal=stal_flag(ep6), **(ep7.get("kind_kwargs") or {}),
+            )
+            report = list(getattr(criterion, "_tod_patched", []))
+        print("[EP6/EP7] 训练准则：" + ("；".join(report) or "框架默认（未做替换）"))
         prog = callable(getattr(criterion, "update", None)) or callable(
             getattr(getattr(criterion, "base", None), "update", None))
         print(f"[EP9] 优化器={ep9.get('optimizer', 'auto')}"
@@ -126,10 +152,15 @@ def main() -> int:
         head = model.model.model[-1]
         with torch.no_grad():
             out = model.model(torch.zeros(1, 3, imgsz, imgsz))
-        print(f"[自检] imgsz={imgsz}  参数量={n_after:,} ({n_after / 1e6:.2f} M)"
+        print(f"[自检] task={task}  imgsz={imgsz}  参数量={n_after:,} ({n_after / 1e6:.2f} M)"
               + (f"  手术影响 {n_after - n_before:+,} 参数" if applied else ""))
         print(f"[自检] 检测层数 nl={getattr(head, 'nl', '?')}  stride={list(getattr(head, 'stride', []))}")
         print(f"[自检] 头输入特征图索引：{list(getattr(head, 'f', []))}")
+        if task == "pose":
+            kpt_branch = ("cv4_kpts + cv4_sigma（Pose26，带归一化流）"
+                          if hasattr(head, "cv4_kpts") else "cv4（Pose）")
+            print(f"[自检] 关键点：kpt_shape={getattr(head, 'kpt_shape', '?')} "
+                  f"nk={getattr(head, 'nk', '?')}  分支={kpt_branch}")
         print(f"[自检] 前向输出层数：{len(out) if isinstance(out, (list, tuple)) else 1}")
         return 0
 
@@ -140,7 +171,7 @@ def main() -> int:
         key, value = item.split("=", 1)
         train_args[key.strip()] = _coerce(value.strip())
 
-    data = args.data or _default_data(variant.dataset)
+    data = args.data or _default_data(variant.dataset, task)
     if data is not None:
         train_args["data"] = str(data)
     elif "data" not in train_args:
@@ -162,13 +193,21 @@ def main() -> int:
     train_args.setdefault("imgsz", spec.get("data", {}).get("imgsz"))
     train_args = {k: v for k, v in train_args.items() if v is not None}
 
+    trainer = _task_trainers()[task]
+    print(f"[训练] {variant.name} | task={task} | data={train_args.get('data')} | "
+          f"imgsz={train_args.get('imgsz')} | epochs={train_args.get('epochs')} | "
+          f"box_loss={runtime.get('eps.EP7.box', '框架默认')}"
+          + (f" | pose_loss={runtime.get('eps.EP7.pose', '框架默认')}" if task == "pose" else ""))
+    model.train(trainer=trainer, **train_args)
+    return 0
+
+
+def _task_trainers() -> dict:
+    """task → 训练器类（延迟导入：未装 ultralytics 时 tools/train.py 仍可 --help）。"""
+    from tod.engine.pose_trainer import TODPoseTrainer
     from tod.engine.trainer import TODDetectionTrainer
 
-    print(f"[训练] {variant.name} | data={train_args.get('data')} | "
-          f"imgsz={train_args.get('imgsz')} | epochs={train_args.get('epochs')} | "
-          f"box_loss={runtime.get('eps.EP7.box', '框架默认')}")
-    model.train(trainer=TODDetectionTrainer, **train_args)
-    return 0
+    return {"detect": TODDetectionTrainer, "pose": TODPoseTrainer}
 
 
 def _dry_run_args(spec: dict, get_cfg):
@@ -184,12 +223,25 @@ def _dry_run_args(spec: dict, get_cfg):
     return args
 
 
-def _default_data(dataset: str) -> Path | None:
-    """按数据集名推断本库的 base 配置路径。"""
+def _default_data(dataset: str, task: str = "detect") -> Path | None:
+    """按数据集名 + 任务推断本库的 base 配置路径。
+
+    姿态任务优先找 ``<dataset>-pose.yaml``（``visdrone2019-det`` → ``visdrone2019-pose``）：
+    检测数据集与姿态数据集**不是同一份文件**（后者多一个 ``kpt_shape``），
+    直接用检测配置会让框架报 "No kpt_shape in data yaml" 而中止。
+    """
     if not dataset:
         return None
-    candidate = ROOT / "configs" / "_base_" / "datasets" / f"{dataset}.yaml"
-    return candidate if candidate.is_file() else None
+    candidates = []
+    if task == "pose":
+        stem = dataset.replace("2019-det", "2019-pose")
+        candidates += [f"{stem}.yaml", f"{dataset}-pose.yaml"]
+    candidates.append(f"{dataset}.yaml")
+    for name in candidates:
+        candidate = ROOT / "configs" / "_base_" / "datasets" / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 if __name__ == "__main__":

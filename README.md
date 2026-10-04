@@ -3,10 +3,14 @@
 收集、复现并**可归因地**对比针对小目标检测（Tiny/Small Object Detection）的 YOLO 魔改。
 完整方案见 [`PLAN.md`](PLAN.md)：架构设计、值得收录的魔改清单、优先级、评测协议。
 
-**当前状态：M0 骨架已完成（`tests/smoke.py` 66 项全绿，`tests/test_modules.py` 105 项全绿）；
+**当前状态：M0 骨架已完成（`tests/smoke.py` 77 项全绿，`tests/test_modules.py` 105 项全绿）；
 两个论文级变体已实现 —— SPAE-YOLOv8n 与 SDD-YOLO26n（结构自检全通）；
+**姿态式关键点检测（pose）已打通完整回路**（`tests/test_pose.py` 99 项全绿 +
+`tests/train_pose_smoke.py` 合成关键点数据真训练），变体为 `visdrone-yolo26n-pose-p2-p16`
+（**数据集标注待准备**，见下）；
 训练回路已用**合成数据**端到端跑通（`tests/train_smoke.py`：训练/验证/EMA/存权重/载权重/推理），
-并补齐了**尺度分层评测**（`tools/val.py`：整体 AP + AP_small/AP_tiny）与
+并补齐了**尺度分层评测**（`tools/val.py`：整体 AP + AP_small/AP_tiny）、
+**姿态 OKS 分层评测**（`tools/val_pose.py`）与
 **消融流水线**（`tools/ablation.py`：leave-one-out + 逐字段 diff + 汇总表）。
 真实数据集上的精度数字待 M1。推理端（C++/TensorRT）工厂化骨架已落地：
 `src/todrt/`，CPU 自检 107 项全绿。**
@@ -20,6 +24,36 @@
   见 [`docs/DEPLOY.md`](docs/DEPLOY.md)
 
 ## 已实现的变体
+
+### visdrone-yolo26n-pose-p2-p16 —— 航拍小目标**姿态关键点**（本库自研）
+
+把"小目标检测"延伸到**关键点**，并把 OKS 口径的坑做成可归因配置：
+
+| 组件 | 本库落点 | 要点 |
+|---|---|---|
+| **P2 关键点头** | `model(add_p2=True)`（EP5/EP2） | 关键点分支跟着多一层，关键点预测分辨率 ×2 |
+| **OKS 关键点损失** | `modules/loss/pose.py`（EP7） | `TinyPoseLoss` 与框架同签名；sigma 策略 `person`/`auto`/`balanced`；σ 下限；可见性开关 |
+| **姿态训练器** | `engine/pose_trainer.py`（EP9） | 继承检测侧全部 EP 接线，改用 `PoseModel` + 姿态准则（O2M/O2O **两套**都替换） |
+| **OKS 分层评测** | `eval/pose.py`（EP8） | OKS-AP 50:95 + 按目标边长分层 + **逐关键点尺度诊断**（≤1px 命中率/平均误差/平均 OKS） |
+| **合成关键点数据** | `tools/make_dummy_dataset.py --task pose`（EP0） | 火柴人 + COCO 17 点，tiny(12–24px) 与日常(48–112px) 双尺度 |
+
+```powershell
+python tools\make_variant.py variants\visdrone-yolo26n-pose-p2-p16\recipe.py
+python tools\train.py --variant variants\visdrone-yolo26n-pose-p2-p16\variant.yaml --dry-run
+python tests\train_pose_smoke.py      # 合成关键点数据真训练（回路自检）
+python tools\val_pose.py --weights results\...\best.pt `
+    --data configs\_base_\datasets\visdrone2019-pose.yaml --imgsz 1024 --sigma-strategy person
+```
+
+> ⚠️ **数据集状态**：VisDrone2019-DET **没有关键点标注**，`configs/_base_/datasets/visdrone2019-pose.yaml`
+> 目前是**接口占位**（`tod.kpt_annotation: none`，候选标注来源写在该文件注释里）。
+> 在真实标注到位前，本变体只能跑结构自检与合成数据回路自检，**卡片精度栏必须留空**。
+>
+> ⚠️ 三条必须知道的结论：① **OKS 的分母含框面积** —— 同一个 3 px 误差在 120 px 人体上 OKS≈0.95、
+> 在 8 px 行人上 OKS≈0.2，因此**只看整体 OKS-AP 会掩盖小目标关键点退化**，这也是本库必须自带
+> `val_pose.py` 分层口径的原因；② 框架 OKS 项在 tiny 目标上会**饱和**（`1−exp(−e)`，e 随 1/area
+> 爆炸），本库的 σ 下限与 `balanced` 策略就是为这个现象准备的可消融开关；
+> ③ 本变体**不是** FlyPose（WACV 2026）的复现，只是问题设定重叠。
 
 ### SPAE-YOLOv8n —— 空对空微小型无人机检测（Sensors 2026）
 
@@ -123,18 +157,20 @@ v.card("variants/visdrone-yolov8n-p2-dysample-nwd/card.md")
 ```
 src/tod/            训练侧（Python）
 ├─ registry.py      魔改注册表（强制元数据；规范名与别名都会注入框架命名空间）
-├─ compose.py       变体 DSL + 模型图改造（P2 注入 / 下采样替换 / 类型替换）
-├─ compat.py        唯一触碰 ultralytics 内部的地方（含只读配置目录回退）
+├─ compose.py       变体 DSL + 模型图改造（P2 注入 / 下采样替换 / 类型替换 / **task 与 kpt_shape**）
+├─ compat.py        唯一触碰 ultralytics 内部的地方（含只读配置目录回退、PoseModel 获取）
 ├─ runtime.py       变体 spec 的运行时上下文
 ├─ modules/
 │  ├─ conv/adown.py            ADown（EP1）
 │  ├─ attention/dual_attention.py DualAttention（EP4，SDD-YOLO §4.5）
-│  └─ head/efficient_uavdet.py Efficient_UAVDet（EP5）
+│  └─ head/efficient_uavdet.py Efficient_UAVDet（EP5，检测/关键点分支均可换）
 ├─ assigner/stal.py  STAL 小目标感知分配（EP6，可消融开关）
 ├─ optim/musgd.py    MuSGD（EP9，Muon 式 NS 正交化 + SGD 分量）
 ├─ loss/box.py + criterion.py  SIoU / Wise-IoU v3 与训练准则接入（EP7）
+├─ loss/pose.py      **TinyPoseLoss**：OKS 关键点损失（EP7，sigma 策略/σ 下限/可见性开关）
 ├─ eval/scales.py    尺度分层评测（整体 AP + AP_small/AP_tiny，COCO 式 101 点插值）
-└─ engine/           trainer.py（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
+├─ eval/pose.py      **姿态 OKS 评测**（EP8：OKS-AP 50:95 + 按目标/关键点尺度分层）
+└─ engine/           trainer.py + **pose_trainer.py**（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
                     / distill.py（EP9 特征对齐蒸馏）
 
 src/todrt/          部署侧（C++17，四个后端可选）—— 与 src/tod 并列，可独立复用
@@ -146,15 +182,17 @@ src/todrt/          部署侧（C++17，四个后端可选）—— 与 src/tod 
 ├─ apps/todrt_cli   部署工具（list/info/dryrun/probe/bench/run）
 └─ tests/cpp_smoke  架构自检（**不需要任何后端**，148 项）
 
-configs/_base_/     数据集等基础配置
+configs/_base_/     数据集等基础配置（visdrone2019-det / **visdrone2019-pose**）
 configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 C++ 的唯一契约）
 variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
-tools/              make_variant.py / train.py / val.py / ablation.py / catalog.py
-                    / make_dummy_dataset.py / export_onnx.py / convert_rknn.py
+tools/              make_variant.py / train.py / val.py / **val_pose.py** / ablation.py / catalog.py
+                    / make_dummy_dataset.py（--task detect|pose）/ export_onnx.py / convert_rknn.py
 docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
 docs/VARIANTS.md    模块总表（由 tools/catalog.py 自动生成）
-tests/              smoke.py（无 torch 依赖，66 项）+ test_modules.py（形状/数值/手术/蒸馏/
-                    优化器/评测/端到端，105 项）+ train_smoke.py（合成数据跑真训练，opt-in）
+tests/              smoke.py（无 torch 依赖，77 项）+ test_modules.py（105 项）
+                    + test_pose.py（**姿态模块/OKS 口径/建图/准则，99 项**）
+                    + train_smoke.py（检测回路真训练，opt-in）
+                    + train_pose_smoke.py（**姿态回路真训练 + OKS 分层断言，opt-in**）
 ```
 
 ## 评测与消融（可归因对比）

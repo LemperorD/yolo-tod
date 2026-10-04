@@ -68,6 +68,7 @@ class TrtEngine {
   /// 统计每层能否跑在 DLA 上（构建期调用；ONNX 解析后、构建引擎前）。
   void ClassifyLayers();
   /// 引擎逐层信息（JSON 行），排查"为什么没上 DLA / 这层是什么精度"时用。
+  /// 非 const：内部要创建 IEngineInspector 并绑定 execution context（TensorRT 的接口如此）。
   std::vector<std::string> LayerInfo();
 
   void Release();
@@ -81,11 +82,7 @@ class TrtEngine {
   std::unique_ptr<Impl> impl_;
 };
 
-/// 由 backend/engine_trt.cpp 提供：构造真正跑 TensorRT 的 Detector。
-std::unique_ptr<Detector> CreateTrtDetector(const std::string& model_name, const DetectorOptions& opts,
-                                            const ModelRecipe& recipe,
-                                            const std::string& builder_name,
-                                            const std::string& preproc_name,
-                                            const std::string& postproc_name);
+// 注意：CreateTrtDetector() 的声明在 trt_factory.hpp —— 本头只负责 TrtEngine，
+// 不依赖 factory.hpp（否则会引入"必须按特定顺序包含"的隐式约束）。
 
 }  // namespace todrt

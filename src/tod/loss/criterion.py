@@ -170,3 +170,66 @@ def build_detection_loss(model, kind: str | None = "siou", theta: float = 4.0,
         report += install_assigner(criterion, small_target_aware=stal)
     criterion._tod_patched = report
     return criterion
+
+
+def resolve_box_kind(ep7: dict | None) -> tuple[str | None, float]:
+    """从 EP7 配置里解析"是否替换框损失"与形状代价权重。
+
+    抽出来是为了让**检测**与**姿态**两条训练路径共用同一套判断
+    （``tools/train.py --dry-run`` 与 ``TODDetectionTrainer`` 已有两处重复，
+    姿态训练器再加一处就是三处，迟早漂移）。
+
+    Returns:
+        ``(kind, theta)``；``kind=None`` 表示保留框架默认的 IoU 项。
+    """
+    ep7 = ep7 or {}
+    # 只认 "box" 键：姿态变体常只写 ``pose=...``（不换框损失），此时必须返回 None
+    # 而不是把 "pose" 当损失名传下去（``box_loss("oks")`` 会直接报未注册）。
+    kind = ep7.get("box")
+    theta = float(ep7.get("theta", 4.0) or 4.0)
+    return kind, theta
+
+
+def build_pose_criterion(model, ep7: dict | None = None, stal: bool | None = None,
+                         use_dfl: bool | None = None) -> tuple[Any, list[str]]:
+    """构造**姿态**训练准则：框架 PoseLoss 基线 + EP7 的框损失与关键点损失替换。
+
+    姿态准则（``v8PoseLoss`` / YOLO26 的 ``E2ELoss(PoseLoss26)``）继承自
+    ``v8DetectionLoss``，所以"换框损失"这条路**完全复用** ``build_detection_loss``；
+    关键点项则由 ``tod.loss.pose.build_pose_loss`` 单独替换。两件事互不干扰，
+    因此 ``box="wiou"`` 与 ``pose="oks"`` 可以同时生效，消融也各自独立。
+
+    Args:
+        ep7: EP7 覆盖段，识别两个键：
+            * ``box``   —— 框回归损失名（``siou``/``wiou``…；缺省保留框架默认）；
+            * ``pose``  —— 关键点损失：``"oks"``/``True`` 启用 ``TinyPoseLoss``，
+              ``False``/``"native"`` 显式保留框架原生 ``KeypointLoss``（消融列），
+              缺省 = 不替换（与框架完全一致）。
+            其余键（``sigma_strategy``/``min_sigma``）透传给 ``TinyPoseLoss``。
+
+    Returns:
+        ``(criterion, report)``；``criterion._tod_patched`` 同样记录描述，便于
+        ``--dry-run`` 与测试断言。
+    """
+    from tod.loss.pose import build_pose_loss
+
+    ep7 = ep7 or {}
+    kind, theta = resolve_box_kind(ep7)
+    criterion = build_detection_loss(
+        model, kind=kind, theta=theta, use_dfl=use_dfl, stal=stal,
+        **(ep7.get("kind_kwargs") or {}),
+    )
+
+    pose_key = ep7.get("pose")
+    if pose_key is None:
+        return criterion, list(getattr(criterion, "_tod_patched", []))
+    enabled = not (pose_key is False or str(pose_key).lower() in {"native", "off", "none"})
+    report = list(getattr(criterion, "_tod_patched", []))
+    report += build_pose_loss(
+        criterion,
+        enabled=enabled,
+        strategy=str(ep7.get("sigma_strategy", ep7.get("sigma", "auto"))),
+        min_sigma=float(ep7.get("min_sigma", 1e-3) or 1e-3),
+    )
+    criterion._tod_patched = report
+    return criterion, report

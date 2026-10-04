@@ -219,6 +219,106 @@ def framework_has(name: str) -> bool:
         return False
 
 
+def allow_threadless_label_cache(enable: bool = True) -> bool:
+    """让框架的**标签缓存**在受限沙箱（Windows 命名管道被禁）里也能跑。
+
+    背景（这是环境限制，不是本库的 bug）：
+        ultralytics 的 ``YOLODataset.cache_labels`` 无条件用
+        ``with ThreadPool(min(8, os.cpu_count())) as pool:`` 并行校验图片与标签。
+        Windows 上 ``multiprocessing.pool.ThreadPool`` 的实现会创建
+        ``SimpleQueue`` → ``multiprocessing.connection.Pipe`` →
+        ``_winapi.CreateFile`` 打开一个**命名管道**。在文件/进程受限的沙箱会话里
+        这一步会直接 ``PermissionError: [WinError 5] 拒绝访问``，训练与验证都进不去。
+
+    本函数做的事（**不改框架源码**）：
+        把 ``ultralytics.data.dataset.ThreadPool`` 换成一个**顺序执行的假池**，
+        接口只用到 ``__enter__/__exit__/imap/imap_unordered``，语义与单线程串行完全一致
+        —— 结果正确性不受影响，只是放弃并行加速（合成数据的标签缓存本来就是毫秒级）。
+
+    为什么要放在 ``compat.py``：这正是"唯一允许触碰框架内部结构"的文件的职责；
+    其它模块只调用 ``allow_threadless_label_cache()``，不直接 import 框架内部。
+
+    Returns:
+        ``True`` 表示补丁已生效（或已生效过），``False`` 表示未能打补丁（框架结构变化）。
+    """
+    if not installed():
+        return False
+    if not enable:
+        return False
+    ensure_runtime_env()
+    import importlib
+
+    try:
+        module = importlib.import_module("ultralytics.data.dataset")
+    except ImportError:  # pragma: no cover
+        return False
+    if getattr(module, "_tod_threadless_cache", False):
+        return True
+
+    class _SequentialPool:
+        """``ThreadPool`` 的最小顺序替身（只实现框架实际用到的那几个方法）。"""
+
+        def __init__(self, *args, **kwargs):
+            self._closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._closed = True
+            return False
+
+        def imap(self, func, iterable):
+            return (func(item) for item in iterable)
+
+        def imap_unordered(self, func, iterable):
+            return (func(item) for item in iterable)
+
+        def map(self, func, iterable):
+            return [func(item) for item in iterable]
+
+        def close(self):
+            self._closed = True
+
+        def join(self):
+            return None
+
+        def terminate(self):
+            self._closed = True
+
+    module.ThreadPool = _SequentialPool
+    module._tod_threadless_cache = True
+    return True
+
+
+@lru_cache(maxsize=1)
+def pose_model_class():
+    """框架的姿态模型类 ``PoseModel``（``DetectionModel`` 的姿态特化）。
+
+    为什么本库需要它：模型图是 ``*-pose.yaml`` 时，用 ``YOLO(yaml, task="pose")``
+    也能跑，但**任务判定依赖文件名**（``guess_model_task`` 先看路径后看结构，
+    而变体生成的图叫 ``model.yaml``，判不出 pose）。直接用 ``PoseModel`` 建图
+    可以完全绕开文件名启发式，也让 ``--dry-run`` 不依赖 ``YOLO`` 包装器。
+
+    导入路径在历史版本里变动过，按可靠性依次尝试。
+    """
+    if not installed():
+        raise CompatError("未安装 ultralytics，无法获取 PoseModel。")
+    ensure_runtime_env()
+    for mod_path in ("ultralytics.nn.tasks",):
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:  # pragma: no cover
+            continue
+        cls = getattr(mod, "PoseModel", None)
+        if cls is not None:
+            return cls
+    raise CompatError(
+        "未能找到 ultralytics.nn.tasks.PoseModel，框架结构可能已变更，"
+        "请检查 src/tod/compat.py。"
+    )
+
+
 @lru_cache(maxsize=1)
 def tal_assigner():
     """框架的 ``TaskAlignedAssigner``（EP6 的基类）。

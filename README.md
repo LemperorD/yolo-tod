@@ -5,12 +5,13 @@
 
 **当前状态：M0 骨架已完成（`tests/smoke.py` 77 项全绿，`tests/test_modules.py` 105 项全绿）；
 两个论文级变体已实现 —— SPAE-YOLOv8n 与 SDD-YOLO26n（结构自检全通）；
-**姿态式关键点检测（pose）已打通完整回路**（`tests/test_pose.py` 99 项全绿 +
-`tests/train_pose_smoke.py` 合成关键点数据真训练），变体为 `visdrone-yolo26n-pose-p2-p16`
-（**数据集标注待准备**，见下）；
+**姿态式关键点检测（pose）已打通完整回路**（`tests/test_pose.py` 195 项全绿 +
+`tests/train_pose_smoke.py` 合成关键点数据真训练 23 项），已有两个姿态变体：
+`spae-yolov8n-pose`（**SPAE 加 9 点机体关键点，面向 RflySim 仿真数据**）与
+`visdrone-yolo26n-pose-p2-p16`（航拍行人 17 点，**数据集标注待准备**）；
 训练回路已用**合成数据**端到端跑通（`tests/train_smoke.py`：训练/验证/EMA/存权重/载权重/推理），
 并补齐了**尺度分层评测**（`tools/val.py`：整体 AP + AP_small/AP_tiny）、
-**姿态 OKS 分层评测**（`tools/val_pose.py`）与
+**姿态 OKS 分层评测**（`tools/val_pose.py`）、**关键点数据开训前校验**（`tools/check_pose_dataset.py`）与
 **消融流水线**（`tools/ablation.py`：leave-one-out + 逐字段 diff + 汇总表）。
 真实数据集上的精度数字待 M1。推理端（C++/TensorRT）工厂化骨架已落地：
 `src/todrt/`，CPU 自检 107 项全绿。**
@@ -24,6 +25,46 @@
   见 [`docs/DEPLOY.md`](docs/DEPLOY.md)
 
 ## 已实现的变体
+
+### spae-yolov8n-pose —— SPAE **加关键点**（RflySim 仿真训练）
+
+在 **既有 SPAE-YOLOv8n 上新增一条关键点输出支路**：四个 SPAE 组件全部保留，
+检测头换成姿态头，用于"检测框 + 9 点机体关键点"的多任务模型。
+
+| SPAE 组件 | 在姿态头上的落点（实测） |
+|---|---|
+| **P2 浅层** | `Pose(P2,P3,P4,P5)`，`nl=4`、`stride=[4,8,16,32]` → **关键点分辨率 ×2**，不需额外手术 |
+| **ADown** | 主干索引 1/3/5/7 替换，与检测变体完全一致 |
+| **SIoU** | `v8PoseLoss` 继承 `v8DetectionLoss`，框损失替换路径完全复用 |
+| **Efficient_UAVDet** | `cv2/cv3` 分组 `g=[2,4,8,16]`（16 ch/组）；**`cv4` 关键点分支默认不压缩**（见下） |
+
+```powershell
+python tools\make_variant.py variants\spae-yolov8n-pose\recipe.py
+python tools\train.py --variant variants\spae-yolov8n-pose\variant.yaml --dry-run
+python tools\check_pose_dataset.py --data configs\_base_\datasets\rflysim-pose.yaml   # 开训前校验
+python tests\train_pose_smoke.py --layout uav        # 合成 9 点数据跑通回路
+```
+
+> ⚠️ 三条必须知道的边界：
+> ① 这是**新组合，不是论文复现** —— SPAE 论文只出框（没有关键点），而 9 点定义来自
+> *Keypoint-Guided Efficient Pose Estimation and Domain Adaptation for MAVs*（IEEE T-RO 2024）；
+> 本库用的是 **YOLO 姿态头 + OKS 损失**，**没有**采用该论文的自定义质心引导定位网络与
+> 域适应方法，结构不等价，**不能宣称复现其精度**。
+> ② **9 个关键点的顺序是推断**（论文付费墙 + 作者仓库只有 README），定义在
+> [`docs/KEYPOINTS.md`](docs/KEYPOINTS.md)，状态 `inferred`；校正只改数据集 YAML 的
+> `kpt_names` / `flip_idx` 两行，**无需改代码**。
+> ③ 数据集是 **RflySim 仿真**，与 SPAE 论文的 Det-Fly 真实空对空不同域；
+> 仿真数字不能直接当真实场景指标。
+
+#### 关键点分支为什么默认"不压缩"
+
+论文的 `g = x/16` 是针对**检测头**给出的。关键点分支的中间通道是框架固定的
+`c4 = max(ch[0]//4, nk)`：9 点时 `c4=27`，与输入 32 **最大公约数为 1**，
+照搬 `g=x/16` 只会退化成 `g=1`（= 普通卷积）——**"配了压缩、其实一个通道都没压"的静默失效**。
+本库因此：默认不压（`KeptStem`，日志里如实写"未压缩"）；要压必须显式给
+`EP5.keypoint_per_group`，且**不可行时直接报错**而不是放行。
+
+
 
 ### visdrone-yolo26n-pose-p2-p16 —— 航拍小目标**姿态关键点**（本库自研）
 
@@ -167,7 +208,7 @@ src/tod/            训练侧（Python）
 ├─ assigner/stal.py  STAL 小目标感知分配（EP6，可消融开关）
 ├─ optim/musgd.py    MuSGD（EP9，Muon 式 NS 正交化 + SGD 分量）
 ├─ loss/box.py + criterion.py  SIoU / Wise-IoU v3 与训练准则接入（EP7）
-├─ loss/pose.py      **TinyPoseLoss**：OKS 关键点损失（EP7，sigma 策略/σ 下限/可见性开关）
+├─ loss/pose.py      **TinyPoseLoss**：OKS 关键点损失（EP7，sigma 策略 person/auto/balanced/uniform + σ 下限 + 可见性开关）
 ├─ eval/scales.py    尺度分层评测（整体 AP + AP_small/AP_tiny，COCO 式 101 点插值）
 ├─ eval/pose.py      **姿态 OKS 评测**（EP8：OKS-AP 50:95 + 按目标/关键点尺度分层）
 └─ engine/           trainer.py + **pose_trainer.py**（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
@@ -182,17 +223,20 @@ src/todrt/          部署侧（C++17，四个后端可选）—— 与 src/tod 
 ├─ apps/todrt_cli   部署工具（list/info/dryrun/probe/bench/run）
 └─ tests/cpp_smoke  架构自检（**不需要任何后端**，148 项）
 
-configs/_base_/     数据集等基础配置（visdrone2019-det / **visdrone2019-pose**）
+configs/_base_/     数据集等基础配置（visdrone2019-det / **visdrone2019-pose** / **rflysim-pose**）
 configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 C++ 的唯一契约）
 variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
 tools/              make_variant.py / train.py / val.py / **val_pose.py** / ablation.py / catalog.py
-                    / make_dummy_dataset.py（--task detect|pose）/ export_onnx.py / convert_rknn.py
+                    / **check_pose_dataset.py**（关键点数据开训前校验）
+                    / make_dummy_dataset.py（--task detect|pose --layout person|uav --kpt-shape N,D）
+                    / export_onnx.py / convert_rknn.py
 docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
+docs/KEYPOINTS.md   **9 点机体关键点定义（唯一编号来源，含 flip_idx 与推断状态）**
 docs/VARIANTS.md    模块总表（由 tools/catalog.py 自动生成）
 tests/              smoke.py（无 torch 依赖，77 项）+ test_modules.py（105 项）
-                    + test_pose.py（**姿态模块/OKS 口径/建图/准则，99 项**）
+                    + test_pose.py（**姿态/关键点模块与口径，195 项**）
                     + train_smoke.py（检测回路真训练，opt-in）
-                    + train_pose_smoke.py（**姿态回路真训练 + OKS 分层断言，opt-in**）
+                    + train_pose_smoke.py（**姿态回路真训练 + OKS 分层断言，23 项**）
 ```
 
 ## 评测与消融（可归因对比）

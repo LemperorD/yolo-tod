@@ -69,16 +69,25 @@ def sigma_tensor(kpt_shape: Any, strategy: str = "auto",
               （不做任何缩放，与框架 ``KeypointLoss`` 逐元素一致，本库有回归对照）；
             * ``"auto"`` —— 17 点同 ``person``；其它点数用**形状自适应的几何衰减**
               sigma（见 ``_auto_sigma``），并缩放到 COCO sigma 的均值量级；
+            * ``"uniform"`` —— 所有点同 σ（见下）。
             * ``"balanced"`` —— 在 auto 的基础上把 sigma 压平（推向均值 1）并归一化，
               减小"末端点权重 5 倍于髋部"的悬殊。**这是刻意改变损失尺度的激进选项**，
-              只在明确要"让离群点不再主导 tiny 目标的关键点损失"时使用。
+              只在明确要"让离群点不再主导 tiny 目标的关键点损失"时使用；
+            * ``"uniform"`` —— 所有点用同一个 sigma。**没有"某个点更难"的先验时用它**：
+              机体关键点（四个电机/机臂）通常是同质的，几何曲线会把首尾点无依据地
+              放松/收紧；uniform 的诚实表述是"我们不知道哪个点更难，所以一视同仁"。
+              尺度同样对齐到 COCO sigma 均值，便于与其它策略比较。
         device: 目标设备。
 
     Returns:
         ``(sigma, 可读说明)``。
     """
     nkpt = int(kpt_shape[0])
-    if strategy in ("person", "framework") and nkpt == len(COCO_SIGMA_17):
+    if strategy == "uniform":
+        sigma = torch.full((max(nkpt, 1),), COCO_SIGMA_MEAN, dtype=torch.float32)
+        note = (f"uniform（所有 {nkpt} 点同 σ={COCO_SIGMA_MEAN:.4f}；"
+                "无「哪个点更难」先验时的诚实选择）")
+    elif strategy in ("person", "framework") and nkpt == len(COCO_SIGMA_17):
         sigma = torch.tensor(COCO_SIGMA_17, dtype=torch.float32)
         note = "person（COCO 17 点标准 sigma，未缩放 → 与框架逐元素一致）"
     elif strategy == "balanced":

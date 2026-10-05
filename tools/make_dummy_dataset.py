@@ -64,6 +64,45 @@ COCO_POSE_LAYOUT = (
     (0.32, 1.00), (0.68, 1.00),                       # 15/16 踝
 )
 
+#: 9 点无人机机体关键点在 0..1 单位方框里的位置，**顺序与 docs/KEYPOINTS.md §2 一致**：
+#:   0/1/2/3 = 左前/右前/左后/右后电机，4 = 机头，5/6/7/8 = 左前/右前/左后/右后机臂中点。
+#: 合成图把前 N 个点画出来（``--kpt-shape N,3``），用于非 9 点机型的回路自检。
+UAV_POSE_LAYOUT = (
+    (0.20, 0.20),   # 0 左前电机
+    (0.80, 0.20),   # 1 右前电机
+    (0.20, 0.80),   # 2 左后电机
+    (0.80, 0.80),   # 3 右后电机
+    (1.00, 0.50),   # 4 机头
+    (0.45, 0.30),   # 5 左前机臂中点
+    (0.55, 0.30),   # 6 右前机臂中点
+    (0.45, 0.70),   # 7 左后机臂中点
+    (0.55, 0.70),   # 8 右后机臂中点
+)
+#: 机体的连线（机身 + 机臂），只连存在的点。
+UAV_SKELETON = (
+    (5, 7), (6, 8),           # 前/后机臂（横梁）
+    (5, 0), (6, 1), (7, 2), (8, 3),   # 机臂到电机
+    (5, 6), (7, 8),           # 机身横梁
+    (4, 5), (4, 6),           # 机头到前侧
+    (4, 7), (4, 8),           # 机头到后侧（俯视视角的机身轮廓）
+)
+#: 每个布局对应的镜像配对（与 docs/KEYPOINTS.md 的 flip_idx 一致）。
+UAV_MIRROR = (1, 0, 3, 2, 4, 6, 5, 8, 7)
+PERSON_MIRROR = (0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15)
+
+#: 布局名 → (点位表, 连线, 镜像配对, 点名建议)
+LAYOUTS = {
+    "person": (COCO_POSE_LAYOUT, COCO_SKELETON, PERSON_MIRROR,
+               ["nose", "left_eye", "right_eye", "left_ear", "right_ear",
+                "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+                "left_wrist", "right_wrist", "left_hip", "right_hip",
+                "left_knee", "right_knee", "left_ankle", "right_ankle"]),
+    "uav": (UAV_POSE_LAYOUT, UAV_SKELETON, UAV_MIRROR,
+            ["rotor_front_left", "rotor_front_right", "rotor_rear_left",
+             "rotor_rear_right", "nose", "arm_front_left", "arm_front_right",
+             "arm_rear_left", "arm_rear_right"]),
+}
+
 
 def _draw_image(rng: random.Random, index: int):
     """返回 (PIL.Image, labels)，labels 为 ``[(cls, cx, cy, w, h), ...]``（归一化）。"""
@@ -95,13 +134,21 @@ def _draw_image(rng: random.Random, index: int):
     return img, labels
 
 
-def _draw_pose_image(rng: random.Random, index: int):
-    """姿态版：画火柴人 → ``(PIL.Image, [(cls, cx, cy, w, h, kpts)])``。
+def _draw_pose_image(rng: random.Random, index: int, layout: str = "person",
+                     n_kpt: int | None = None):
+    """姿态版：画火柴人 / 无人机 → ``(PIL.Image, [(cls, cx, cy, w, h, kpts)])``。
 
-    ``kpts`` 是归一化的 ``[(x, y, vis), ...]``（17 点，``vis=2`` 表示可见）。
+    ``kpts`` 是归一化的 ``[(x, y, vis), ...]``（取布局的前 ``n_kpt`` 个点，``vis=2``）。
     """
     import numpy as np
     from PIL import Image, ImageDraw, ImageFilter
+
+    points_table, skeleton, _mirror, _names = LAYOUTS[layout]
+    n_kpt = int(n_kpt or len(points_table))
+    if not 1 <= n_kpt <= len(points_table):
+        raise ValueError(f"layout={layout!r} 只支持 1..{len(points_table)} 个点，收到 {n_kpt}")
+    points_table = points_table[:n_kpt]
+    skeleton = [(a, b) for a, b in skeleton if a < n_kpt and b < n_kpt]
 
     arr = np.full((IMAGE_SIZE, IMAGE_SIZE, 3), 40, dtype=np.uint8)
     noise = np.random.default_rng(rng.randrange(1 << 30)).integers(0, 60, arr.shape)
@@ -112,25 +159,27 @@ def _draw_pose_image(rng: random.Random, index: int):
     labels: list[tuple] = []
 
     def add(cls: int, box: int) -> None:
-        """在随机位置放一个 ``box`` 像素高的人形；宽度按其 0.55 缩放（人比正方形高）。"""
-        w = max(6, int(box * 0.55))
-        h = box
+        """在随机位置放一个 ``box`` 像素的目标；宽度按布局的宽高比缩放。"""
+        xs = [p[0] for p in points_table]
+        ys = [p[1] for p in points_table]
+        w = max(6, int(box * max(max(xs) - min(xs), 0.3)))
+        h = max(6, int(box * max(max(ys) - min(ys), 0.3)))
         x0 = rng.randint(2, max(3, IMAGE_SIZE - w - 3))
         y0 = rng.randint(2, max(3, IMAGE_SIZE - h - 3))
         bright = 240 if cls == 0 else 200
-        points = [(x0 + px * w, y0 + py * h) for px, py in COCO_POSE_LAYOUT]
-        width = max(1, box // 14)                     # 细线，避免把 17 个点糊成一团
-        for a, b in COCO_SKELETON:
+        points = [(x0 + px * w, y0 + py * h) for px, py in points_table]
+        width = max(1, box // 14)                     # 细线，避免把点糊成一团
+        for a, b in skeleton:
             draw.line((points[a], points[b]), fill=(bright, bright, bright), width=width)
         radius = max(1, box // 10)
-        for px, py in points:                         # 关节点画成小圆，给关键点可辨识的落点
+        for px, py in points:                         # 关键点画成小圆，给可辨识的落点
             draw.ellipse((px - radius, py - radius, px + radius, py + radius),
                          fill=(bright, bright, bright))
-        kpts = [((px) / IMAGE_SIZE, (py) / IMAGE_SIZE, 2.0) for px, py in points]
+        kpts = [(px / IMAGE_SIZE, py / IMAGE_SIZE, 2.0) for px, py in points]
         labels.append((cls, (x0 + w / 2) / IMAGE_SIZE, (y0 + h / 2) / IMAGE_SIZE,
                        w / IMAGE_SIZE, h / IMAGE_SIZE, kpts))
 
-    for _ in range(rng.randint(2, 4)):          # 2–4 个小人（12–24 px）
+    for _ in range(rng.randint(2, 4)):          # 2–4 个小目标（12–24 px）
         add(0, rng.randint(12, 24))
     for _ in range(rng.randint(1, 2)):          # 1–2 个日常尺度（48–112 px）
         add(1, rng.randint(48, 112))
@@ -139,21 +188,59 @@ def _draw_pose_image(rng: random.Random, index: int):
     return img, labels
 
 
+def mirror_for(layout: str, n_kpt: int) -> list[int]:
+    """给出**前 n_kpt 个点**的合法镜像置换（``flip_idx``）。
+
+    为什么不能直接截断 ``UAV_MIRROR``：布局的镜像配对里，后段的点依赖前段存在
+    （机臂中点配对 5↔6、7↔8 是有界的，但人物的 8↔7 等分段截断后会指向越界索引）。
+    越界的 ``flip_idx`` 框架**不会报错**，只会把关键点配到错误的关节上 —— 典型的静默错误。
+    因此这里按"只保留两端都 < n_kpt 的配对，未配对的点自配对"重建：
+    这样无论截到几个点，输出的都是**合法对换置换**。
+    """
+    raw = list(LAYOUTS[layout][2])[:n_kpt]
+    mirror = list(range(n_kpt))
+    seen: set[int] = set()
+    for i, j in enumerate(raw):
+        if i in seen or j in seen or j >= n_kpt or j == i:
+            continue
+        if raw[j] != i:              # 只接受真正的对换
+            continue
+        mirror[i], mirror[j] = j, i
+        seen.add(i)
+        seen.add(j)
+    return mirror
+
+
 def build(out: Path, n_train: int, n_val: int, seed: int = 0, task: str = "detect",
-          kpt_shape: tuple[int, int] = (17, 3)) -> Path:
+          kpt_shape: tuple[int, int] = (17, 3), layout: str = "person") -> Path:
     """生成合成数据集，返回 dataset.yaml。
 
     Args:
-        task: ``"detect"``（实心方块 + 框）或 ``"pose"``（火柴人 + 框 + 17 关键点）。
-        kpt_shape: 姿态模式下的关键点形状（写进 dataset.yaml；必须是 ``[17, 3]``，
-            因为火柴人只画了 COCO 的 17 点）。
+        task: ``"detect"``（实心方块 + 框）或 ``"pose"``（骨架 + 框 + 关键点）。
+        kpt_shape: 姿态模式下的关键点形状，写进 dataset.yaml。
+        layout: 姿态模式的骨架布局：``"person"``（COCO 17 点人体，仅支持 17）
+            或 ``"uav"``（无人机机体，最多 9 点，顺序见 docs/KEYPOINTS.md）。
+            只画前 ``kpt_shape[0]`` 个点，因此可以造 4/5/6/9 点等不同机型的自检数据。
     """
     if task not in ("detect", "pose"):
         raise ValueError(f"task 只能是 detect / pose，收到 {task!r}")
-    if task == "pose" and tuple(kpt_shape) != (17, 3):
-        raise ValueError(
-            f"合成火柴人只提供 COCO 的 17 点 3 维标注，不支持 kpt_shape={kpt_shape}。"
-        )
+    if task == "pose":
+        if layout not in LAYOUTS:
+            raise ValueError(f"未知姿态布局 {layout!r}；可选 {sorted(LAYOUTS)}")
+        available = len(LAYOUTS[layout][0])
+        if layout == "person" and tuple(kpt_shape) != (17, 3):
+            raise ValueError(
+                f"合成火柴人只提供 COCO 的 17 点 3 维标注，不支持 kpt_shape={kpt_shape}。"
+                "要非 17 点请用 layout='uav'（顺序见 docs/KEYPOINTS.md）。"
+            )
+        if not 1 <= int(kpt_shape[0]) <= available:
+            raise ValueError(
+                f"layout={layout!r} 最多提供 {available} 个点，收到 kpt_shape={kpt_shape}。"
+            )
+        if int(kpt_shape[1]) != 3:
+            raise ValueError(
+                f"合成姿态数据只写 3 维关键点 (x, y, visibility)，收到 kpt_shape={kpt_shape}。"
+            )
 
     for split, count in (("train", n_train), ("val", n_val)):
         (out / "images" / split).mkdir(parents=True, exist_ok=True)
@@ -161,7 +248,8 @@ def build(out: Path, n_train: int, n_val: int, seed: int = 0, task: str = "detec
         rng = random.Random(seed + (0 if split == "train" else 10_000))
         for i in range(count):
             if task == "pose":
-                img, labels = _draw_pose_image(rng, i)
+                img, labels = _draw_pose_image(rng, i, layout=layout,
+                                               n_kpt=int(kpt_shape[0]))
             else:
                 img, labels = _draw_image(rng, i)
             stem = f"{split}_{i:04d}"
@@ -179,7 +267,7 @@ def build(out: Path, n_train: int, n_val: int, seed: int = 0, task: str = "detec
 
     header = (
         "# 由 tools/make_dummy_dataset.py 生成的合成数据集（训练回路自检用，勿用于任何结论）\n"
-        f"# 任务：{task}\n"
+        f"# 任务：{task}" + (f"｜骨架布局：{layout}\n" if task == "pose" else "\n")
     )
     body = (
         f"path: {out.resolve().as_posix()}\n"
@@ -187,18 +275,18 @@ def build(out: Path, n_train: int, n_val: int, seed: int = 0, task: str = "detec
         "val: images/val\n"
     )
     if task == "pose":
-        body += (f"kpt_shape: [{int(kpt_shape[0])}, {int(kpt_shape[1])}]\n"
-                 "# 关键点名称（COCO 17 点顺序；框架用它做可视化）\n"
-                 "kpt_names:\n"
-                 "  0: [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder,\n"
-                 "      right_shoulder, left_elbow, right_elbow, left_wrist, right_wrist,\n"
-                 "      left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle]\n"
-                 "  1: [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder,\n"
-                 "      right_shoulder, left_elbow, right_elbow, left_wrist, right_wrist,\n"
-                 "      left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle]\n")
-    names = ("  0: small-target\n  1: large-object\n" if task == "detect" else
-             "  0: tiny-person\n  1: person\n")
-    (out / "dataset.yaml").write_text(header + body + "names:\n" + names, encoding="utf-8")
+        n_kpt, n_dim = int(kpt_shape[0]), int(kpt_shape[1])
+        names = list(LAYOUTS[layout][3])[:n_kpt]
+        mirror = mirror_for(layout, n_kpt)
+        # flip_idx 必须显式给出，否则框架会**静默关掉** fliplr/flipud（见 docs/KEYPOINTS.md §3）
+        body += (f"kpt_shape: [{n_kpt}, {n_dim}]\n"
+                 f"flip_idx: [{', '.join(str(m) for m in mirror)}]\n")
+        for cls in (0, 1):
+            body += f"kpt_names:\n" if cls == 0 else ""
+            body += f"  {cls}: [{', '.join(names)}]\n"
+    names_yaml = ("  0: small-target\n  1: large-object\n" if task == "detect" else
+                  "  0: tiny-target\n  1: target\n")
+    (out / "dataset.yaml").write_text(header + body + "names:\n" + names_yaml, encoding="utf-8")
     return out / "dataset.yaml"
 
 
@@ -209,13 +297,28 @@ def main() -> int:
     ap.add_argument("--n-val", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--task", choices=("detect", "pose"), default="detect",
-                    help="pose 会额外画 17 个 COCO 关键点并写 kpt_shape")
+                    help="pose 会额外画关键点并写 kpt_shape / flip_idx / kpt_names")
+    ap.add_argument("--layout", choices=tuple(LAYOUTS), default="person",
+                    help="姿态骨架：person（COCO 17 点）或 uav（机体，最多 9 点）")
+    ap.add_argument("--kpt-shape", default=None, metavar="N,D",
+                    help="关键点形状，如 9,3（默认：person=17,3 / uav=9,3）")
     args = ap.parse_args()
 
-    path = build(args.out, args.n_train, args.n_val, args.seed, task=args.task)
-    print(f"[dummy] 任务={args.task} 图像 {args.n_train} 训练 / {args.n_val} 验证 → {args.out}")
+    kpt_shape = (17, 3) if args.layout == "person" else (9, 3)
+    if args.kpt_shape:
+        parts = [int(x) for x in args.kpt_shape.replace(" ", "").split(",")]
+        if len(parts) != 2:
+            raise SystemExit(f"--kpt-shape 需要 N,D 形式，收到 {args.kpt_shape!r}")
+        kpt_shape = (parts[0], parts[1])
+
+    path = build(args.out, args.n_train, args.n_val, args.seed, task=args.task,
+                 kpt_shape=kpt_shape, layout=args.layout)
+    print(f"[dummy] 任务={args.task} 布局={args.layout} kpt_shape={list(kpt_shape)} "
+          f"图像 {args.n_train} 训练 / {args.n_val} 验证 → {args.out}")
     print(f"[dummy] 数据集配置 → {path}")
     if args.task == "pose":
+        print("[下一步] python tools/check_pose_dataset.py --data "
+              f"{path}  # 校验 kpt_shape/flip_idx/标签一致性")
         print("[下一步] python tests/train_pose_smoke.py     # 姿态训练回路自检")
     else:
         print("[下一步] python tools/train.py --variant variants/SDD-YOLO26n/variant.yaml "

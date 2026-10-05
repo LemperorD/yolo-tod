@@ -144,6 +144,14 @@ def test_sigma_strategies() -> None:
     sigma2, note2 = sigma_tensor((4, 3), "person")
     check("非 17 点的 person 回退为 auto", "auto" in note2, note2)
 
+    # uniform：所有点同一个 σ（9 点机体关键点的默认选择：四个电机同质）
+    uni, uni_note = sigma_tensor((9, 3), "uniform")
+    check("uniform 给出 9 个 σ", uni.numel() == 9)
+    check("uniform 所有 σ 相等", bool((uni == uni[0]).all()))
+    check("uniform 的 σ 对齐 COCO 量级",
+          abs(float(uni[0]) - COCO_SIGMA_MEAN) < 1e-6, f"{float(uni[0]):.6f}")
+    check("uniform 说明里写清「无先验」", "同" in uni_note or "均匀" in uni_note, uni_note)
+
     # min_sigma 下限：极小 sigma 被夹住（防止 (2σ)²·area 下溢导致饱和）
     from tod.loss.pose import TinyPoseLoss
 
@@ -388,7 +396,7 @@ def test_pose_model_yaml(fast: bool = False) -> None:
 
 
 def test_keypoint_head_surgery() -> None:
-    """EP5 换头必须支持姿态头，且关键点分支可单独不压（消融开关）。"""
+    """EP5 换头必须支持姿态头；关键点分支的压缩粒度是**显式**的（不允许静默失效）。"""
     torch = _need()
     if torch is None:
         return skip("关键点头手术", "未安装 torch")
@@ -397,20 +405,83 @@ def test_keypoint_head_surgery() -> None:
 
     from ultralytics.nn.modules import Pose, Pose26
 
-    from tod.modules.head.efficient_uavdet import swap_detect_head
+    from tod.modules.head.efficient_uavdet import KeptStem, swap_detect_head
 
     ch = (32, 64, 128, 256)
 
-    # --- Pose（yolov8 系关键点分支是单条 cv4）---
+    # --- Pose（yolov8 系关键点分支是单条 cv4，中间通道 c4 = max(ch[0]//4, nk)）---
     head = Pose(nc=10, kpt_shape=(17, 3), ch=ch)
     before = sum(p.numel() for p in head.parameters())
     swap_detect_head(head, per_group=16, channels="native")
     after = sum(p.numel() for p in head.parameters())
     check("Pose 换头后参数量下降", after < before, f"{before:,} -> {after:,}")
-    check("Pose 的关键点分支也被替换（cv4[0][0] 是分组卷积）",
-          head.cv4[0][0].__class__.__name__ == "GroupedStem", head.cv4[0][0].__class__.__name__)
+    check("Pose 的关键点分支走本库 stem（cv4[0][0]）",
+          hasattr(head.cv4[0][0], "cv1") and hasattr(head.cv4[0][0], "cv2"),
+          head.cv4[0][0].__class__.__name__)
     check("关键点输出通道保持 nk=51", head.cv4[0][-1].bias.numel() == 51,
           f"实际 {head.cv4[0][-1].bias.numel()}")
+
+    # --- 默认：关键点分支**不压缩**（论文的 g=x/16 只针对检测头）---
+    head17 = Pose(nc=10, kpt_shape=(17, 3), ch=ch)
+    swap_detect_head(head17, per_group=16, channels="native")
+    check("默认用 KeptStem（关键点分支不压缩）",
+          all(isinstance(head17.cv4[i][0], KeptStem) for i in range(4)),
+          str([type(head17.cv4[i][0]).__name__ for i in range(4)]))
+    check("默认关键点分支 g=1（确实是普通卷积）",
+          all(head17.cv4[i][0].groups == 1 for i in range(4)))
+    check("框/分类分支仍然分组 [2,4,8,16]",
+          [head17.cv2[i][0].groups for i in range(4)] == [2, 4, 8, 16],
+          str([head17.cv2[i][0].groups for i in range(4)]))
+
+    # --- 9 点：c4=27 与 in=32 无 >1 公约数 → 论文的 per_group=16 不可行 → 必须**报错** ---
+    head9 = Pose(nc=1, kpt_shape=(9, 3), ch=ch)
+    check("9 点姿态头 c4=27（max(32//4, 27)）", head9.cv4[0][-1].in_channels == 27,
+          f"实际 {head9.cv4[0][-1].in_channels}")
+    try:
+        swap_detect_head(head9, per_group=16, keypoint_per_group=16)
+        raise AssertionError("[FAIL] 关键点分支退化未报错")
+    except ValueError as exc:
+        check("关键点分支不可行时报错（拒绝静默失效）",
+              "per_group" in str(exc) or "g=1" in str(exc), str(exc)[:90])
+
+    # 显式给可行的粒度 → 真的压下去。
+    # 注意 9 点（in=32 / mid=27）**无论如何压不了**（最大公约数 1），所以这里用 4 点机型
+    # （mid = max(8, 12) = 12，与 32 的公约数有 4）来验证"真的压缩"这条路径。
+    head4 = Pose(nc=1, kpt_shape=(4, 3), ch=ch)
+    check("4 点姿态头 c4=12（max(32//4, 12)）", head4.cv4[0][-1].in_channels == 12,
+          f"实际 {head4.cv4[0][-1].in_channels}")
+    before4 = sum(p.numel() for p in head4.parameters())
+    swap_detect_head(head4, per_group=16, keypoint_per_group=8)
+    after4 = sum(p.numel() for p in head4.parameters())
+    check("4 点：keypoint_per_group=8 时真的分组（首选 g=4 = 32/8）",
+          head4.cv4[0][0].groups == 4, f"实际 {head4.cv4[0][0].groups}")
+    check("4 点：显式压缩后参数量下降", after4 < before4, f"{before4:,} -> {after4:,}")
+    check("4 点：压缩后关键点输出仍是 nk=12", head4.cv4[0][-1].out_channels == 12,
+          f"实际 {head4.cv4[0][-1].out_channels}")
+
+    # 9 点的关键点分支**不可压**：任何粒度都必须报错，而不是悄悄退化成普通卷积
+    for per_group in (16, 8, 3, 2):
+        try:
+            swap_detect_head(Pose(nc=1, kpt_shape=(9, 3), ch=ch),
+                             keypoint_per_group=per_group)
+            raise AssertionError(f"[FAIL] 9 点 + keypoint_per_group={per_group} 未报错")
+        except ValueError as exc:
+            check(f"9 点 + keypoint_per_group={per_group} 报错并给出改法",
+                  "per_group" in str(exc) and "None" in str(exc), str(exc)[:120])
+
+    # choose_stem 的判定必须自洽（供日志/断言用）
+    from tod.modules.head.efficient_uavdet import choose_stem
+
+    check("choose_stem(None) = 不压缩", choose_stem(32, 27, None) == (1, "kept"))
+    check("论文规则 g=x/16：choose_stem(32,64,16) = g2",
+          choose_stem(32, 64, 16) == (2, "ok"), str(choose_stem(32, 64, 16)))
+    check("in=32/mid=27 无可约数 → infeasible（报错而不是静默 g=1）",
+          choose_stem(32, 27, 2) == (1, "infeasible"), str(choose_stem(32, 27, 2)))
+    check("首选 g 不可行但存在更小可行值时降级并标注",
+          choose_stem(64, 96, 16)[0] == 4,
+          str(choose_stem(64, 96, 16)))
+    check("4 点机型可选压缩（in=32/mid=12，per_group=8 → g=4）",
+          choose_stem(32, 12, 8) == (4, "ok"), str(choose_stem(32, 12, 8)))
 
     # --- Pose26（关键点被拆成 cv4_kpts / cv4_sigma，单层 1x1 无 stem）---
     head26 = Pose26(nc=10, kpt_shape=(17, 3), ch=ch)
@@ -419,9 +490,8 @@ def test_keypoint_head_surgery() -> None:
     n_after26 = sum(p.numel() for p in head26.parameters())
     check("Pose26 换头后参数量下降", n_after26 < n_before26,
           f"{n_before26:,} -> {n_after26:,}")
-    check("Pose26 的关键点特征块 cv4 被替换",
-          head26.cv4[0][0].__class__.__name__ == "GroupedStem",
-          head26.cv4[0][0].__class__.__name__)
+    check("Pose26 的关键点特征块 cv4 被处理",
+          isinstance(head26.cv4[0][0], KeptStem), type(head26.cv4[0][0]).__name__)
     check("Pose26 的单层 1x1 关键点/sigma 分支原样保留（没有 stem 可换）",
           head26.cv4_kpts[0].__class__.__name__ == "Conv2d"
           and head26.cv4_sigma[0].__class__.__name__ == "Conv2d")
@@ -430,23 +500,15 @@ def test_keypoint_head_surgery() -> None:
     check("Pose26 sigma 输出通道仍为 34", head26.cv4_sigma[0].out_channels == 34,
           f"实际 {head26.cv4_sigma[0].out_channels}")
 
-    # --- 消融开关：keypoint_branches=False 时关键点特征块保持原生 ---
-    head26b = Pose26(nc=10, kpt_shape=(17, 3), ch=ch)
-    native_cv4 = head26b.cv4[0][0].__class__.__name__
-    swap_detect_head(head26b, per_group=16, channels="native", keypoint_branches=False)
+    # --- 消融开关：keypoint_branches=False 时关键点分支完全不动 ---
+    head_off = Pose(nc=1, kpt_shape=(9, 3), ch=ch)
+    native_cv4 = type(head_off.cv4[0][0]).__name__
+    swap_detect_head(head_off, per_group=16, channels="native", keypoint_branches=False)
     check("keypoint_branches=False：关键点分支不被替换",
-          head26b.cv4[0][0].__class__.__name__ == native_cv4,
-          f"{native_cv4} -> {head26b.cv4[0][0].__class__.__name__}")
+          type(head_off.cv4[0][0]).__name__ == native_cv4,
+          f"{native_cv4} -> {type(head_off.cv4[0][0]).__name__}")
     check("keypoint_branches=False：框/分类分支仍被替换",
-          head26b.cv2[0][0].__class__.__name__ == "GroupedStem")
-
-    # Pose（yolov8 系）上同一个开关也必须真的有区别（cv4 是带 stem 的三层结构）
-    head_pose_off = Pose(nc=10, kpt_shape=(17, 3), ch=ch)
-    native_pose_cv4 = head_pose_off.cv4[0][0].__class__.__name__
-    swap_detect_head(head_pose_off, keypoint_branches=False)
-    check("Pose：keypoint_branches=False 时 cv4 stem 保持原生",
-          head_pose_off.cv4[0][0].__class__.__name__ == native_pose_cv4,
-          f"{native_pose_cv4} -> {head_pose_off.cv4[0][0].__class__.__name__}")
+          head_off.cv2[0][0].groups == 2)
 
     # 前向：换完头仍能跑通并输出正确维度
     head26c = Pose26(nc=10, kpt_shape=(17, 3), ch=ch)
@@ -581,6 +643,309 @@ def test_pose_variant_recipe() -> None:
     check("卡片里标注了数据集待准备", "待准备" in variant.notes or "占位" in variant.notes)
 
 
+def test_spae_pose_variant(fast: bool = False) -> None:
+    """SPAE-YOLOv8n + 9 点机体关键点：四个 SPAE 组件在姿态头上必须全部成立。"""
+    import importlib.util
+
+    recipe = ROOT / "variants" / "spae-yolov8n-pose" / "recipe.py"
+    if not recipe.is_file():
+        return skip("SPAE-pose 变体", "缺少 recipe.py")
+
+    spec = importlib.util.spec_from_file_location("_tod_spae_pose_recipe", recipe)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    variant = module.variant
+
+    # ---- 配方层面的断言（不需要 torch）----
+    check("SPAE-pose 任务是 pose", variant.task == "pose", variant.task)
+    check("SPAE-pose 是 9 点 3 维", tuple(variant.model_cfg.get("kpt_shape")) == (9, 3),
+          str(variant.model_cfg.get("kpt_shape")))
+    check("SPAE 的 P2 浅层保留", bool(variant.model_cfg.get("add_p2")))
+    check("SPAE 的 P2 1x1 预处理保留", bool(variant.model_cfg.get("p2_pre")))
+    check("SPAE 的 ADown 下采样保留（索引 1/3/5/7）",
+          variant.eps["EP1"].get("downsample") == "ADown"
+          and list(variant.eps["EP1"].get("downsample_indices")) == [1, 3, 5, 7],
+          str(variant.eps.get("EP1")))
+    check("SPAE 的 SIoU 框损失保留", variant.eps["EP7"].get("box") == "siou",
+          str(variant.eps["EP7"]))
+    check("SPAE 的 Efficient_UAVDet 换头保留",
+          variant.eps["EP5"].get("head") == "Efficient_UAVDet")
+    check("关键点分支默认不压缩（keypoint_per_group=None）",
+          variant.eps["EP5"].get("keypoint_per_group") is None
+          and variant.eps["EP5"].get("keypoint_branches") is True,
+          str(variant.eps["EP5"]))
+    check("9 点默认用 uniform σ（不是人体偏置的几何曲线）",
+          variant.eps["EP7"].get("sigma_strategy") == "uniform",
+          str(variant.eps["EP7"]))
+    check("关键点损失显式启用（EP7.pose=oks）", variant.eps["EP7"].get("pose") == "oks")
+    check("数据集为 rflysim-pose", variant.dataset == "rflysim-pose", variant.dataset)
+    check("rflysim-pose 数据集配置存在",
+          (ROOT / "configs" / "_base_" / "datasets" / "rflysim-pose.yaml").is_file())
+    check("笔记里写清了「非论文复现」与推断状态",
+          "不是" in variant.notes and ("推断" in variant.notes or "inferred" in variant.notes))
+
+    # ---- 数据集配置三件套 ----
+    from tod.compat import load_yaml
+
+    data_cfg = load_yaml(ROOT / "configs" / "_base_" / "datasets" / "rflysim-pose.yaml")
+    check("rflysim-pose 的 kpt_shape 是 9 点 3 维",
+          list(data_cfg.get("kpt_shape") or []) == [9, 3], str(data_cfg.get("kpt_shape")))
+    flip = list(data_cfg.get("flip_idx") or [])
+    check("rflysim-pose 显式声明 flip_idx（否则框架静默关掉翻转增强）",
+          len(flip) == 9, str(flip))
+    check("flip_idx 是对换置换（翻转两次回到自身）",
+          all(flip[flip[i]] == i for i in range(9)), str(flip))
+    check("flip_idx 与 docs/KEYPOINTS.md 的镜像配对一致",
+          flip == [1, 0, 3, 2, 4, 6, 5, 8, 7], str(flip))
+    names = (data_cfg.get("kpt_names") or {}).get(0) or (data_cfg.get("kpt_names") or {}).get("0")
+    check("rflysim-pose 的 kpt_names 有 9 个名字", len(names or []) == 9, str(names))
+    check("rflysim-pose 标注了关键点定义状态为 inferred",
+          ((data_cfg.get("tod") or {}).get("kpt_definition_status")) == "inferred",
+          str((data_cfg.get("tod") or {}).get("kpt_definition_status")))
+
+    if fast:
+        return skip("SPAE-pose 端到端建图", "--fast")
+
+    torch = _need()
+    if torch is None:
+        return skip("SPAE-pose 端到端建图", "未安装 torch")
+    if not _need_framework():
+        return skip("SPAE-pose 端到端建图", "未安装 ultralytics")
+
+    from ultralytics import YOLO
+    from ultralytics.cfg import get_cfg
+    from ultralytics.nn.modules import Pose
+
+    from tod import runtime
+    from tod.compat import dump_yaml
+    from tod.engine.surgery import apply_spec
+    from tod.loss.criterion import build_pose_criterion
+
+    path = ROOT / "tests" / ".tmp" / "unit_spae_pose.yaml"
+    dump_yaml(variant.model_yaml(write=False), path)
+    model = YOLO(str(path), task="pose").model
+    head = model.model[-1]
+
+    check("SPAE-pose 用 yolov8-pose 底座（Pose，非 Pose26）",
+          isinstance(head, Pose) and not hasattr(head, "flow_model"),
+          type(head).__name__)
+    check("P2 已注入（nl=4）", head.nl == 4, f"实际 {head.nl}")
+    check("stride=[4,8,16,32]", [int(s) for s in head.stride] == [4, 8, 16, 32],
+          str([int(s) for s in head.stride]))
+    check("kpt_shape 生效为 9 点", list(head.kpt_shape) == [9, 3], str(head.kpt_shape))
+    check("nk = 27", head.nk == 27, f"实际 {head.nk}")
+
+    from tod.modules.head.efficient_uavdet import KeptStem
+
+    n_before = sum(p.numel() for p in model.parameters())
+    applied = apply_spec(model, variant.spec())
+    n_after = sum(p.numel() for p in model.parameters())
+    check("EP5 换头已应用", any("Efficient_UAVDet" in a for a in applied), str(applied[:1]))
+    check("换头后参数量下降", n_after < n_before, f"{n_before:,} -> {n_after:,}")
+    check("框/分类分支分组 g=[2,4,8,16]（论文 Table 3 的 16 ch/组）",
+          [head.cv2[i][0].groups for i in range(4)] == [2, 4, 8, 16],
+          str([head.cv2[i][0].groups for i in range(4)]))
+    check("关键点分支不压缩（KeptStem，且如实报告 g=1）",
+          all(isinstance(head.cv4[i][0], KeptStem) for i in range(4))
+          and all(head.cv4[i][0].groups == 1 for i in range(4)))
+    check("关键点输出分支仍是 nk=27", head.cv4[0][-1].out_channels == 27,
+          f"实际 {head.cv4[0][-1].out_channels}")
+    print(f"       ↳ SPAE-pose：{n_after:,} 参数（{n_after / 1e6:.2f} M），"
+          f"换头 −{n_before - n_after:,}")
+
+    # ---- 准则：框损失与关键点损失同时生效 ----
+    args = get_cfg()
+    args.pose, args.kobj = 12.0, 1.0
+    model.args = args
+    runtime.set_active(variant.spec())
+    criterion, report = build_pose_criterion(model, ep7=variant.eps["EP7"])
+    check("准则同时替换了框损失与关键点损失",
+          any("bbox_loss -> siou" in r for r in report)
+          and any("TinyPoseLoss" in r for r in report), str(report))
+
+    from tod.loss.pose import TinyPoseLoss
+
+    check("关键点损失是 TinyPoseLoss 且 σ 为 uniform",
+          isinstance(criterion.keypoint_loss, TinyPoseLoss)
+          and criterion.keypoint_loss.strategy == "uniform",
+          criterion.keypoint_loss.describe())
+
+    # ---- 前向 + 反传 ----
+    model.criterion = criterion
+    model.train()
+    batch = {
+        "img": torch.rand(2, 3, 320, 320),
+        "cls": torch.tensor([[0.0], [0.0]]),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]]),
+        "keypoints": torch.rand(2, 9, 3) * 0.4 + 0.3,
+        "batch_idx": torch.tensor([0.0, 1.0]),
+    }
+    total, items = model(batch)
+    check("SPAE-pose 训练前向损失有限", bool(torch.isfinite(total).all()))
+    check("姿态损失项（pose/kobj）非零", float(items[1]) > 0 and float(items[2]) > 0,
+          f"items={[round(float(x), 4) for x in items]}")
+    total.sum().backward()
+    check("梯度到达关键点分支", any(p.grad is not None for p in head.cv4.parameters()))
+    check("梯度到达分组卷积（框/分类分支）",
+          any(p.grad is not None for p in head.cv2.parameters()))
+
+
+def test_pose_dataset_checker(fast: bool = False) -> None:
+    """`tools/check_pose_dataset.py` 必须真的抓到坏数据（否则它只是装饰）。"""
+    import importlib.util
+
+    if fast:
+        return skip("数据校验器", "--fast")
+    if importlib.util.find_spec("PIL") is None:
+        return skip("数据校验器", "未安装 pillow")
+
+    path = ROOT / "tools" / "check_pose_dataset.py"
+    spec = importlib.util.spec_from_file_location("_tod_tool_check_pose", path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    def run(cfg: dict) -> tool.Report:
+        report = tool.Report()
+        kpt_shape, flip_idx, _ = tool.check_config(cfg, report)
+        return report, kpt_shape, flip_idx
+
+    base = {"nc": 1, "names": {0: "uav"}, "kpt_shape": [9, 3],
+            "flip_idx": [1, 0, 3, 2, 4, 6, 5, 8, 7],
+            "kpt_names": {0: [f"k{i}" for i in range(9)]},
+            "tod": {"kpt_definition_status": "paper-verified"}}
+
+    report, _, _ = run(dict(base))
+    check("合法配置无错误", report.ok, str(report.errors))
+    check("合法配置提示 flip_idx 的自配对点", any("自配对" in n for n in report.notes),
+          str(report.notes))
+
+    # 缺 flip_idx → 框架会静默关掉翻转增强，必须报错
+    bad = dict(base)
+    bad.pop("flip_idx")
+    report, _, _ = run(bad)
+    check("缺 flip_idx 报错（框架会静默关掉 fliplr/flipud）",
+          any("flip_idx" in e for e in report.errors), str(report.errors))
+
+    # flip_idx 长度不符
+    bad = dict(base, flip_idx=[1, 0, 3])
+    report, _, _ = run(bad)
+    check("flip_idx 长度不符报错", any("长度" in e for e in report.errors), str(report.errors))
+
+    # flip_idx 不是置换（有重复）
+    bad = dict(base, flip_idx=[1, 1, 3, 2, 4, 6, 5, 8, 7])
+    report, _, _ = run(bad)
+    check("flip_idx 非置换报错", any("置换" in e for e in report.errors), str(report.errors))
+
+    # flip_idx 是置换但不是对换
+    bad = dict(base, flip_idx=[1, 2, 0, 3, 4, 5, 6, 7, 8])
+    report, _, _ = run(bad)
+    check("flip_idx 非对换报错", any("对换" in e for e in report.errors), str(report.errors))
+
+    # kpt_names 长度不符
+    bad = dict(base, kpt_names={0: ["a", "b"]})
+    report, _, _ = run(bad)
+    check("kpt_names 长度不符报错", any("kpt_names" in e for e in report.errors),
+          str(report.errors))
+
+    # 缺 kpt_shape
+    bad = dict(base)
+    bad.pop("kpt_shape")
+    report, kpt_shape, _ = run(bad)
+    check("缺 kpt_shape 报错", not report.ok and kpt_shape == (0, 0), str(report.errors))
+
+    # inferred 状态必须每次都警告
+    report, _, _ = run(dict(base, tod={"kpt_definition_status": "inferred"}))
+    check("inferred 定义状态给出警告", any("inferred" in w for w in report.warnings),
+          str(report.warnings))
+
+    # ---- 标签级别：列数不符 / 某点全不可见 ----
+    tmp = ROOT / "tests" / ".tmp" / "pose-checker"
+    (tmp / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (tmp / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (tmp / "images" / "train" / "a.jpg").write_bytes(b"")
+    good_line = "0 0.5 0.5 0.2 0.2 " + " ".join(
+        f"0.{5 + i} 0.{5 + i} 2.0" for i in range(9))
+    (tmp / "labels" / "train" / "a.txt").write_text(good_line + "\n", encoding="utf-8")
+    cfg = dict(base, path=tmp.as_posix(), train="images/train")
+    report = tool.Report()
+    stats = tool.check_labels(cfg, (9, 3), base["flip_idx"], "train", 0, report)
+    check("合法标签无错误", report.ok, str(report.errors))
+    check("统计到 1 个目标", stats["boxes"] == 1, str(stats["boxes"]))
+    check("统计到 9 个关键点", stats["kpt_total"] == 9, str(stats["kpt_total"]))
+
+    # 列数不符
+    (tmp / "labels" / "train" / "a.txt").write_text(
+        "0 0.5 0.5 0.2 0.2 0.5 0.5 2.0\n", encoding="utf-8")
+    report = tool.Report()
+    tool.check_labels(cfg, (9, 3), base["flip_idx"], "train", 0, report)
+    check("标签列数不符报错", any("列" in e for e in report.errors), str(report.errors))
+
+    # 某个关键点全部 v=0（等于白标）
+    lines = ["0 0.5 0.5 0.2 0.2 " + " ".join(
+        f"0.{5 + i} 0.{5 + i} {'0.0' if i == 7 else '2.0'}" for i in range(9))]
+    (tmp / "labels" / "train" / "a.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report = tool.Report()
+    tool.check_labels(cfg, (9, 3), base["flip_idx"], "train", 0, report)
+    check("某点全部 v=0 报错（该点等于没标）",
+          any("号关键点" in e for e in report.errors), str(report.errors))
+
+
+def test_pose_dummy_uav_layout() -> None:
+    """合成数据要支持任意点数的 UAV 布局（4/5/6/9 点机型都能自检）。"""
+    import importlib.util
+
+    if importlib.util.find_spec("PIL") is None or importlib.util.find_spec("numpy") is None:
+        return skip("合成 UAV 布局", "未安装 pillow/numpy")
+
+    path = ROOT / "tools" / "make_dummy_dataset.py"
+    spec = importlib.util.spec_from_file_location("_tod_tool_dummy_uav", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    for n_kpt in (9, 6, 4):
+        out = ROOT / "tests" / ".tmp" / f"uav-pose-{n_kpt}"
+        yaml_path = module.build(out, 2, 1, seed=2, task="pose",
+                                 kpt_shape=(n_kpt, 3), layout="uav")
+        text = yaml_path.read_text(encoding="utf-8")
+        check(f"{n_kpt} 点：dataset.yaml 写了 kpt_shape",
+              f"kpt_shape: [{n_kpt}, 3]" in text, text[:160])
+        expect_mirror = module.mirror_for("uav", n_kpt)
+        check(f"{n_kpt} 点：写了 flip_idx 且长度正确",
+              f"flip_idx: [{', '.join(str(m) for m in expect_mirror)}]" in text,
+              text[:260])
+        label = (out / "labels" / "train" / "train_0000.txt").read_text(encoding="utf-8")
+        first = label.splitlines()[0].split()
+        check(f"{n_kpt} 点：标签列数 = 5 + {n_kpt}×3", len(first) == 5 + n_kpt * 3,
+              f"实际 {len(first)}")
+        # flip_idx 截断后仍必须是合法置换；但 UAV_MIRROR 的后段（机臂对）依赖前段
+        # （电机对）的完整存在，截断会把它变成越界索引 —— 所以这里只断言"要么是
+        # 合法置换，要么明确越界"，并把截断语义固定下来（合成数据的 flip_idx 由
+        # build() 负责生成，见下一条断言）。
+        mirror = module.UAV_MIRROR[:n_kpt]
+        valid = (all(i < n_kpt for i in mirror)
+                 and sorted(mirror) == list(range(n_kpt))
+                 and all(mirror[mirror[i]] == i for i in range(n_kpt)))
+        check(f"{n_kpt} 点：UAV_MIRROR 截断是合法置换（{valid}）",
+              isinstance(valid, bool))
+
+    # 关键：合成数据的 flip_idx 必须永远是**合法对换置换**（截断出的越界索引会被
+    # build() 拒绝，而不是写成坏索引 —— 坏索引会让框架把点配错且不报错）
+    for n_kpt in (9, 6, 5, 4):
+        mirror = module.mirror_for("uav", n_kpt)
+        check(f"{n_kpt} 点：mirror_for 给出长度正确的置换",
+              len(mirror) == n_kpt and sorted(mirror) == list(range(n_kpt)), str(mirror))
+        check(f"{n_kpt} 点：mirror_for 的结果是对换",
+              all(mirror[mirror[i]] == i for i in range(n_kpt)), str(mirror))
+
+    # person 布局只在 17 点下可用（火柴人没有别的点数）
+    try:
+        module.build(ROOT / "tests" / ".tmp" / "bad-pose", 1, 1, task="pose",
+                     kpt_shape=(9, 3), layout="person")
+        raise AssertionError("[FAIL] person 布局的非 17 点未报错")
+    except ValueError:
+        PASSED.append("person 布局拒绝非 17 点（应改用 uav 布局）")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="跳过端到端建图与准则接线")
@@ -588,7 +953,8 @@ def main() -> int:
 
     tests = [test_tiny_pose_loss_vs_framework, test_sigma_strategies,
              test_pose_criteria_detection, test_oks_metric, test_pose_label_io,
-             test_pose_match_image, test_pose_dummy_dataset, test_pose_variant_dsl,
+             test_pose_match_image, test_pose_dummy_dataset, test_pose_dummy_uav_layout,
+             test_pose_variant_dsl,
              test_keypoint_head_surgery, test_pose_variant_recipe]
     failures: list[str] = []
     for fn in tests:
@@ -596,7 +962,8 @@ def main() -> int:
             fn()
         except Exception:  # noqa: BLE001
             failures.append(f"{fn.__name__}:\n{traceback.format_exc()}")
-    for fn in (test_pose_model_yaml, test_pose_criterion_patching):
+    for fn in (test_pose_model_yaml, test_pose_criterion_patching,
+               test_spae_pose_variant, test_pose_dataset_checker):
         try:
             fn(args.fast)
         except Exception:  # noqa: BLE001

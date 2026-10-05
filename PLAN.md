@@ -418,6 +418,7 @@ ultralytics 内部 API 变动频繁（`parse_model`、`DetectionModel`、`v8Dete
 | 名称 | 赛道 | 核心卖点 | 收录方式 |
 |---|---|---|---|
 | **SPAE-YOLOv8** ([Sensors 2026](https://doi.org/10.3390/s26113424)) ✅ **已实现** | 空对空微小型无人机 | SIoU + P2 浅层 + ADown + Efficient_UAVDet；PARAMS −30%、FPS +28%，但精度主贡献来自 P2（+7.5pp），换头本身 −0.4pp | 全模块化（EP1/EP5/EP7 + P2 注入） |
+| **spae-yolov8n-pose** ✅ **已实现（数据集待录制）** | 空对空微小型无人机 + **9 点机体关键点** | SPAE 四组件全保留 + YOLO 姿态头 + OKS 损失；用于 RflySim 仿真数据。**新组合，非论文复现**：关键点任务设定借自 *Keypoint-Guided Efficient Pose Estimation and Domain Adaptation for MAVs*（[T-RO 2024](https://doi.org/10.1109/TRO.2024.3400938)，作者仓库 [WindyLab/MAV6D](https://github.com/WindyLab/MAV6D)），但网络/损失/域适应均未采用；**9 点顺序为推断**，定义见 `docs/KEYPOINTS.md` | 变体 + EP5 关键点分支 + EP7 OKS 损失；数据集接口见 `configs/_base_/datasets/rflysim-pose.yaml` |
 | **visdrone-yolo26n-pose-p2-p16** ⚠️ **已实现（数据集待标注）** | 航拍行人**关键点** | P2 关键点头 + TinyPoseLoss（EP7）+ OKS 分层评测（EP8）；本库自研，**非论文复现** | 变体 + EP7/EP8 新模块；数据集接口占位见 `configs/_base_/datasets/visdrone2019-pose.yaml` |
 | **TPH-YOLOv5 / TPH-YOLOv5++** | 航拍 VisDrone | Transformer 预测头 + 额外小目标头 + 复制粘贴增强 | 建议整仓 submodule + 适配器 |
 | **CEASC** ([CVPR 2023](https://openaccess.thecvf.com//content/CVPR2023/html/Du_Adaptive_Sparse_Convolutional_Networks_With_Global_Context_Enhancement_for_Faster_CVPR_2023_paper.html)) | 航拍 | 自适应稀疏卷积 + 全局上下文增强，加速密集小目标推理 | 模块化（EP1/EP4） |
@@ -594,7 +595,7 @@ planned → reproducing → reproduced → (promoted | dropped)
 ## 12. 落地进展
 
 ### M0 架构层（已完成，`python tests/smoke.py` 77 项 + `python tests/test_modules.py` 105 项
-+ `python tests/test_pose.py` 99 项检查全绿）
++ `python tests/test_pose.py` 195 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
@@ -612,8 +613,8 @@ planned → reproducing → reproduced → (promoted | dropped)
 | `src/tod/modules/head/efficient_uavdet.py` | **Efficient_UAVDet** 轻量检测头，两组通道策略（EP5） | ✅ |
 | `tests/smoke.py` | 无 torch 依赖的架构冒烟测试（**77 项**） | ✅ |
 | `tests/test_modules.py` | 形状 / 数值 / 换头 / 蒸馏 / 优化器 / 评测 / 端到端建图测试（需 torch，**105 项**） | ✅ |
-| `tests/test_pose.py` | 姿态模块测试（**104 项**）：OKS 损失与框架逐元素对照、σ 策略、OKS 指标与尺度敏感性、标签读写、合成关键点数据、DSL/建图/换头手术/双分支准则 | ✅ |
-| `tests/train_pose_smoke.py` | 姿态训练回路自检（合成关键点数据真训练，**21 项**） | ✅ |
+| `tests/test_pose.py` | 姿态模块测试（**195 项**）：OKS 损失与框架逐元素对照、σ 策略（含 uniform）、OKS 指标与尺度敏感性、标签读写、合成关键点数据（含 4/5/6/9 点 UAV 布局）、数据校验器、DSL/建图/换头手术/双分支准则/SPAE-pose 端到端 | ✅ |
+| `tests/train_pose_smoke.py` | 姿态训练回路自检（合成关键点数据真训练，**23 项**；`--layout person|uav` 覆盖 17 点与 9 点两种机型） | ✅ |
 | `src/tod/eval/scales.py` + `tools/val.py` | 尺度分层评测（整体 AP + `AP_small`/`AP_tiny`，COCO 式 AP 与 ignore 语义） | ✅ |
 | `tools/ablation.py` | 消融流水线（leave-one-out、逐字段 diff、假消融识别、汇总 csv/md） | ✅ |
 | `tools/make_dummy_dataset.py` + `tests/train_smoke.py` | 合成数据集 + 训练回路自检（真训练/验证/EMA/存载权重/推理） | ✅ |
@@ -625,6 +626,9 @@ planned → reproducing → reproduced → (promoted | dropped)
 | `src/tod/engine/pose_trainer.py` | 姿态训练器（EP9）：继承检测侧全部接线，改用 PoseModel + 姿态准则（O2M/O2O 双分支） | ✅ |
 | `tools/val_pose.py` + `make_dummy_dataset.py --task pose` | 姿态评测入口 + 合成关键点数据（火柴人 + COCO 17 点） | ✅ |
 | `variants/visdrone-yolo26n-pose-p2-p16/` | 变体 3：姿态关键点（**数据集标注待准备**，卡片精度栏留空） | ✅ |
+| `variants/spae-yolov8n-pose/` | 变体 4：**SPAE + 9 点机体关键点**（面向 RflySim 仿真数据；数据待录制） | ✅ |
+| `docs/KEYPOINTS.md` | 9 点机体关键点定义（唯一编号来源；含 `flip_idx` 配对表与**推断状态**） | ✅ |
+| `tools/check_pose_dataset.py` | 关键点数据开训前校验（kpt_shape / flip_idx / 列数 / 可见率 / 图文配对），有错即 exit 1 | ✅ |
 
 **已验证的关键逻辑**（对官方 yolov8 同构图做单元验证）：
 

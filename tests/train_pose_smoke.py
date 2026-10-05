@@ -57,8 +57,15 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--device", default="0")
     ap.add_argument("--variant", type=Path,
-                    default=ROOT / "variants" / "visdrone-yolo26n-pose-p2-p16" / "variant.yaml")
+                    default=ROOT / "variants" / "spae-yolov8n-pose" / "variant.yaml",
+                    help="姿态变体 spec；默认 SPAE+9 点机体（可用 --variant 换成"
+                         "visdrone-yolo26n-pose-p2-p16 验 17 点人体）")
     ap.add_argument("--work", type=Path, default=ROOT / "tests" / ".tmp" / "train-pose-smoke")
+    ap.add_argument("--layout", choices=("auto", "person", "uav"), default="auto",
+                    help="合成骨架布局；auto = 按变体的 kpt_shape 自动选"
+                         "（17 点→person，其它→uav）")
+    ap.add_argument("--kpt-shape", default=None, metavar="N,D",
+                    help="合成数据的关键点形状（默认取变体 model.kpt_shape）")
     ap.add_argument("--keep", action="store_true", help="保留实验输出目录")
     ap.add_argument("--allow-threaded-cache", action="store_true",
                     help="保留框架默认的并行标签缓存（受限沙箱下会 WinError 5）")
@@ -82,16 +89,35 @@ def main() -> int:
     if not args.allow_threaded_cache and compat.allow_threadless_label_cache():
         print("[env ] 标签缓存已切换为顺序模式（沙箱兼容；--allow-threaded-cache 可关闭）")
 
-    # ---- 1) 合成关键点数据集（火柴人 + COCO 17 点）----
+    # ---- 1) 合成关键点数据集 ----
+    # 关键点形状取**变体自己声明的** kpt_shape：这样同一个自检既能验 17 点人体
+    # （SSD/VisDrone-pose），也能验 9 点机体（SPAE + RflySim），不会出现
+    # "配置写 9 点、合成数据却是 17 点"这种自欺欺人的自检。
+    spec = load_yaml(args.variant)
+    declared = list((spec.get("model") or {}).get("kpt_shape") or (17, 3))
+    if args.kpt_shape:
+        declared = [int(x) for x in args.kpt_shape.replace(" ", "").split(",")]
+    kpt_shape = (int(declared[0]), int(declared[1]))
+    layout = args.layout
+    if layout == "auto":
+        layout = "person" if kpt_shape == (17, 3) else "uav"
+
     data_yaml = _load_tool("make_dummy_dataset").build(
-        args.work / "data", 12, 4, seed=0, task="pose")
+        args.work / "data", 12, 4, seed=0, task="pose",
+        kpt_shape=kpt_shape, layout=layout)
     check("合成姿态数据集配置已生成", data_yaml.is_file())
     cfg = load_yaml(data_yaml)
-    check("数据集声明 kpt_shape=[17,3]", list(cfg.get("kpt_shape") or []) == [17, 3],
+    check(f"合成数据声明 kpt_shape={list(kpt_shape)}",
+          list(cfg.get("kpt_shape") or []) == list(kpt_shape),
           f"实际 {cfg.get('kpt_shape')}")
+    check("合成数据含 flip_idx（否则框架会静默关掉翻转增强）",
+          len(cfg.get("flip_idx") or []) == kpt_shape[0],
+          f"实际 {cfg.get('flip_idx')}")
+    check("变体声明的 kpt_shape 与合成数据一致",
+          list((spec.get("model") or {}).get("kpt_shape") or []) == list(kpt_shape),
+          f"变体 {(spec.get('model') or {}).get('kpt_shape')} vs 自检 {list(kpt_shape)}")
 
     # ---- 2) 真训练（姿态回路）----
-    spec = load_yaml(args.variant)
     variant = Variant.from_spec(spec)
     check("变体声明的任务为 pose", variant.task == "pose", f"实际 {variant.task!r}")
     model_yaml = args.work / "model.yaml"
@@ -142,7 +168,7 @@ def main() -> int:
           all(abs(float(r[pose_col])) < 1e4 and float(r[pose_col]) > 0 for r in rows),
           f"实际 {[r[pose_col] for r in rows]}")
 
-    # ---- 4) 断点能被新进程载入并输出 17×3 关键点 ----
+    # ---- 4) 断点能被新进程载入并输出 (n_kpt, 3) 关键点 ----
     reloaded = YOLO(str(best))           # 任务由 checkpoint 里的 model.task 决定
     check("best.pt 可被重新载入", reloaded.model is not None)
     images = sorted((args.work / "data" / "images" / "val").glob("*.jpg"))
@@ -153,7 +179,8 @@ def main() -> int:
     check("推理结果带关键点对象", kpts is not None)
     if kpts is not None and len(kpts):
         shape = tuple(kpts.data.shape)
-        check("关键点张量形状为 (n, 17, 3)", shape[1:] == (17, 3), f"实际 {shape}")
+        check(f"关键点张量形状为 (n, {kpt_shape[0]}, 3)",
+              shape[1:] == (kpt_shape[0], 3), f"实际 {shape}")
         print(f"       ↳ 推理结果：{len(results[0].boxes)} 个框，"
               f"关键点 {shape}，图像 {Path(images[0]).name}")
     else:
@@ -169,7 +196,7 @@ def main() -> int:
     def perfect(image: Path):
         with Image.open(image) as im:
             w, h = im.size
-        boxes, classes, kpts = load_pose_labels(image, w, h, (17, 3))
+        boxes, classes, kpts = load_pose_labels(image, w, h, kpt_shape)
         return [(classes[i], 0.9, boxes[4 * i:4 * i + 4],
                  [[k[0], k[1]] for k in kpts[i]]) for i in range(len(classes))]
 

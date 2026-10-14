@@ -1,13 +1,13 @@
 """MAV6D 工具链测试：解析 / 位姿 / 去畸变 / 划分 / 转换 / 端到端（数据可选）。
 
 依赖：torch + numpy（+ scipy、cv2 用于部分断言；缺失时自动跳过对应项）。
-**默认不需要 `D:/MAV6D`**：核心解析与几何断言全部用合成样本；
+**默认不需要 `/path/to/MAV6D`**：核心解析与几何断言全部用合成样本；
 只有 ``--mav6d`` 存在时才额外跑真实数据的端到端。
 
 运行::
 
-    python tests/test_mav6d.py
-    python tests/test_mav6d.py --mav6d D:/MAV6D --model phantom4 --max-frames 60
+    python3 tests/test_mav6d.py
+    python3 tests/test_mav6d.py --mav6d /path/to/MAV6D --model phantom4 --max-frames 60
 """
 
 from __future__ import annotations
@@ -22,6 +22,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 PASSED: list[str] = []
 SKIPPED: list[str] = []
@@ -373,9 +381,26 @@ def test_real_data(mav6d: Path, model: str, max_frames: int) -> None:
     shutil.rmtree(out, ignore_errors=True)
 
 
+def _default_mav6d_root() -> Path:
+    """真实数据根目录：环境变量 MAV6D_ROOT > 常见的 D:/MAV6D > data/MAV6D。
+
+    不写死 ``/path/to/MAV6D``：在 Linux 上 ``Path("D:/MAV6D")`` 会被当成当前目录下名叫
+    ``D:`` 的相对路径，默认值永远不可能命中。
+    """
+    import os
+
+    env = os.environ.get("MAV6D_ROOT")
+    if env:
+        return Path(env)
+    win = Path("D:/MAV6D")
+    if win.is_dir():
+        return win
+    return ROOT / "data" / "MAV6D"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mav6d", type=Path, default=Path("D:/MAV6D"),
+    ap.add_argument("--mav6d", type=Path, default=_default_mav6d_root(),
                     help="真实数据根目录（不存在则跳过相关项）")
     ap.add_argument("--model", choices=("phantom4", "mavic2"), default="phantom4")
     ap.add_argument("--max-frames", type=int, default=120)

@@ -1,0 +1,94 @@
+# RflySim-Pose —— 仿真录制的微小型无人机 9 点机体关键点
+#
+# 数据来源：RflySim（https://rflysim.com）录制的图像 + 关键点标注。
+# 关键点定义：见 docs/KEYPOINTS.md（**唯一**编号来源）。
+# 方法参考：Zheng et al., "Keypoint-Guided Efficient Pose Estimation and Domain
+#           Adaptation for Micro Aerial Vehicles", IEEE T-RO 40 (2024) 2967-2983,
+#           DOI 10.1109/TRO.2024.3400938；作者仓库 WindyLab/MAV6D（MIT）。
+#
+# ⚠️ 本文件里的 kpt_names / flip_idx 顺序为 **INFERRED（本库推断）**：
+#    论文在付费墙后，作者仓库只有 README，无法核对那 9 个点的确切语义与顺序。
+#    校正方式：改下面的 kpt_names 与 flip_idx 两处即可（不用动代码）；
+#    改完请跑 `python tools/check_pose_dataset.py` 校验一致性，并把
+#    tod.kpt_definition_status 改成 "paper-verified"。
+#
+# 目录约定（YOLO-pose 格式，与 ultralytics 一致）：
+#   <path>/images/{train,val}/*.jpg
+#   <path>/labels/{train,val}/*.txt
+#     每行： cls cx cy w h  x1 y1 v1  x2 y2 v2 ... x9 y9 v9
+#       · cx/cy/w/h 与关键点坐标都是**归一化**到 [0,1] 的；
+#       · v = 0 未标注 / 1 存在但不可见（遮挡） / 2 可见；
+#       · **越界点写 v=0，不要裁剪到边界**（框架的掩码规则是 `v != 0`）。
+#   （RflySim 若直接导出 2D 像素点，除以图像宽高即可；详见 docs/KEYPOINTS.md §5）
+
+path: ./data/rflysim-pose
+train: images/train
+val: images/val
+# test: images/test          # 有测试划分时取消注释
+
+# 类别数：单一机型 = 1。若同时训练多种机型，改成对应数量并在 kpt_names 里逐类给名字
+# （注意：不同机型的点数不同时**不能**混在一个 kpt_shape 里，必须拆成多个数据集）。
+nc: 1
+names:
+  0: uav
+
+# ---- 姿态三件套（缺 flip_idx 会被框架静默关掉翻转增强，见 docs/KEYPOINTS.md §3）----
+kpt_shape: [9, 3]      # 9 个机体关键点，每点 (x, y, visibility)
+# 翻转时的索引置换：翻转后第 i 号点 = 原来的第 flip_idx[i] 号点。
+# 必须是一个**对换置换**（flip_idx[flip_idx[i]] == i）且长度 == kpt_shape[0]。
+# 论文口径：p0 是质心（在镜像轴上，自配对），p1~p8 是 8 个角点，按左右成对互换。
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7]
+# 每个关键点的名字（按类别给；框架用它做可视化与日志）
+kpt_names:
+  0: [centroid, corner_1, corner_2, corner_3, corner_4,
+      corner_5, corner_6, corner_7, corner_8]
+
+# ---- 本库自用补充字段（非 ultralytics 字段）----
+tod:
+  # 关键点定义状态：paper-structured（结构按论文，编号顺序读图推定） /
+  #                figure-inferred / paper-verified / custom
+  kpt_definition_status: paper-structured
+  kpt_definition_source: "docs/KEYPOINTS.md（IEEE T-RO 40 (2024) 2967-2983, DOI 10.1109/TRO.2024.3400938）"
+  # 标注协议：改动后历史结果不可合并，必须记录
+  kpt_protocol: "v=0 未标注/越界；v=1 存在但被遮挡/自遮挡；v=2 可见；坐标归一化到 [0,1]"
+  # 目标尺度分层口径（按框边长 px）；与检测侧、OKS 分层评测共用
+  size_bins_px: [8, 16, 32, 96]
+  # 微小型无人机在仿真里通常占画面很小（Det-Fly 论文口径：平均约占画面 0.12%）
+  mean_object_px: 24
+
+  # ===================== 3D 几何损失 Lrep 所需（论文 §III-A-3 式 6/8）=====================
+  # 论文消融（Table III）：加入 Lrep 后 10°10cm 提升 > 10%，是三个组件里最显著的。
+  # 启用方式：EP7.reproj=true（见 variants/spae-yolov8n-pose/recipe.py）
+  #
+  # ⚠️ 下面的 object_points 是**占位值**：论文没有给出 p0~p8 在机体坐标系 Σo 的
+  #    3D 坐标表（正文只有式 (12) 的 p_i^o 记号）。必须换成你 RflySim 机模的真实几何！
+  #    顺序与 kpt_names 严格一一对应；单位：米；Σo 约定 x 前 / y 左 / z 上。
+  #    这里的数值只是"一个 0.3 m 量级四旋翼的对称角点"示意，切勿直接用于训练。
+  object_points:
+    - [0.000,  0.000,  0.000]   # 0 centroid（质心，放机体原点）
+    - [0.100,  0.100,  0.030]   # 1 corner_1 左前上
+    - [0.100, -0.100,  0.030]   # 2 corner_2 右前上
+    - [0.100,  0.100, -0.030]   # 3 corner_3 左前下
+    - [0.100, -0.100, -0.030]   # 4 corner_4 右前下
+    - [-0.100, 0.100,  0.030]   # 5 corner_5 左后上
+    - [-0.100, -0.100, 0.030]   # 6 corner_6 右后上
+    - [-0.100, 0.100, -0.030]   # 7 corner_7 左后下
+    - [-0.100, -0.100, -0.030]  # 8 corner_8 右后下
+  # 机型外接直径（米）：用于论文的 ADD(0.5d) 指标阈值（正确判据 = ADD < 0.5·diameter）
+  model_diameter: 0.30
+  # 相机内参 K（3×3）：fx, fy, cx, cy —— 必须用你 RflySim 里实际配置的那一组。
+  # 下面按"640×480、水平 FOV ≈ 90°"给的占位值（fx = fy = (W/2)/tan(FOV/2) = 320）。
+  # 注意：论文的输入是 640×480（不是 YOLO 常用的正方形输入），若你沿用 640×480，
+  #      训练时请显式 --imgsz 640 并确认 rect/letterbox 行为与标注时的投影一致。
+  camera_matrix: [[320.0, 0.0, 320.0], [0.0, 320.0, 240.0], [0.0, 0.0, 1.0]]
+  # 6D 位姿旁挂文件（机体→相机，逐目标一行）；格式见 docs/KEYPOINTS.md §5.2
+  pose_labels: labels_6d        # 相对 path 的目录名；<split>.csv
+  # 论文训练策略：前 N 个 epoch 只用 2D 定位损失 Lloc，之后再加入 Lrep
+  # （论文 §IV-A-2："we only use the 2-D regression loss Lloc ... in the first 15 training epochs"）
+  reproj_warmup_epochs: 15
+
+  # 是否已有 6D 位姿（可用于把关键点回归成姿态 / 做几何一致性检查）
+  has_6d_pose: true
+  # 采集环境与域信息（域适应实验要用：仿真→真实）
+  domain: simulation
+  simulator: RflySim

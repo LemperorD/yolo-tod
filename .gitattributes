@@ -6,6 +6,9 @@
 
 *.bat   text eol=crlf
 *.cmd   text eol=crlf
+# PowerShell 脚本保持 CRLF（Windows PowerShell 5.1 读无 BOM 的 UTF-8 脚本时按 ANSI
+# 代码页解码，内容必须是纯 ASCII；换行用 CRLF 与 Windows 习惯一致）
+*.ps1   text eol=crlf
 
 *.sh    text eol=lf
 
@@ -17,6 +20,8 @@
 *.toml  text eol=lf
 *.json  text eol=lf
 *.cfg   text eol=lf
+# 生成的 CSV 也钉 LF：否则同一份数据在 Windows/Linux 上产出的字节不同
+*.csv   text eol=lf
 
 # 二进制资源不做换行转换
 *.jpg   binary

@@ -11,16 +11,16 @@
 用法::
 
     # 1) 检查导出链路（不需要 GPU 也能跑到 ONNX 这一步）
-    python tools/export_onnx.py --variant variants/SPAE-YOLOv8n/variant.yaml \\
+    python3 tools/export_onnx.py --variant variants/SPAE-YOLOv8n/variant.yaml \\
         --weights results/SPAE-YOLOv8n/weights/best.pt \\
         --imgsz 640 --out exports/ --deploy-config configs/deploy/spae-yolov8n.json
 
     # 2) 顺带构建 TensorRT engine（需要目标机上的 tensorrt Python 包）
-    python tools/export_onnx.py --variant ... --weights ... --build-engine \\
+    python3 tools/export_onnx.py --variant ... --weights ... --build-engine \\
         --engine-preset orin --save-engine exports/spae_orin_fp16.engine
 
     # 3) INT8（需要校准数据列表）
-    python tools/export_onnx.py ... --build-engine --engine-preset orin \\
+    python3 tools/export_onnx.py ... --build-engine --engine-preset orin \\
         --int8 --calib-data exports/calib.txt
 """
 
@@ -33,6 +33,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 #: C++ 端（src/todrt）识别这个 schema；改动字段请同时改 src/todrt/src/config_io.cpp
 DEPLOY_SCHEMA = "todrt.deploy/v1"
@@ -103,7 +111,7 @@ def load_model(args):
     else:
         model = YOLO(str(args.weights))
         print(f"[模型] 直接加载权重：{args.weights}")
-        print("       ⚠️ 未提供 --variant：无法应用 EP5 头部手术，"
+        print("       [!] 未提供 --variant：无法应用 EP5 头部手术，"
               "导出的图只适合没有做检测头改造的变体。")
 
     # 权重覆盖：变体图 + 训练好的权重
@@ -261,7 +269,7 @@ def build_engine(onnx_path: Path, cfg: dict, args) -> Path:
             print("[TRT] INT8：请使用 TensorRT 的 calibrator（本脚本只传 flag，"
                   "校准数据由 tensorrt Python 的 IInt8EntropyCalibrator2 子类消费）")
     if hw.get("device") == "dla":
-        print("[TRT] ⚠️ DLA 配置需要在 C++ 端（todrt_cli）或自行调用 set_device_type 完成；"
+        print("[TRT] [!] DLA 配置需要在 C++ 端（todrt_cli）或自行调用 set_device_type 完成；"
               "Python 端这里只做精度与 workspace 设置。")
 
     imgsz = cfg["input"][0]
@@ -374,10 +382,10 @@ def verify_onnx(onnx_path: Path, anchors: int, layout: str) -> None:
             if len(dims) == 3 and dims[2] == anchors:
                 found = True
         if not found:
-            print(f"[校验] ⚠️ 没有找到 anchor={anchors} 的输出；"
+            print(f"[校验] [!] 没有找到 anchor={anchors} 的输出；"
                   "请确认 strides 与导出图一致，否则 C++ 解码会直接报错。")
         else:
-            print(f"[校验] ✅ 输出 anchor 数与预期一致（{anchors}）")
+            print(f"[校验] [OK] 输出 anchor 数与预期一致（{anchors}）")
     except Exception as exc:
         print(f"[校验] onnx 校验失败：{exc}")
 

@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -50,12 +49,17 @@ echo
 
 # 推送当前分支
 if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
-    git push "$REMOTE" "$BRANCH"
+    git push "$REMOTE" "$BRANCH" || {
+        echo "[错误] 推送失败，请检查网络、认证或远端分支状态。" >&2
+        exit 1
+    }
 else
     echo "[首次推送] 设置上游分支"
-    git push -u "$REMOTE" "$BRANCH"
+    git push -u "$REMOTE" "$BRANCH" || {
+        echo "[错误] 推送失败，请检查网络、认证或远端分支状态。" >&2
+        exit 1
+    }
 fi
 
 echo
 echo "[完成] 推送成功。"
-```

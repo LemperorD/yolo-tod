@@ -4,11 +4,34 @@
 主干框架（ultralytics）只作为加载器与训练引擎，绝不 fork。
 """
 
+import sys
+
 from tod.registry import catalog, get, has, install, list_specs, register
 
 __all__ = ["register", "install", "bootstrap", "import_libraries", "catalog", "get",
-           "has", "list_specs"]
+           "has", "list_specs", "configure_stdio"]
 __version__ = "0.0.1"
+
+
+def configure_stdio() -> None:
+    """把 stdout / stderr 切到 UTF-8，免得 Windows 默认代码页（GBK/cp936）编不出字符。
+
+    为什么需要：Windows 上 ``sys.stdout.encoding`` 常是 ``gbk``，一旦输出被重定向到
+    文件、被管道接走或被 CI 捕获，``print()`` 碰到 GBK 之外的字符就会
+    ``UnicodeEncodeError`` 让整条命令失败；同样的代码在 Linux（UTF-8）上却正常，
+    属于"只在某个平台炸"的隐蔽故障。
+
+    做法：优先 ``reconfigure``；失败就静默忽略（这只是输出层面的改善，
+    不该让业务逻辑挂掉）。``errors="replace"`` 保证最坏情况显示成 ``?`` 而不是中断。
+    """
+    import os
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, OSError, ValueError):
+            pass
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
 def import_libraries() -> None:
@@ -35,5 +58,6 @@ def bootstrap() -> None:
     早期版本只导入了 ``tod.modules``，结果 EP6/EP9 的模块（STAL、MuSGD、
     FeatureAlignKD）虽然注册了，却不在 parse_model 命名空间里。
     """
+    configure_stdio()
     import_libraries()
     install()

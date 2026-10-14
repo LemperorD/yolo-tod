@@ -2,7 +2,7 @@
 
 运行::
 
-    python tests/smoke.py
+    python3 tests/smoke.py
 
 只要这一步失败，就不要进入训练阶段 —— 说明架构层已经有问题。
 """
@@ -15,6 +15,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 from tod.compose import (  # noqa: E402
     Variant,

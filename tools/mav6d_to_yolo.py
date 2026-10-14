@@ -1,6 +1,6 @@
 """把 MAV6D 转成本库可直接训练/测试的 YOLO-pose 格式（小目标检测 + 9 点关键点）。
 
-## 输入（`D:/MAV6D`，作者原始布局）
+## 输入（`/path/to/MAV6D`，作者原始布局）
 
 ```
 <机型>/{JPEGImages,mask,labels,labels_yolo6d}/<组>/<序列>/<文件>
@@ -36,16 +36,16 @@
 ## 用法
 
     # 1) 先标定（得到内参与机体 3D 关键点；phantom4 已被 --check-util 验证）
-    python tools/mav6d_calibrate.py --mav6d D:/MAV6D --model phantom4 --check-util
-    python tools/mav6d_calibrate.py --mav6d D:/MAV6D --model mavic2 `
+    python3 tools/mav6d_calibrate.py --mav6d /path/to/MAV6D --model phantom4 --check-util
+    python3 tools/mav6d_calibrate.py --mav6d /path/to/MAV6D --model mavic2 `
         --max-frames 400 --out configs/_base_/datasets/_mav6d_mavic2_calib.json
 
     # 2) 转换（软链接图像，秒级）
-    python tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model phantom4 `
+    python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model phantom4 `
         --out data/mav6d --val-ratio 0.1
 
     # 3) 开训前校验
-    python tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml
+    python3 tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml
 """
 
 from __future__ import annotations
@@ -65,8 +65,19 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
+
 #: MAV6D 官方标注的归一化基准（与作者 `unzip_tools.py` 的说明一致；实测两机型全部 1920×1080）。
 MAV6D_NORM_W, MAV6D_NORM_H = 1920.0, 1080.0
+
+#: 视为图像的扩展名（统一小写比较：Linux 的 glob 区分大小写，Windows 不区分）。
+IMG_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 #: 关键点名称（顺序与作者 `util.py` 的 `corners` / 论文 p0~p8 一致）。
 KPT_NAMES = ["centroid", "corner_1", "corner_2", "corner_3", "corner_4",
@@ -124,24 +135,32 @@ def undistort_points(uv_px: np.ndarray, K: np.ndarray, D: np.ndarray,
 
 
 def index_images(mav6d: Path, model: str) -> dict[str, Path]:
-    """``{组/序列/stem: 图像路径}``（递归扫 JPEGImages）。"""
+    """``{组/序列/stem: 图像路径}``（递归扫 JPEGImages）。
+
+    用 ``suffix.lower()`` 而不是 ``glob("*.jpg")``：Linux 的 glob 区分大小写，
+    Windows 不区分；统一成小写比较才能两个平台得到同一份索引。
+    """
     out: dict[str, Path] = {}
     base = mav6d / model / "JPEGImages"
     for group in sorted(p for p in base.iterdir() if p.is_dir()):
         for seq in sorted(p for p in group.iterdir() if p.is_dir()):
-            for img in sorted(seq.glob("*.jpg")):
+            for img in sorted(p for p in seq.iterdir() if p.suffix.lower() in IMG_SUFFIXES):
                 out[f"{group.name}/{seq.name}/{img.stem}"] = img
     return out
 
 
 def read_listing(mav6d: Path, model: str, split: str) -> list[str]:
-    """读作者清单 → ``["组/序列/stem", ...]``（去重、保序）。"""
+    """读作者清单 → ``["组/序列/stem", ...]``（去重、保序）。
+
+    清单里是**作者机器上的绝对路径**，可能是 Windows 的 ``D:\\MAV6D\\...``，
+    所以在匹配前先把 ``\\`` 归一成 ``/``；否则在 Linux 上一条都匹配不到。
+    """
     path = mav6d / model / f"{split}.txt"
     if not path.is_file():
         return []
     keys, seen = [], set()
-    for line in path.read_text().splitlines():
-        m = re.search(r"(\d{2})/(\d{4})/([^/\\]+)\.jpg$", line.strip())
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.search(r"(\d{2})/(\d{4})/([^/\\]+)\.jpg$", line.strip().replace("\\", "/"))
         if not m:
             continue
         key = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
@@ -235,7 +254,7 @@ def convert_frame(img_path: Path, labels_dir: Path, yolo6d_dir: Path,
 def _pose_line(target: np.ndarray, cam: np.ndarray, calib) -> str | None:
     """算出 ``camera→MAV`` 的 6D 位姿行；目标位姿不可信时返回 ``None``。
 
-    ⚠️ **目标位姿块的偏移（实测，用 `tests/test_mav6d.py` 的合成真值往返钉住）**：
+    [!] **目标位姿块的偏移（实测，用 `tests/test_mav6d.py` 的合成真值往返钉住）**：
     ``labels`` 每行的目标块布局是::
 
         [0] 时间戳    [1] x   [2] y   [3] z   [4] qx  [5] qy  [6] qz  [7] qw
@@ -352,7 +371,9 @@ def write_dataset_yaml(out_root: Path, model: str, calib_result: dict, D: np.nda
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="MAV6D → YOLO-pose（检测 + 9 点关键点）")
-    ap.add_argument("--mav6d", type=Path, default=Path("D:/MAV6D"))
+    ap.add_argument("--mav6d", type=Path,
+                    default=Path(os.environ.get("MAV6D_ROOT", "data/MAV6D")),
+                    help="MAV6D 根目录（默认取环境变量 MAV6D_ROOT，否则 data/MAV6D）")
     ap.add_argument("--model", choices=("phantom4", "mavic2"), required=True)
     ap.add_argument("--out", type=Path, default=Path("data/mav6d"))
     ap.add_argument("--calib", type=Path, default=None,
@@ -478,12 +499,12 @@ def main() -> int:
                                   args.val_ratio)
     (out_root / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[convert] dataset.yaml → {yaml_path}")
-    print(f"[convert] manifest.json → {out_root / 'manifest.json'}")
+    print(f"[convert] dataset.yaml -> {yaml_path.as_posix()}")
+    print(f"[convert] manifest.json -> {(out_root / 'manifest.json').as_posix()}")
     print(f"[convert] 共 {total_ok} 帧")
     print("\n[下一步] 开训前先校验：")
-    print(f"  python tools/check_pose_dataset.py --data {yaml_path}")
-    print(f"  python tools/train_mav6d.py --model {args.model} --data {yaml_path}")
+    print(f"  python3 tools/check_pose_dataset.py --data {yaml_path.as_posix()}")
+    print(f"  python3 tools/train_mav6d.py --model {args.model} --data {yaml_path.as_posix()}")
     return 0
 
 

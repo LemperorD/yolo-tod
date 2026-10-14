@@ -246,7 +246,7 @@ Conv），包在外面会顺带改动颈部聚合 —— 那既不是论文说�
 
 | 指标 | 值 | 复现方式 |
 |---|---|---|
-| Params（SDD 骨架，nc=10） | 2,498,586（2.50 M） | `python tools/train.py --variant variants/SDD-YOLO26n/variant.yaml --dry-run` |
+| Params（SDD 骨架，nc=10） | 2,498,586（2.50 M） | `python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml --dry-run` |
 | 检测层数 / strides | `nl=4`，`[4, 8, 16, 32]` | 同上 |
 | Detect 输入索引（含注意力插入） | `[26, 27, 28, 29]` | 同上 |
 | GFLOPs（imgsz=1024, nc=10） | 基线 14.83 → +P2 18.43 → +注意力 18.47 | `tests/.tmp/probe_flops.py`（临时脚本） |
@@ -255,9 +255,9 @@ Conv），包在外面会顺带改动颈部聚合 —— 那既不是论文说�
 | KD 项量级（λ=0.5, T=3.0, 均值口径） | KD ≈ 0.44 vs `L_task` ≈ 22.8 | `test_modules.py::test_kd` |
 | 式 (6) 一致性 | criterion 11.617682 vs `0.5·L_task+0.5·L_KD` 11.617683 | 同上 |
 | 双注意力开销 | +11,786 参数、+0.04 GFLOPs | §5-2 表 |
-| **训练回路（合成数据）** | 2 epoch 跑通训练/验证/EMA/存权重；`results.csv` 的 `dfl_loss` **恒为 0**（§4.3 的无 DFL 真的生效）；best.pt 5.4 MB 可在**新进程**载入并推理 | `python tests/train_smoke.py --epochs 2 --device 0` |
-| **消融流水线（合成数据）** | `without-DualAttention` 2,484,688 vs baseline 2,496,474 参数（**−11,786**，正是注意力开销）；`--plan` 秒级产出 7 份配置并打印逐字段 diff | `python tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan` |
-| 尺度分层评测 | `tools/val.py` 在训练出的 best.pt 上跑通：整体与 <8 / 8-16 / 16-32 / 32-96 / ≥96 px 五层 AP 同时给出，并写 results.json（带 git commit） | `python tools/val.py --weights <best.pt> --data <dataset.yaml>` |
+| **训练回路（合成数据）** | 2 epoch 跑通训练/验证/EMA/存权重；`results.csv` 的 `dfl_loss` **恒为 0**（§4.3 的无 DFL 真的生效）；best.pt 5.4 MB 可在**新进程**载入并推理 | `python3 tests/train_smoke.py --epochs 2 --device 0` |
+| **消融流水线（合成数据）** | `without-DualAttention` 2,484,688 vs baseline 2,496,474 参数（**−11,786**，正是注意力开销）；`--plan` 秒级产出 7 份配置并打印逐字段 diff | `python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan` |
+| 尺度分层评测 | `tools/val.py` 在训练出的 best.pt 上跑通：整体与 <8 / 8-16 / 16-32 / 32-96 / ≥96 px 五层 AP 同时给出，并写 results.json（带 git commit） | `python3 tools/val.py --weights <best.pt> --data <dataset.yaml>` |
 
 > 精度类数字（mAP / AP_small / 延迟）**尚未产生**：合成数据上的 AP 恒为 0，不构成任何结论；
 > 真实数据（VisDrone）上的基线、消融与重复性属于 M1（见 PLAN.md §12）。
@@ -277,32 +277,32 @@ Conv），包在外面会顺带改动颈部聚合 —— 那既不是论文说�
 
 ## 10. 复现步骤
 
-```powershell
+```text
 # 1) 物化变体（生成 variant.yaml / model.yaml / card.md）
-python tools\make_variant.py variants\SDD-YOLO26n\recipe.py
+python3 tools/make_variant.py variants/SDD-YOLO26n/recipe.py
 
 # 2) 结构自检：建图 + 前向 + EP4/EP6/EP7/EP9 生效情况（不需要数据集）
-python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
+python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml --dry-run
 
 # 3) 真训练（需先准备 VisDrone2019-DET）
-python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml `
-    --data configs\_base_\datasets\visdrone2019-det.yaml
+python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml `
+    --data configs/_base_/datasets/visdrone2019-det.yaml
 
 # 3b) 没有数据集时：先跑合成数据的训练回路自检（1–2 分钟）
-python tools\make_dummy_dataset.py --out tests\.tmp\tiny-detect
-python tests\train_smoke.py --epochs 2 --device 0
+python3 tools/make_dummy_dataset.py --out tests/.tmp/tiny-detect
+python3 tests/train_smoke.py --epochs 2 --device 0
 
 # 4) 评测（整体 AP **与** AP_small / AP_tiny 一起报）与消融
-python tools\val.py --weights results\SDD-YOLO26n\weights\best.pt `
-    --data configs\_base_\datasets\visdrone2019-det.yaml --imgsz 1024 `
-    --json variants\SDD-YOLO26n\results.json
-python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py --plan   # 先看网格
-python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py `
-    --data configs\_base_\datasets\visdrone2019-det.yaml --epochs 100 --imgsz 1024
+python3 tools/val.py --weights results/SDD-YOLO26n/weights/best.pt `
+    --data configs/_base_/datasets/visdrone2019-det.yaml --imgsz 1024 `
+    --json variants/SDD-YOLO26n/results.json
+python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan   # 先看网格
+python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py `
+    --data configs/_base_/datasets/visdrone2019-det.yaml --epochs 100 --imgsz 1024
 
 # 5) 单模块与数值验证
-python tests\smoke.py            # 无 torch 依赖的架构检查
-python tests\test_modules.py     # 形状 / 数值 / 手术 / 蒸馏 / 优化器 / 评测
+python3 tests/smoke.py            # 无 torch 依赖的架构检查
+python3 tests/test_modules.py     # 形状 / 数值 / 手术 / 蒸馏 / 优化器 / 评测
 ```
 
 **消融怎么开**（对应论文 Table 3 的列）：

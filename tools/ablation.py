@@ -8,15 +8,15 @@
 用法::
 
     # 1) 只看消融网格（不训练，秒级；用于评审/确认配置正确）
-    python tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan
+    python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan
 
     # 2) 真跑：默认 baseline + 逐项剔除（leave-one-out）
-    python tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py \
+    python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py \
         --data configs/_base_/datasets/visdrone2019-det.yaml \
         --epochs 100 --imgsz 1024 --batch 4 --device 0
 
     # 3) 自检（合成数据、1 epoch、CPU 也能跑通整条流水线）
-    python tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py \
+    python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py \
         --data tests/.tmp/tiny-detect/dataset.yaml --epochs 1 --imgsz 320 --batch 2 \
         --device cpu --set workers=0 --max-images 8
 
@@ -45,6 +45,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 #: 这些键是"结构性开关"，参与自动消融扫描（其余如 nc/imgsz 属于固定设定）
 ABLATABLE_MODEL_KEYS = ("add_p2", "p2_pre", "p2_fuse_block")
@@ -284,7 +292,7 @@ def main() -> int:
     for name, v in variants[1:]:
         diff = diff_spec(baseline_spec, v.spec())
         if is_equivalent(diff):
-            print(f"  - {name:<28} ⚠ 与 baseline 等价（剔掉的键本来就是默认值），已跳过")
+            print(f"  - {name:<28} [!] 与 baseline 等价（剔掉的键本来就是默认值），已跳过")
             continue
         print(f"  - {name:<28} " + "；".join(diff))
         runnable.append((name, v))

@@ -13,22 +13,22 @@
 ## 用法
 
     # 0) 先转换数据（会现场标定；phantom4 的标定已被 --check-util 验证）
-    python tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model phantom4 --out data/mav6d
+    python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model phantom4 --out data/mav6d
 
     # 1) 结构自检（不需要数据，几秒钟）
-    python tools/train_mav6d.py --model phantom4 --data data/mav6d/phantom4/dataset.yaml --dry-run
+    python3 tools/train_mav6d.py --model phantom4 --data data/mav6d/phantom4/dataset.yaml --dry-run
 
     # 2) 只跑 2 个 epoch 做冒烟（确认数据/损失/显存都没问题）
-    python tools/train_mav6d.py --model phantom4 --smoke
+    python3 tools/train_mav6d.py --model phantom4 --smoke
 
     # 3) 正式训练
-    python tools/train_mav6d.py --model phantom4 --epochs 100 --batch 8 --imgsz 1280
+    python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 8 --imgsz 1280
 
     # 4) 两个机型分别训练（论文 Table IV 显示跨机型零样本很差，建议分别训）
-    python tools/train_mav6d.py --model mavic2 --epochs 100 --batch 8 --imgsz 1280
+    python3 tools/train_mav6d.py --model mavic2 --epochs 100 --batch 8 --imgsz 1280
 
     # 5) 断点续训
-    python tools/train_mav6d.py --model phantom4 --resume results/mav6d-phantom4/weights/last.pt
+    python3 tools/train_mav6d.py --model phantom4 --resume results/mav6d-phantom4/weights/last.pt
 
 ## 为什么默认这些超参（都可覆盖）
 
@@ -62,6 +62,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 #: 机型 → 变体 spec 与默认数据集路径（都可用命令行覆盖）。
 MODEL_DEFAULTS = {
@@ -159,7 +167,7 @@ def main() -> int:
         raise SystemExit(
             f"数据集不存在：{data_path}\n"
             "请先转换数据：\n"
-            f"  python tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model {args.model} "
+            f"  python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model {args.model} "
             "--out data/mav6d"
         )
 

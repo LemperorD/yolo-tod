@@ -13,11 +13,11 @@
 
 用法::
 
-    python tests/train_pose_smoke.py                 # 1 epoch，默认 device=0
-    python tests/train_pose_smoke.py --device cpu --epochs 2
-    python tests/train_pose_smoke.py --keep          # 保留实验目录（默认清理）
+    python3 tests/train_pose_smoke.py                 # 1 epoch，默认 device=0
+    python3 tests/train_pose_smoke.py --device cpu --epochs 2
+    python3 tests/train_pose_smoke.py --keep          # 保留实验目录（默认清理）
 
-⚠️ 环境要求：同 ``train_smoke.py`` —— ultralytics 的标签缓存用 ``multiprocessing.Pool``
+[!] 环境要求：同 ``train_smoke.py`` —— ultralytics 的标签缓存用 ``multiprocessing.Pool``
 （Windows 上是命名管道），在受限沙箱会话里会 ``PermissionError [WinError 5]``。
 """
 
@@ -32,6 +32,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 PASSED: list[str] = []
 
@@ -204,7 +212,7 @@ def main() -> int:
               not crit.active, f"epoch={crit.epoch} active={crit.active}")
         crit.set_epoch(int(cfg["tod"]["reproj_warmup_epochs"]) + 1)
         check("warm-up 之后 L_rep 生效", crit.active)
-        print(f"       ↳ L_rep：warm-up={crit.warmup_epochs} epoch、"
+        print(f"       -> L_rep：warm-up={crit.warmup_epochs} epoch、"
               f"{crit.reproj.n_kpt} 个关键点参与")
 
     # ---- 4) 断点能被新进程载入并输出 (n_kpt, 3) 关键点 ----
@@ -220,11 +228,11 @@ def main() -> int:
         shape = tuple(kpts.data.shape)
         check(f"关键点张量形状为 (n, {kpt_shape[0]}, 3)",
               shape[1:] == (kpt_shape[0], 3), f"实际 {shape}")
-        print(f"       ↳ 推理结果：{len(results[0].boxes)} 个框，"
+        print(f"       -> 推理结果：{len(results[0].boxes)} 个框，"
               f"关键点 {shape}，图像 {Path(images[0]).name}")
     else:
         # 1 epoch 的合成数据可能一个框都检不出，这不是回路问题，但要如实报告
-        print("       ↳ 注意：1 epoch 后没有检出任何目标（合成数据 + 极小 epoch 的正常现象）")
+        print("       -> 注意：1 epoch 后没有检出任何目标（合成数据 + 极小 epoch 的正常现象）")
         PASSED.append("推理结果关键点形状（本次无检出，跳过形状断言）")
 
     # ---- 5) OKS 评测口径可用（完美预测 = 满分）----
@@ -269,11 +277,11 @@ def main() -> int:
         check("ADD 阈值 = 0.5 × 机型直径",
               abs(scored["add"]["threshold_m"] - 0.5 * 0.45) < 1e-9,
               f"实际 {scored['add']['threshold_m']}")
-        print(f"       ↳ 论文指标：ADD={scored['add']['add_m']:.4f} m、"
+        print(f"       -> 论文指标：ADD={scored['add']['add_m']:.4f} m、"
               f"ADD(0.5d)={scored['add']['add_0.5d_ratio']:.2f}"
               f"（阈值 {scored['add']['threshold_m']:.3f} m）")
     else:
-        print("       ↳ 本次数据没有 6D 位姿，跳过 ADD 指标")
+        print("       -> 本次数据没有 6D 位姿，跳过 ADD 指标")
 
     # 半像素偏移：OKS 必须**下降**，且小目标层下降得更狠（口径有效性的核心断言）
     def shifted(image: Path):
@@ -295,16 +303,16 @@ def main() -> int:
              for name in ("8-16", "32-96")]
     usable = [(n, a, b) for n, a, b in pairs if a == a and b == b]     # 剔除 nan
     drops = {n: a - b for n, a, b in usable}
-    print("       ↳ 半像素偏移的 OKS-AP 降幅：" + " / ".join(
+    print("       -> 半像素偏移的 OKS-AP 降幅：" + " / ".join(
         f"{n} 层 {d:.4f}" for n, d in drops.items()))
     check("OKS 口径对尺度敏感（小目标降幅 ≥ 大目标降幅）",
           "8-16" in drops and "32-96" in drops and drops["8-16"] >= drops["32-96"] - 1e-9,
           f"实际 {drops}")
 
-    print(f"       ↳ 实验目录：{run_dir}")
+    print(f"       -> 实验目录：{run_dir}")
     if not args.keep:
         shutil.rmtree(args.work, ignore_errors=True)
-        print("       ↳ 已清理临时实验目录（--keep 可保留）")
+        print("       -> 已清理临时实验目录（--keep 可保留）")
 
     print(f"\n姿态训练回路自检通过：{len(PASSED)} 项\n")
     for label in PASSED:

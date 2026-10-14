@@ -2,8 +2,8 @@
 
 用法::
 
-    python tools/catalog.py            # 打印到标准输出
-    python tools/catalog.py --write    # 写入 docs/VARIANTS.md
+    python3 tools/catalog.py            # 打印到标准输出
+    python3 tools/catalog.py --write    # 写入 docs/VARIANTS.md
 
 为什么不用 ``python -m tod.registry``：包 __init__ 已导入该子模块，
 runpy 会抛 RuntimeWarning，输出不干净。
@@ -17,6 +17,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 from tod.registry import catalog  # noqa: E402
 

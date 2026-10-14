@@ -59,7 +59,8 @@ yolo-tod/
 ├─ README.md                   # 快速开始
 ├─ pyproject.toml              # 依赖（含 ultralytics / mmyolo 引脚）
 ├─ requirement.txt             # venv 依赖清单（不含 torch：GPU 轮子要按自己的 CUDA 版本单独装）
-├─ tools/setup_venv.ps1        # 一键建 .venv（建venv→引导pip→装torch栈→装依赖→可编辑安装→自检）
+├─ tools/setup_venv.ps1        # Windows 一键建 .venv（纯 ASCII，PS 5.1 安全）
+├─ tools/setup_venv.sh         # Linux/macOS 对等脚本（bin/python 布局）
 ├─ WORKFLOW.md                 # ★ 全流程命令：拉取 → 建环境 → 数据 → 训练 → 测试 → 消融 → 导出
 │
 ├─ configs/                    # 只放配置，不放代码
@@ -596,8 +597,8 @@ planned → reproducing → reproduced → (promoted | dropped)
 
 ## 12. 落地进展
 
-### M0 架构层（已完成，`python tests/smoke.py` 77 项 + `python tests/test_modules.py` 105 项
-+ `python tests/test_pose.py` 220 项检查全绿）
+### M0 架构层（已完成，`python3 tests/smoke.py` 77 项 + `python3 tests/test_modules.py` 105 项
++ `python3 tests/test_pose.py` 220 项检查全绿）
 
 | 文件 | 作用 | 状态 |
 |---|---|---|

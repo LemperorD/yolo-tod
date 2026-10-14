@@ -1,4 +1,3 @@
-```bat
 @echo off
 chcp 65001 >nul 2>&1
 setlocal
@@ -35,10 +34,19 @@ if "%BRANCH%"=="" (
     exit /b 1
 )
 
+REM 检查远端是否存在
+git remote get-url "%REMOTE%" >nul 2>&1
+if errorlevel 1 (
+    echo [错误] 远端 "%REMOTE%" 不存在。
+    exit /b 1
+)
+
+for /f "delims=" %%i in ('git remote get-url "%REMOTE%"') do set "REMOTE_URL=%%i"
+
 echo.
 echo 仓库: %ROOT%
 echo 分支: %BRANCH%
-echo 远端: %REMOTE%
+echo 远端: %REMOTE% (%REMOTE_URL%)
 echo.
 
 REM 检查是否存在提交
@@ -65,4 +73,3 @@ if errorlevel 1 (
 echo.
 echo [完成] 推送成功。
 exit /b 0
-```

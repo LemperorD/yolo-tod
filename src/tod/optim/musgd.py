@@ -30,7 +30,7 @@
       ``sqrt(max(1, rows/cols))`` 缩放（RMS 匹配）；
     * 混合模式只对 SGD 分量施加 weight decay（框架同样如此）。
 
-⚠️ 与框架原生路径的一处差异（已知，不影响主流程）：框架 ``build_optimizer`` 在
+[!] 与框架原生路径的一处差异（已知，不影响主流程）：框架 ``build_optimizer`` 在
 MuSGD 下会把 YOLO26 辅助头（``proto.semseg`` / ``SegmentationHead`` 等）的参数学习率
 放大 3 倍；本文件的 ``param_groups()`` 不做这件事（本库不训练分割辅助头）。
 """

@@ -11,8 +11,8 @@
 
 用法::
 
-    python tools/make_dummy_dataset.py --out tests/.tmp/tiny-detect --n-train 12 --n-val 4
-    python tools/train.py --variant variants/SDD-YOLO26n/variant.yaml \
+    python3 tools/make_dummy_dataset.py --out tests/.tmp/tiny-detect --n-train 12 --n-val 4
+    python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml \
         --data tests/.tmp/tiny-detect/dataset.yaml --epochs 2 --batch 2 --imgsz 320 `
         --set workers=0 --set plots=False --name sdd-tiny
 
@@ -505,14 +505,15 @@ def main() -> int:
                  kpt_shape=kpt_shape, layout=args.layout)
     print(f"[dummy] 任务={args.task} 布局={args.layout} kpt_shape={list(kpt_shape)} "
           f"图像 {args.n_train} 训练 / {args.n_val} 验证 → {args.out}")
-    print(f"[dummy] 数据集配置 → {path}")
+    print(f"[dummy] 数据集配置 -> {path.as_posix()}")
     if args.task == "pose":
-        print("[下一步] python tools/check_pose_dataset.py --data "
-              f"{path}  # 校验 kpt_shape/flip_idx/标签一致性")
-        print("[下一步] python tests/train_pose_smoke.py     # 姿态训练回路自检")
+        print("[下一步] python3 tools/check_pose_dataset.py --data "
+              f"{path.as_posix()}  # 校验 kpt_shape/flip_idx/标签一致性")
+        print("[下一步] python3 tests/train_pose_smoke.py     # 姿态训练回路自检")
     else:
-        print("[下一步] python tools/train.py --variant variants/SDD-YOLO26n/variant.yaml "
-              f"--data {path} --epochs 2 --batch 2 --imgsz 320 --set workers=0 --set plots=False")
+        print("[下一步] python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml "
+              f"--data {path.as_posix()} --epochs 2 --batch 2 --imgsz 320 "
+              "--set workers=0 --set plots=False")
     return 0
 
 

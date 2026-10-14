@@ -27,10 +27,10 @@ MAV6D 的标注里**没有**存相机内参、外参与机体 3D 关键点：它
 ## 用法
 
     # 1) 用 Phantom 4 验证本工具（应与 util.py 的公开标定一致）
-    python tools/mav6d_calibrate.py --mav6d D:/MAV6D --model phantom4 --check-util
+    python3 tools/mav6d_calibrate.py --mav6d /path/to/MAV6D --model phantom4 --check-util
 
     # 2) 解 Mavic 2（util.py 没有它的标定）
-    python tools/mav6d_calibrate.py --mav6d D:/MAV6D --model mavic2 `
+    python3 tools/mav6d_calibrate.py --mav6d /path/to/MAV6D --model mavic2 `
         --max-frames 400 --out configs/_base_/datasets/_mav6d_mavic2_calib.json
 """
 
@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -48,6 +49,14 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 #: MAV6D 官方（作者 `unzip_tools.py` 的说明 + 实测）标注归一化基准。
 MAV6D_NORM_W, MAV6D_NORM_H = 1920.0, 1080.0
@@ -121,7 +130,7 @@ def read_pose_file(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
     返回的每个位姿都是清理后的 ``[x, y, z, qx, qy, qz, qw]``。
     """
-    text = path.read_text().strip()
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
     if not text:
         raise ValueError(f"空标签：{path}")
     values = [float(v) for v in text.split()]
@@ -129,7 +138,7 @@ def read_pose_file(path: Path) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError(f"{path} 只有 {len(values)} 个数，期望 16（目标 8 + 相机 8）")
     values = values[:16]
 
-    # ⚠️ **实证结论（本库逐帧验证，不是猜的）**：只有"相机位姿"这块可靠。
+    # [!] **实证结论（本库逐帧验证，不是猜的）**：只有"相机位姿"这块可靠。
     #
     # 文件每行 16 个数（**没有空间位**）：
     #     [0]     目标时间戳（纳秒，量级 1e18）
@@ -167,7 +176,7 @@ def read_yolo6d(path: Path) -> tuple[int, np.ndarray, tuple[float, float]]:
       —— 它把末尾的 ``w,h`` 也当成了一个点。本库用作者自己的投影链交叉验证过。
     * 关键的归一化基准是**固定 1920×1080**（不是各图实际尺寸）。
     """
-    row = [float(v) for v in path.read_text().split()]
+    row = [float(v) for v in path.read_text(encoding="utf-8", errors="replace").split()]
     if len(row) != 21:
         raise ValueError(f"{path} 有 {len(row)} 列，期望 21（cls + 9 点×2 + w,h）")
     return int(row[0]), np.array(row[1:19], dtype=float).reshape(9, 2), (row[19], row[20])
@@ -258,8 +267,9 @@ def collect_pairs(mav6d: Path, model: str, splits: tuple[str, ...], max_frames: 
                   seed: int = 0) -> list[tuple[Path, Path]]:
     """返回 ``[(labels 路径, labels_yolo6d 路径)]``（按 split 清单取，去重）。
 
-    清单里是作者机器上的绝对路径，本库只用它取 ``<组>/<序列>/<文件>`` 尾部，
-    再拼到本机 ``labels`` / ``labels_yolo6d`` 上 —— 这样换机器不用改清单。
+    清单里是作者机器上的绝对路径（**可能是 Windows 的 ``D:\\...``**），本库只用它取
+    ``<组>/<序列>/<文件>`` 尾部，再拼到本机 ``labels`` / ``labels_yolo6d`` 上 —— 这样换机器
+    不用改清单。因此匹配前先把 ``\\`` 归一成 ``/``，否则 Linux 上一条都匹配不到。
     """
     pairs: list[tuple[Path, Path]] = []
     seen: set[str] = set()
@@ -267,11 +277,11 @@ def collect_pairs(mav6d: Path, model: str, splits: tuple[str, ...], max_frames: 
         listing = mav6d / model / f"{split}.txt"
         if not listing.is_file():
             continue
-        for line in listing.read_text().splitlines():
+        for line in listing.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
                 continue
-            m = re.search(r"(\d{2})/(\d{4})/([^/\\]+)\.jpg$", line)
+            m = re.search(r"(\d{2})/(\d{4})/([^/\\]+)\.jpg$", line.replace("\\", "/"))
             if not m:
                 continue
             group, seq, stem = m.groups()
@@ -566,7 +576,9 @@ def check_against_util(mav6d: Path, max_frames: int = 200) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="MAV6D 标定与机体 3D 关键点求解")
-    ap.add_argument("--mav6d", type=Path, default=Path("D:/MAV6D"), help="MAV6D 根目录")
+    ap.add_argument("--mav6d", type=Path,
+                    default=Path(os.environ.get("MAV6D_ROOT", "data/MAV6D")),
+                    help="MAV6D 根目录（默认取环境变量 MAV6D_ROOT，否则 data/MAV6D）")
     ap.add_argument("--model", choices=("phantom4", "mavic2"), default="phantom4")
     ap.add_argument("--splits", default="train", help="用哪些清单（逗号分隔：train,test）")
     ap.add_argument("--max-frames", type=int, default=400, help="最多用多少帧（0=全部）")
@@ -577,7 +589,10 @@ def main() -> int:
     args = ap.parse_args()
 
     if not (args.mav6d / args.model).is_dir():
-        raise SystemExit(f"找不到 {args.mav6d / args.model}")
+        raise SystemExit(
+            f"找不到 {args.mav6d / args.model}。用 --mav6d 指定 MAV6D 根目录，"
+            "或设置环境变量 MAV6D_ROOT。"
+        )
 
     if args.check_util:
         r = check_against_util(args.mav6d, max(50, min(args.max_frames or 200, 400)))

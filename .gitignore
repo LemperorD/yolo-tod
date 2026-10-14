@@ -3,15 +3,20 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
-dist/
+# 注意：下面这些一律用「前导斜杠」锚定到仓库根。
+# 不锚定的话，形如 `data/` 的规则会匹配**任意层级**的同名目录 —— 曾经把
+# `src/toddata/`（EP0 的 6D 位姿数据模块）整目录静默忽略掉，导致 Linux 侧
+# `from tod.data.pose6d import ...` 报 ModuleNotFoundError，而本机因为可编辑安装
+# 直接指向源目录，反而看不出问题。
+/build/
+/dist/
 
 # ultralytics 用户配置目录的回退位置（只读 HOME / 沙箱下由 tod.compat 指向这里）
 .cache/
 
-# 数据与权重（体积大，不入库）
-data/
-datasets/
+# 数据与权重（体积大，不入库）；只忽略仓库根的 data/ 与 datasets/
+/data/
+/datasets/
 *.pt
 *.onnx
 *.engine
@@ -22,7 +27,7 @@ results/*
 !results/.gitkeep
 
 # ultralytics 的默认输出目录（project 写相对路径时会落到这里）
-runs/
+/runs/
 
 # 测试临时产物
 tests/.tmp/

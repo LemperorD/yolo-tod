@@ -10,8 +10,8 @@
 
 用法::
 
-    python tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
-    python tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py --no-model
+    python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
+    python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py --no-model
 """
 
 from __future__ import annotations
@@ -23,6 +23,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 from tod.compat import CompatError  # noqa: E402
 from tod.compose import Variant  # noqa: E402
@@ -82,7 +90,7 @@ def main() -> int:
         card_path = variant.card(out / "card.md")
         print(f"[card ] {card_path}")
 
-    print("\n下一步：python tools/train.py --variant", spec_path)
+    print("\n下一步：python3 tools/train.py --variant", spec_path)
     return 0
 
 

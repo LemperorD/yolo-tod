@@ -50,11 +50,11 @@ Adaptation for Micro Aerial Vehicles*）**已存于 `docs/`**，本变体按它�
 | **SIoU** | `v8PoseLoss` 继承 `v8DetectionLoss`，框损失替换路径完全复用 |
 | **Efficient_UAVDet** | `cv2/cv3` 分组 `g=[2,4,8,16]`（16 ch/组）；**`cv4` 关键点分支默认不压缩**（见下） |
 
-```powershell
-python tools\make_variant.py variants\spae-yolov8n-pose\recipe.py
-python tools\train.py --variant variants\spae-yolov8n-pose\variant.yaml --dry-run
-python tools\check_pose_dataset.py --data configs\_base_\datasets\rflysim-pose.yaml   # 开训前校验
-python tests\train_pose_smoke.py --layout uav --warmup 0   # 合成数据端到端（含 L_rep 与 ADD）
+```text
+python3 tools/make_variant.py variants/spae-yolov8n-pose/recipe.py
+python3 tools/train.py --variant variants/spae-yolov8n-pose/variant.yaml --dry-run
+python3 tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.yaml   # 开训前校验
+python3 tests/train_pose_smoke.py --layout uav --warmup 0   # 合成数据端到端（含 L_rep 与 ADD）
 ```
 
 > ⚠️ 四条必须知道的边界：
@@ -92,12 +92,12 @@ python tests\train_pose_smoke.py --layout uav --warmup 0   # 合成数据端到�
 | **OKS 分层评测** | `eval/pose.py`（EP8） | OKS-AP 50:95 + 按目标边长分层 + **逐关键点尺度诊断**（≤1px 命中率/平均误差/平均 OKS） |
 | **合成关键点数据** | `tools/make_dummy_dataset.py --task pose`（EP0） | 火柴人 + COCO 17 点，tiny(12–24px) 与日常(48–112px) 双尺度 |
 
-```powershell
-python tools\make_variant.py variants\visdrone-yolo26n-pose-p2-p16\recipe.py
-python tools\train.py --variant variants\visdrone-yolo26n-pose-p2-p16\variant.yaml --dry-run
-python tests\train_pose_smoke.py      # 合成关键点数据真训练（回路自检）
-python tools\val_pose.py --weights results\...\best.pt `
-    --data configs\_base_\datasets\visdrone2019-pose.yaml --imgsz 1024 --sigma-strategy person
+```text
+python3 tools/make_variant.py variants/visdrone-yolo26n-pose-p2-p16/recipe.py
+python3 tools/train.py --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml --dry-run
+python3 tests/train_pose_smoke.py      # 合成关键点数据真训练（回路自检）
+python3 tools/val_pose.py --weights results/.../best.pt `
+    --data configs/_base_/datasets/visdrone2019-pose.yaml --imgsz 1024 --sigma-strategy person
 ```
 
 > ⚠️ **数据集状态**：VisDrone2019-DET **没有关键点标注**，`configs/_base_/datasets/visdrone2019-pose.yaml`
@@ -121,12 +121,12 @@ python tools\val_pose.py --weights results\...\best.pt `
 | `tools/mav6d_to_yolo.py` | 转成 YOLO-pose（检测 + 9 点）+ `labels_6d` 6D 位姿 + `dataset.yaml`（含全部 `tod.*`） |
 | `tools/train_mav6d.py` / `tools/test_mav6d.py` | 训练与测试（测试报**论文全部指标**：ADD / ADD(0.5d) / 10°10cm + OKS 分层 + 框 AP 分层） |
 
-```powershell
-python tools\mav6d_calibrate.py --mav6d D:\MAV6D --model phantom4 --check-util   # 核对投影链
-python tools\mav6d_to_yolo.py --mav6d D:\MAV6D --model phantom4 --out data\mav6d  # 转换
-python tools\check_pose_dataset.py --data data\mav6d\phantom4\dataset.yaml       # 开训前校验
-python tools\train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280  # 训练
-python tools\test_mav6d.py --model phantom4       # 测试（--model both 两机型一起报）
+```text
+python3 tools/mav6d_calibrate.py --mav6d D:/MAV6D --model phantom4 --check-util   # 核对投影链
+python3 tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model phantom4 --out data/mav6d  # 转换
+python3 tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml       # 开训前校验
+python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280  # 训练
+python3 tools/test_mav6d.py --model phantom4       # 测试（--model both 两机型一起报）
 ```
 
 **本库从数据里实证核对过的四件事**（都写进了代码注释，别改）：
@@ -154,15 +154,15 @@ python tools\test_mav6d.py --model phantom4       # 测试（--model both 两机
 | **SIoU** | `loss/box.py` + `loss/criterion.py` | 角度+距离+形状三项代价，只替换 IoU 项、复用框架 DFL |
 | **Efficient_UAVDet** | `modules/head/efficient_uavdet.py` | 分支 stem 换成两层 3×3 分组卷积，**g = x/16**（每组 16 通道） |
 
-```powershell
+```text
 # 物化变体（生成 variant.yaml / model.yaml / card.md）
-python tools\make_variant.py variants\SPAE-YOLOv8n\recipe.py
+python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
 
 # 结构自检：建模型 + 一次前向，不需要数据集
-python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --dry-run
+python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --dry-run
 
 # 真训练（需先准备 VisDrone）
-python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --data configs\_base_\datasets\visdrone2019-det.yaml
+python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --data configs/_base_/datasets/visdrone2019-det.yaml
 ```
 
 取证笔记（含论文原文摘录、消融表、**两处论文内部数据冲突**、以及"哪些是原文、哪些是我们的推断"）
@@ -186,9 +186,9 @@ python tools\train.py --variant variants\SPAE-YOLOv8n\variant.yaml --data config
 | **ProgLoss / STAL** | §4.6 | 底座 `E2ELoss.update` / `TaskAlignedAssigner` | 论文未给 STAL 公式，本库显式化为可消融开关 |
 | **特征对齐 KD** | §4.7 式 (6)(7) | `engine/distill.py`（EP9） | λ=0.5、T=3.0；默认关闭（YOLO26x 教师 8 GB 放不下） |
 
-```powershell
-python tools\make_variant.py variants\SDD-YOLO26n\recipe.py
-python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
+```text
+python3 tools/make_variant.py variants/SDD-YOLO26n/recipe.py
+python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml --dry-run
 ```
 
 > ⚠️ 引用前必读 `variants/SDD-YOLO26n/paper-notes.md`：论文用**未公开**的 DroneSOD-30K
@@ -210,26 +210,32 @@ python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
 ## 快速开始
 
 **完整全流程（拉取 → 建环境 → 数据 → 训练 → 测试）见 [`WORKFLOW.md`](WORKFLOW.md)**，
-下面只是最短路径。用到的文件：`requirement.txt`（必需依赖）、`tools/setup_venv.ps1`（一键建 `.venv`）。
+下面只是最短路径，**Windows / Linux 通用**。用到的文件：`requirement.txt`（必需依赖）、
+`tools/setup_venv.ps1`（Windows 一键建 `.venv`）、`tools/setup_venv.sh`（Linux/macOS 对等脚本）。
 
-```powershell
+```bash
 # 1) 建环境 + 装依赖 + 自检（一键）
-powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1
+bash tools/setup_venv.sh                       # Linux / macOS
+powershell -ExecutionPolicy Bypass -File tools/setup_venv.ps1   # Windows
 
 # 等价的手工步骤（脚本做的就是这些）
-python -m venv .venv                      # 3.10~3.14 均可（唯一要避开 3.14.1）
-.\.venv\Scripts\Activate.ps1
-python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128  # 按你的 CUDA 换 cuXXX
-python -m pip install -r requirement.txt
-python -m pip install -e . --no-deps      # 本仓库可编辑安装
+python3 -m venv .venv                      # 3.10~3.14 均可（唯一要避开 3.14.1）
+source .venv/bin/activate                  # Linux/macOS；Windows: .\.venv\Scripts\Activate.ps1
+python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128  # 按你的 CUDA 换 cuXXX
+python3 -m pip install -r requirement.txt
+python3 -m pip install -e . --no-deps      # 本仓库可编辑安装
 
 # 2) 架构层冒烟测试（不需要 GPU / torch）
-python tests\smoke.py
+python3 tests/smoke.py
 
 # 3) 查看已登记的魔改模块总表
-python tools\catalog.py
+python3 tools/catalog.py
 ```
 
+> **命令写法**：统一用 `python3` 与正斜杠 `/`（Windows 的 Python 与 PowerShell 都接受正斜杠）。
+> Windows 上若 `python3` 不可用（可能是 Microsoft Store 的 0 字节占位假壳），
+> 把它换成 `python` 即可，或按 `WORKFLOW.md` §0.0 的两行配置让它真正可用。
+>
 > `torch` / `torchvision` **不能**从 PyPI 装：PyPI 上是 CPU-only 构建，GPU 版只在
 > `https://download.pytorch.org/whl/cuXXX` 上。所以清单里**不含 torch**，由你自己按显卡与驱动
 > 选索引（RTX 5060 这类 Blackwell 卡需 cu128 及以上；`nvidia-smi` 可看驱动支持的 CUDA 版本）。
@@ -296,7 +302,7 @@ tools/              make_variant.py / train.py / val.py / **val_pose.py** / abla
                     / **check_pose_dataset.py**（关键点数据开训前校验）
                     / make_dummy_dataset.py（--task detect|pose --layout person|uav --kpt-shape N,D）
                     / **train_mav6d.py + test_mav6d.py**（MAV6D 训练与全指标测试）
-                    / **setup_venv.ps1**（一键建 .venv，纯 ASCII）
+                    / **setup_venv.ps1**（Windows 一键建 .venv，纯 ASCII）/ **setup_venv.sh**（Linux/macOS 对等脚本）
                     / export_onnx.py / convert_rknn.py
 WORKFLOW.md         **全流程命令**：拉取 → 建 venv → 数据 → 训练 → 测试 → 消融 → 导出
 requirement.txt     venv 依赖清单（**不含 torch**：GPU 轮子按自己的 CUDA 版本单独装）
@@ -312,23 +318,23 @@ tests/              smoke.py（无 torch 依赖，77 项）+ test_modules.py（1
 
 ## 评测与消融（可归因对比）
 
-```powershell
+```text
 # 0) 合成数据集：几秒钟造一份"训练回路自检"数据（离线、确定性）
-python tools\make_dummy_dataset.py --out tests\.tmp\tiny-detect
+python3 tools/make_dummy_dataset.py --out tests/.tmp/tiny-detect
 
 # 1) 训练回路自检：真训练 + 验证 + 存/载权重 + 推理（1–2 分钟）
-python tests\train_smoke.py --epochs 2 --device 0
+python3 tests/train_smoke.py --epochs 2 --device 0
 
 # 2) 尺度分层评测：整体 AP **与** AP_small / AP_tiny 一起报（只看整体会掩盖小目标退化）
-python tools\val.py --variant variants\SDD-YOLO26n\variant.yaml `
-    --weights results\SDD-YOLO26n\weights\best.pt `
-    --data configs\_base_\datasets\visdrone2019-det.yaml --imgsz 1024 `
-    --json variants\SDD-YOLO26n\results.json
+python3 tools/val.py --variant variants/SDD-YOLO26n/variant.yaml `
+    --weights results/SDD-YOLO26n/weights/best.pt `
+    --data configs/_base_/datasets/visdrone2019-det.yaml --imgsz 1024 `
+    --json variants/SDD-YOLO26n/results.json
 
 # 3) 消融流水线：先看网格与逐字段 diff（秒级、不训练），确认无误再真跑
-python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py --plan
-python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py `
-    --data configs\_base_\datasets\visdrone2019-det.yaml --epochs 100 --imgsz 1024 --batch 4
+python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan
+python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py `
+    --data configs/_base_/datasets/visdrone2019-det.yaml --epochs 100 --imgsz 1024 --batch 4
 ```
 
 > 消融的两条硬规矩（都写进了代码）：① 组件的"关掉"动作不能一律用 `without` ——
@@ -338,11 +344,11 @@ python tools\ablation.py --recipe variants\SDD-YOLO26n\recipe.py `
 
 ## 部署（推理端）
 
-```powershell
+```text
 # 导出 ONNX + 部署配置（需要 torch/ultralytics）
-python tools\export_onnx.py --variant variants\SPAE-YOLOv8n\variant.yaml `
-    --weights results\SPAE-YOLOv8n\weights\best.pt --imgsz 640 `
-    --deploy-config configs\deploy\spae-yolov8n.json
+python3 tools/export_onnx.py --variant variants/SPAE-YOLOv8n/variant.yaml `
+    --weights results/SPAE-YOLOv8n/weights/best.pt --imgsz 640 `
+    --deploy-config configs/deploy/spae-yolov8n.json
 ```
 
 ```bash
@@ -362,7 +368,7 @@ RK3588 的 `.rknn` 在 **x86 主机**上转换（板上不转换）：
 
 ```bash
 pip install rknn-toolkit2
-python tools/convert_rknn.py --onnx exports/SPAE-YOLOv8n.onnx --target rk3588 \
+python3 tools/convert_rknn.py --onnx exports/SPAE-YOLOv8n.onnx --target rk3588 \
     --out exports/spae.rk3588.rknn --dataset exports/calib.txt \
     --deploy-config configs/deploy/spae-yolov8n.json   # 自动切 uint8 NHWC 前处理
 ```

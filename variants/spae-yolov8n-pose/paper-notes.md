@@ -75,7 +75,7 @@
 
 ## 2. SPAE 四个组件在姿态头上的落点（实测）
 
-用 `python tools/train.py --variant variants/spae-yolov8n-pose/variant.yaml --dry-run --imgsz 640` 可复算：
+用 `python3 tools/train.py --variant variants/spae-yolov8n-pose/variant.yaml --dry-run --imgsz 640` 可复算：
 
 | SPAE 组件 | 结果 | 判定 |
 |---|---|---|
@@ -197,27 +197,27 @@ L_rep = Σ_i smoothL1( (I − v̂_i v̂_iᵀ) p_i^c ),
 
 ## 6. 复现命令
 
-```powershell
+```text
 # 0) 结构自检（不需要数据）
-python tools\make_variant.py variants\spae-yolov8n-pose\recipe.py
-python tools\train.py --variant variants\spae-yolov8n-pose\variant.yaml --dry-run
+python3 tools/make_variant.py variants/spae-yolov8n-pose/recipe.py
+python3 tools/train.py --variant variants/spae-yolov8n-pose/variant.yaml --dry-run
 
 # 1) 数据到位后**先校验**（会抓 flip_idx / 6D 位姿行序 / 相机内参 / 3D 点个数）
-python tools\check_pose_dataset.py --data configs\_base_\datasets\rflysim-pose.yaml --split train
-python tools\check_pose_dataset.py --data configs\_base_\datasets\rflysim-pose.yaml --split val
+python3 tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.yaml --split train
+python3 tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.yaml --split val
 
 # 2) 合成 9 点数据跑通回路（含 L_rep 与 ADD 指标）
-python tests\train_pose_smoke.py --layout uav --warmup 0 --epochs 1 --device 0
+python3 tests/train_pose_smoke.py --layout uav --warmup 0 --epochs 1 --device 0
 
 # 3) 真训练（前 15 epoch 自动只用 2D 项，之后加入 L_rep）
-python tools\train.py --variant variants\spae-yolov8n-pose\variant.yaml `
-    --data configs\_base_\datasets\rflysim-pose.yaml --epochs 200 --batch 4 --imgsz 640
+python3 tools/train.py --variant variants/spae-yolov8n-pose/variant.yaml `
+    --data configs/_base_/datasets/rflysim-pose.yaml --epochs 200 --batch 4 --imgsz 640
 
 # 4) 评测（OKS 分层 + 逐点诊断 + 论文的 ADD/ADD(0.5d)）
-python tools\val_pose.py --variant variants\spae-yolov8n-pose\variant.yaml `
-    --weights results\spae-yolov8n-pose\weights\best.pt `
-    --data configs\_base_\datasets\rflysim-pose.yaml --sigma-strategy uniform `
-    --json variants\spae-yolov8n-pose\results.json
+python3 tools/val_pose.py --variant variants/spae-yolov8n-pose/variant.yaml `
+    --weights results/spae-yolov8n-pose/weights/best.pt `
+    --data configs/_base_/datasets/rflysim-pose.yaml --sigma-strategy uniform `
+    --json variants/spae-yolov8n-pose/results.json
 
 # 5) 消融（每项只改一个字段）
 #    EP7.reproj=False / reproj_weight=0   → 关掉 L_rep（复现论文的 baseline 列）

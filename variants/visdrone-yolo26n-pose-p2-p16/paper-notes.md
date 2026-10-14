@@ -146,7 +146,7 @@ OKS-AP 是**排序指标**，小样本下噪声很大，而平均误差是**度�
 ## 4.5 本库实测的结构数据（确定性，可复算；**不是精度**）
 
 下面这些数字来自本机实跑（ultralytics 8.4.60 / torch 2.11.0+cu128 / RTX 5060 Laptop 8 GB），
-与数据集无关，可以用 `python tools\train.py --variant ... --dry-run --imgsz 640` 复算
+与数据集无关，可以用 `python3 tools/train.py --variant ... --dry-run --imgsz 640` 复算
 （除标注"训练时"的那一行）：
 
 | 项 | 实测值 | 复算方式 |
@@ -206,23 +206,23 @@ OKS-AP 是**排序指标**，小样本下噪声很大，而平均误差是**度�
 
 ## 7. 复现命令
 
-```powershell
+```text
 # 结构自检（不需要数据集）：建图 + 前向 + 准则接线
-python tools\make_variant.py variants\visdrone-yolo26n-pose-p2-p16\recipe.py
-python tools\train.py --variant variants\visdrone-yolo26n-pose-p2-p16\variant.yaml --dry-run
+python3 tools/make_variant.py variants/visdrone-yolo26n-pose-p2-p16/recipe.py
+python3 tools/train.py --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml --dry-run
 
 # 合成关键点数据端到端自检（真训练 + 载权重 + OKS 分层断言）
-python tests\train_pose_smoke.py --epochs 1 --device 0
+python3 tests/train_pose_smoke.py --epochs 1 --device 0
 
 # 模块级测试（损失数值 / σ 策略 / OKS 口径 / 建图 / 换头手术）
-python tests\test_pose.py
+python3 tests/test_pose.py
 
 # 真实数据到位后：
-python tools\train.py --variant variants\visdrone-yolo26n-pose-p2-p16\variant.yaml `
-    --data configs\_base_\datasets\visdrone2019-pose.yaml --epochs 100 --imgsz 1024 --batch 4
-python tools\val_pose.py `
-    --variant variants\visdrone-yolo26n-pose-p2-p16\variant.yaml `
-    --weights results\visdrone-yolo26n-pose-p2-p16\weights\best.pt `
-    --data configs\_base_\datasets\visdrone2019-pose.yaml --imgsz 1024 `
-    --sigma-strategy person --json variants\visdrone-yolo26n-pose-p2-p16\results.json
+python3 tools/train.py --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml `
+    --data configs/_base_/datasets/visdrone2019-pose.yaml --epochs 100 --imgsz 1024 --batch 4
+python3 tools/val_pose.py `
+    --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml `
+    --weights results/visdrone-yolo26n-pose-p2-p16/weights/best.pt `
+    --data configs/_base_/datasets/visdrone2019-pose.yaml --imgsz 1024 `
+    --sigma-strategy person --json variants/visdrone-yolo26n-pose-p2-p16/results.json
 ```

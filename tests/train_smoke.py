@@ -14,11 +14,11 @@
 
 用法::
 
-    python tests/train_smoke.py                 # 1 epoch，默认 device=0（有 GPU 用 GPU）
-    python tests/train_smoke.py --device cpu --epochs 2
-    python tests/train_smoke.py --keep          # 保留实验目录（默认清理）
+    python3 tests/train_smoke.py                 # 1 epoch，默认 device=0（有 GPU 用 GPU）
+    python3 tests/train_smoke.py --device cpu --epochs 2
+    python3 tests/train_smoke.py --keep          # 保留实验目录（默认清理）
 
-⚠️ 环境要求：ultralytics 的标签缓存默认用 ``ThreadPool`` 并行校验图片与标签，
+[!] 环境要求：ultralytics 的标签缓存默认用 ``ThreadPool`` 并行校验图片与标签，
    而 Windows 上该池会打开**命名管道**，在受限沙箱会话里会 ``PermissionError [WinError 5]``。
    本脚本默认调用 ``tod.compat.allow_threadless_label_cache()`` 把它换成**顺序**实现
    （语义一致、只是放弃并行；合成数据本来就只有十几张图），因此**在沙箱里也能跑**。
@@ -36,6 +36,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 PASSED: list[str] = []
 
@@ -134,13 +142,13 @@ def main() -> int:
     images = sorted((args.work / "data" / "images" / "val").glob("*.jpg"))
     results = reloaded.predict(str(images[0]), imgsz=args.imgsz, device=args.device, verbose=False)
     check("载入后能推理并返回结果", len(results) == 1 and hasattr(results[0], "boxes"))
-    print(f"       ↳ 推理结果：{len(results[0].boxes)} 个框，"
+    print(f"       -> 推理结果：{len(results[0].boxes)} 个框，"
           f"图像 {Path(images[0]).name}")
-    print(f"       ↳ 实验目录：{run_dir}")
+    print(f"       -> 实验目录：{run_dir}")
 
     if not args.keep:
         shutil.rmtree(args.work, ignore_errors=True)
-        print("       ↳ 已清理临时实验目录（--keep 可保留）")
+        print("       -> 已清理临时实验目录（--keep 可保留）")
 
     print(f"\n训练回路自检通过：{len(PASSED)} 项\n")
     for label in PASSED:

@@ -6,24 +6,24 @@
 |---|---|---|
 | **AP / AP50**（框） | 按 GT 框边长分层（<8 / 8-16 / 16-32 / 32-96 / ≥96 px） | 论文的 AP（框由关键点外接得到） |
 | **OKS-AP 50:95** | 本库口径（框 IoU 匹配）+ 按目标尺度分层 + 逐关键点诊断 | 论文没有这项（本库新增，对尺度更鲁棒） |
-| **ADD / ADD(0.5d)** | ① **PnP 位姿层面**（论文式 13，同口径）② 关键点层面（用真值深度，补充诊断） | ✅ 与论文可比 |
-| **10°10cm** | 论文式 (14)/(15) + PnP | ✅ 与论文可比 |
+| **ADD / ADD(0.5d)** | ① **PnP 位姿层面**（论文式 13，同口径）② 关键点层面（用真值深度，补充诊断） | [OK] 与论文可比 |
+| **10°10cm** | 论文式 (14)/(15) + PnP | [OK] 与论文可比 |
 | 关键点像素误差 | 平均误差 / ≤1px 命中率，按尺度分层 | 论文没有（诊断用） |
 
 ## 用法
 
     # 单机型评测（自动找 results/mav6d-<机型>/weights/best.pt）
-    python tools/test_mav6d.py --model phantom4 --data data/mav6d/phantom4/dataset.yaml
+    python3 tools/test_mav6d.py --model phantom4 --data data/mav6d/phantom4/dataset.yaml
 
     # 指定权重 / 划分 / 输出 JSON
-    python tools/test_mav6d.py --model phantom4 --weights results/xxx/weights/best.pt `
+    python3 tools/test_mav6d.py --model phantom4 --weights results/xxx/weights/best.pt `
         --split val --json results/mav6d-phantom4/test.json
 
     # 两个机型一起报（论文 Table I/IV 就是分机型报的）
-    python tools/test_mav6d.py --model both --data-root data/mav6d
+    python3 tools/test_mav6d.py --model both --data-root data/mav6d
 
     # 只看前 200 张（冒烟）
-    python tools/test_mav6d.py --model phantom4 --max-images 200
+    python3 tools/test_mav6d.py --model phantom4 --max-images 200
 
 ## 重要口径说明（写进 JSON 的 meta，引用数字前必读）
 
@@ -45,6 +45,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 MODELS = ("phantom4", "mavic2")
 
@@ -97,7 +105,7 @@ def find_weights(model: str, results_root: Path, explicit: Path | None) -> Path:
     if not hit:
         raise SystemExit(
             f"没找到 {model} 的权重（在 {results_root} 下）。\n"
-            f"请先训练：python tools/train_mav6d.py --model {model} "
+            f"请先训练：python3 tools/train_mav6d.py --model {model} "
             "--data data/mav6d/%s/dataset.yaml" % model
         )
     return hit[0]
@@ -115,7 +123,7 @@ def evaluate_one(model: str, args) -> dict:
     if not data.is_file():
         raise SystemExit(
             f"数据集不存在：{data}\n"
-            f"请先转换：python tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model {model} "
+            f"请先转换：python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model {model} "
             "--out data/mav6d"
         )
     weights = find_weights(model, args.results_root, args.weights)

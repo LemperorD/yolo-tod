@@ -4,8 +4,8 @@
 
 运行::
 
-    python tests/test_pose.py            # 全部
-    python tests/test_pose.py --fast     # 跳过端到端建图（只跑数值）
+    python3 tests/test_pose.py            # 全部
+    python3 tests/test_pose.py --fast     # 跳过端到端建图（只跑数值）
 """
 
 from __future__ import annotations
@@ -18,6 +18,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 PASSED: list[str] = []
 SKIPPED: list[str] = []
@@ -760,7 +768,7 @@ def test_spae_pose_variant(fast: bool = False) -> None:
           and all(head.cv4[i][0].groups == 1 for i in range(4)))
     check("关键点输出分支仍是 nk=27", head.cv4[0][-1].out_channels == 27,
           f"实际 {head.cv4[0][-1].out_channels}")
-    print(f"       ↳ SPAE-pose：{n_after:,} 参数（{n_after / 1e6:.2f} M），"
+    print(f"       -> SPAE-pose：{n_after:,} 参数（{n_after / 1e6:.2f} M），"
           f"换头 −{n_before - n_after:,}")
 
     # ---- 准则：框损失与关键点损失同时生效 ----

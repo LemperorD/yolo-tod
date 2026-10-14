@@ -91,11 +91,15 @@ def ensure_runtime_env() -> str | None:
 def version() -> str:
     """返回 ultralytics 版本号；未安装时抛 CompatError。"""
     if not installed():
+        if os.name == "nt":
+            setup = "  py -3.12 -m venv .venv && .venv\\Scripts\\activate"
+        else:
+            setup = "  python3 -m venv .venv && source .venv/bin/activate"
         raise CompatError(
             "未检测到 ultralytics。请先建独立虚拟环境并安装依赖：\n"
-            "  py -3.12 -m venv .venv && .venv\\Scripts\\activate\n"
-            "  pip install -e .[dev]\n"
-            "注意：本机 Python 3.14 下 torch 轮子可能不可用，建议用 3.11/3.12。"
+            f"{setup}\n"
+            "  pip install -r requirement.txt && pip install -e . --no-deps\n"
+            "注意：torch 需按自己的 CUDA 版本单独装（见 requirement.txt 顶部说明）。"
         )
     ensure_runtime_env()
     import ultralytics

@@ -1,0 +1,67 @@
+# VisDrone2019-POSE —— 航拍行人关键点（本库的**待准备**数据集，见下方 ⚠️）
+#
+# ⚠️ 重要：VisDrone2019-DET 官方发布里**只有检测框，没有关键点标注**。
+#    也就是说这个配置指向的数据集**当前并不存在**，本文件是"接口占位 + 采集口径"，
+#    目的是让 visdrone-yolo26n-pose-p2-p16 变体的复现目标明确、可追溯。
+#    在拿到真实标注之前，姿态变体只能用合成关键点数据做**回路自检**
+#    （tools/make_dummy_dataset.py --task pose + tests/train_pose_smoke.py），
+#    **任何精度数字都不能写进变体卡片**。
+#
+# 候选标注来源（按落地难度排序，均需自行下载并核对许可证）：
+#   1. **FlyPose**（WACV 2026，https://arxiv.org/abs/2601.05747）—— 航拍人体姿态
+#      数据集/模型，是当前最贴近"航拍行人 17 点"的公开工作；
+#   2. **UAV-Human**（CVPR 2021）—— 无人机视角人体行为，含 17 点骨骼标注；
+#   3. 自建：在 VisDrone-DET 的 pedestrian/people 框内人工标注 COCO 17 点
+#      （**推荐先做 500–1000 框的子集**，验证 AP_small 口径与标注成本，
+#      再决定是否全量标；PLAN §7.3 要求记录标注协议与划分种子）。
+#
+# 目录约定（YOLO-pose 格式，与 ultralytics 一致）：
+#   <path>/images/{train,val}/*.jpg
+#   <path>/labels/{train,val}/*.txt
+#     每行： cls cx cy w h  x1 y1 v1  x2 y2 v2 ... （归一化；v=0 未标注 / 1 遮挡 / 2 可见）
+#
+# 获取：VisDrone 原图 https://github.com/VisDrone/VisDrone-Dataset
+#       关键点标注需自建或取自上述 1/2 号来源。
+
+path: ./data/visdrone2019-pose
+train: images/train
+val: images/val
+test: images/test
+
+nc: 10
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
+
+# ---- 姿态专属字段（ultralytics 读它建数据集；不写会直接报错）----
+# 17 点 3 维（x, y, visibility），顺序与 COCO 一致 —— 因此可直接用
+# EP7 的 sigma_strategy=person（COCO OKS sigma）。
+kpt_shape: [17, 3]
+# 关键点名称（按类别给；框架用它做可视化，缺省则用数字）
+kpt_names:
+  0: [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder,
+      left_elbow, right_elbow, left_wrist, right_wrist, left_hip, right_hip,
+      left_knee, right_knee, left_ankle, right_ankle]
+  1: [nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder,
+      left_elbow, right_elbow, left_wrist, right_wrist, left_hip, right_hip,
+      left_knee, right_knee, left_ankle, right_ankle]
+
+# ---- 本库自用补充字段（非 ultralytics 字段）----
+tod:
+  # 目标尺度分层口径（按 box 边长，px）；姿态评测同样按它分层（tod/eval/pose.py）
+  size_bins_px: [8, 16, 32, 96]
+  # 航拍行人典型像素高度（VisDrone 行人中位数约 20–30 px，远处 <10 px）
+  mean_object_px: 25
+  # 标注状态：none（未标注）/ partial（子集）/ full
+  kpt_annotation: none
+  # 标注协议（自建时必须填，否则不同批次数据不可合并）
+  kpt_protocol: "COCO 17 点；遮挡点 v=1，完全不可见 v=0；框外点仍标注但 v=0"
+  rare_classes: [1, 2, 6, 7, 8]

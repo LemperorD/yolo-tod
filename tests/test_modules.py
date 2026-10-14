@@ -1,11 +1,11 @@
 """模块级测试：形状 / 数值 / 端到端建图。
 
-需要 torch + ultralytics（跑 ``python tests/smoke.py`` 的那套无依赖检查在另一个文件）。
+需要 torch + ultralytics（跑 ``python3 tests/smoke.py`` 的那套无依赖检查在另一个文件）。
 
 运行::
 
-    python tests/test_modules.py            # 全部
-    python tests/test_modules.py --fast     # 跳过端到端建图
+    python3 tests/test_modules.py            # 全部
+    python3 tests/test_modules.py --fast     # 跳过端到端建图
 """
 
 from __future__ import annotations
@@ -17,6 +17,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 PASSED: list[str] = []
 SKIPPED: list[str] = []
@@ -413,7 +421,7 @@ def test_efficient_uavdet_surgery() -> None:
     check("前向输出通道 = nc + 4*reg_max",
           logits["boxes"].shape[1] + logits["scores"].shape[1] == 10 + 64,
           f"实际 boxes={logits['boxes'].shape[1]} scores={logits['scores'].shape[1]}")
-    print("       ↳ " + describe(head).replace("\n", "\n         "))
+    print("       -> " + describe(head).replace("\n", "\n         "))
 
     # 另一种通道策略（in=out=x）也必须可用
     head2 = Detect(nc=10, ch=ch)
@@ -608,7 +616,7 @@ def test_end_to_end_build(fast: bool = False) -> None:
     check("SPAE：stride 含 4（P2 层生效）", 4 in list(getattr(head, "stride", [])),
           f"实际 {list(getattr(head, 'stride', []))}")
     check("SPAE：前向可跑通", out is not None)
-    print(f"       ↳ 参数量 {n_final:,} ({n_final / 1e6:.2f} M)"
+    print(f"       -> 参数量 {n_final:,} ({n_final / 1e6:.2f} M)"
           f"，换头减少 {n_yaml - n_final:,}，头输入尺寸 {getattr(head, 'f', None)}")
 
 
@@ -801,7 +809,7 @@ def test_sdd_end_to_end(fast: bool = False) -> None:
     check("SDD：反向传播到达注意力层", attn.channel[2].weight.grad is not None)
 
     n_final = sum(p.numel() for p in model.parameters())
-    print(f"       ↳ SDD-YOLO26n：{n_final:,} 参数（{n_final / 1e6:.2f} M）、"
+    print(f"       -> SDD-YOLO26n：{n_final:,} 参数（{n_final / 1e6:.2f} M）、"
           f"nl={head.nl}、stride={[int(s) for s in head.stride]}、f={list(head.f)}")
 
 

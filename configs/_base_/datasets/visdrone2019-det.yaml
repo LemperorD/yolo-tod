@@ -1,0 +1,37 @@
+# VisDrone2019-DET —— 第一主战场（航拍小目标）
+#
+# 用法：把 path 指向你自己的数据根目录，或在命令行用 `data=<绝对路径>` 覆盖。
+# 目录约定（YOLO 格式，与 ultralytics 一致）：
+#   <path>/images/{train,val,test}/*.jpg
+#   <path>/labels/{train,val,test}/*.txt
+#
+# 获取：https://github.com/VisDrone/VisDrone-Dataset
+# 注意：官方 val 集常被进一步切成 val/test-dev，全库实验必须统一划分并记录随机种子，
+#       否则不同变体之间的 AP 不可比（PLAN.md §7.3）。
+
+path: ./data/visdrone2019-det
+train: images/train
+val: images/val
+test: images/test
+
+nc: 10
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
+
+# ---- 小目标专属补充字段（本库自用，非 ultralytics 官方字段）----
+tod:
+  # 目标尺度分层口径，用于报告 AP_small / AP_tiny（PLAN.md §7.2）
+  size_bins_px: [8, 16, 32, 96]
+  # 典型目标像素尺寸（供快速判断"这个数据集有多小"）
+  mean_object_px: 30
+  # 长尾类别：bicycle/tricycle/awning-tricycle 等样本极少，需要过采样策略
+  rare_classes: [1, 2, 6, 7, 8]

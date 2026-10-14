@@ -93,7 +93,7 @@ def sigma_tensor(kpt_shape: Any, strategy: str = "auto",
     elif strategy == "balanced":
         sigma = _normalized(_auto_sigma(nkpt) ** 0.5)
         note = (f"balanced（auto sigma 压平后归一到均值 1，n={nkpt}）"
-                "⚠️ 改变了 OKS 项的绝对尺度，与框架/COCO 数值不可直接比较")
+                "[!] 改变了 OKS 项的绝对尺度，与框架/COCO 数值不可直接比较")
     elif nkpt == len(COCO_SIGMA_17):
         sigma = torch.tensor(COCO_SIGMA_17, dtype=torch.float32)
         note = "auto（17 点：沿用 COCO 标准 sigma，未缩放）"

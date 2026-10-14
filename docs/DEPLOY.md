@@ -60,7 +60,7 @@
 
 ```bash
 # 变体 + 权重 → ONNX + 部署配置
-python tools/export_onnx.py \
+python3 tools/export_onnx.py \
     --variant variants/SPAE-YOLOv8n/variant.yaml \
     --weights results/SPAE-YOLOv8n/weights/best.pt \
     --imgsz 640 \
@@ -260,7 +260,7 @@ ls -l /dev/rknpu*                     # crw-rw---- root video
 ```bash
 pip install rknn-toolkit2
 
-python tools/convert_rknn.py \
+python3 tools/convert_rknn.py \
     --onnx exports/SPAE-YOLOv8n.onnx \
     --target rk3588 \
     --out exports/spae_yolov8n.rk3588.rknn \

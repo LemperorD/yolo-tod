@@ -19,8 +19,8 @@
 
 用法::
 
-    python tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.yaml
-    python tools/check_pose_dataset.py --data ... --split val --sample 20 --json out.json
+    python3 tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.yaml
+    python3 tools/check_pose_dataset.py --data ... --split val --sample 20 --json out.json
 
 退出码：有 **错误** 时返回 1（可直接进 CI / 开训前置检查）；只有警告时返回 0。
 """
@@ -35,6 +35,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 
 # ------------------------------------------------------------------ 检查工具
@@ -153,12 +161,30 @@ def check_config(cfg: dict, report: Report) -> tuple[tuple[int, int], list[int],
 # ------------------------------------------------------------------ 标签检查
 
 
+def dataset_root(cfg: dict, base: Path | None = None) -> Path:
+    """解析数据集 YAML 里 ``path`` 的根目录。
+
+    ``path`` 缺省时**回退到 YAML 所在目录**，而不是当前工作目录 —— 否则从仓库根目录
+    执行 ``python3 tools/check_pose_dataset.py --data tests/.tmp/x/dataset.yaml`` 会把
+    相对路径解析到仓库根，误报"找不到标签文件"。与 ``src/tod/eval/scales.py`` 同一口径。
+    """
+    raw = cfg.get("path")
+    fallback = base if base is not None else Path(".")
+    root = Path(str(raw)) if raw else Path(fallback)
+    if not root.is_absolute():
+        root = (Path(fallback) / root).resolve()
+    return root
+
+
 def iter_label_files(root: Path, split: str) -> list[Path]:
     """按 ultralytics 约定定位标签文件。
 
     数据集 YAML 里 ``train:``/``val:`` 写的是**图像**路径（如 ``images/train``），
     标签在同级 ``labels/train``。早先这里直接拼 ``root/split`` 会找不到任何标签、
     误报"没有数据" —— 所以按优先级依次尝试，并把 ``/images/`` 换成 ``/labels/``。
+
+    列表文件（``.txt`` 里一行一个路径）统一按正斜杠解析：Windows 生成的清单在 Linux
+    上会被当成含 ``\\`` 的单个文件名，一条都读不到。
     """
     value = str(split)
     candidates: list[Path] = []
@@ -177,13 +203,14 @@ def iter_label_files(root: Path, split: str) -> list[Path]:
             lines = [ln.strip() for ln in target.read_text(encoding="utf-8").splitlines()
                      if ln.strip()]
             if lines:
-                return [Path(ln) for ln in lines]
+                return [p if p.is_absolute() else root / p
+                        for p in (Path(ln.replace("\\", "/")) for ln in lines)]
     return []
 
 
-def resolve_labels_dir(cfg: dict, split: str) -> Path | None:
+def resolve_labels_dir(cfg: dict, split: str, base: Path | None = None) -> Path | None:
     """返回某个划分的标签目录（供图像/标签配对检查用）。"""
-    root = Path(str(cfg.get("path") or "."))
+    root = dataset_root(cfg, base)
     value = Path(str(split))
     if "images" in value.parts:
         parts = list(value.parts)
@@ -194,12 +221,12 @@ def resolve_labels_dir(cfg: dict, split: str) -> Path | None:
 
 
 def check_labels(cfg: dict, kpt_shape: tuple[int, int], flip_idx: list[int],
-                 split: str, sample: int, report: Report) -> dict:
+                 split: str, sample: int, report: Report, base: Path | None = None) -> dict:
     """逐行校验标签格式与数值，返回统计信息。"""
     n_kpt, n_dim = kpt_shape
     # nc 缺省时按 names 的条目数推断（很多数据集只写 names 不写 nc）
     n_cls = int(cfg.get("nc") or len(cfg.get("names") or {}) or 1)
-    root = Path(str(cfg.get("path") or "."))
+    root = dataset_root(cfg, base)
     files = iter_label_files(root, split)
     stats: dict = {"split": split, "files": len(files), "lines": 0, "boxes": 0,
                    "kpt_total": 0, "kpt_vis_hist": {}, "kpt_per_index_vis": {},
@@ -312,7 +339,7 @@ def summarize_scale(stats: dict, cfg: dict, report: Report) -> None:
     )
 
 
-def check_pose6d(cfg: dict, split: str, report: Report) -> dict:
+def check_pose6d(cfg: dict, split: str, report: Report, base: Path | None = None) -> dict:
     """校验 ``L_rep``（论文式 8）需要的 6D 位姿旁挂数据与相机/机体参数。
 
     论文启用几何重投影项后 10°10cm 提升 >10%，但它的输入有三处**极易错且静默**：
@@ -331,7 +358,7 @@ def check_pose6d(cfg: dict, split: str, report: Report) -> dict:
         )
         return stats
 
-    root = Path(str(cfg.get("path") or "."))
+    root = dataset_root(cfg, base)
     csv_path = root / str(pose_dir) / f"{split}.csv"
     if not csv_path.is_file():
         report.error(
@@ -351,7 +378,7 @@ def check_pose6d(cfg: dict, split: str, report: Report) -> dict:
     stats["pose_rows"] = sum(len(v) for v in table.values())
 
     # ---- 与标签行数逐图对齐（错位是静默错误里最危险的一种）----
-    label_dir = resolve_labels_dir(cfg, split)
+    label_dir = resolve_labels_dir(cfg, split, base)
     if label_dir and label_dir.is_dir():
         mismatched = []
         for path in sorted(label_dir.glob("*.txt")):
@@ -426,12 +453,13 @@ def check_pose6d(cfg: dict, split: str, report: Report) -> dict:
     return stats
 
 
-def check_image_pairing(cfg: dict, split: str, report: Report) -> None:
+def check_image_pairing(cfg: dict, split: str, report: Report,
+                        base: Path | None = None) -> None:
     """标签与图像的配对是否完整（漏标/多余标签是常见的数据集事故）。"""
-    root = Path(str(cfg.get("path") or "."))
+    root = dataset_root(cfg, base)
     value = Path(str(split))
     images = (root / value) if (root / value).is_dir() else (root / "images" / value)
-    labels = resolve_labels_dir(cfg, split)
+    labels = resolve_labels_dir(cfg, split, base)
     if not images.is_dir() or labels is None or not labels.is_dir():
         report.note(f"跳过图像/标签配对检查（images={images}，labels={labels}）。")
         return
@@ -469,12 +497,13 @@ def main() -> int:
     report = Report()
 
     kpt_shape, flip_idx, _names = check_config(cfg, report)
+    base = args.data.parent                      # 相对 path 以 YAML 所在目录为基准
     stats: dict = {}
     if kpt_shape[0] > 0:
-        stats = check_labels(cfg, kpt_shape, flip_idx, args.split, args.sample, report)
+        stats = check_labels(cfg, kpt_shape, flip_idx, args.split, args.sample, report, base)
         summarize_scale(stats, cfg, report)
-        check_image_pairing(cfg, args.split, report)
-        stats["pose6d"] = check_pose6d(cfg, args.split, report)
+        check_image_pairing(cfg, args.split, report, base)
+        stats["pose6d"] = check_pose6d(cfg, args.split, report, base)
 
     print(f"\n[check] {args.data}  (split={args.split})")
     print(f"        kpt_shape={list(kpt_shape)}  flip_idx={flip_idx}  nc={cfg.get('nc')}")

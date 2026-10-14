@@ -10,13 +10,13 @@
 用法::
 
     # 单变体评测（并把结果写成 machine-readable 的 results.json）
-    python tools/val.py --variant variants/SDD-YOLO26n/variant.yaml \
+    python3 tools/val.py --variant variants/SDD-YOLO26n/variant.yaml \
         --weights results/SDD-YOLO26n/weights/best.pt \
         --data configs/_base_/datasets/visdrone2019-det.yaml \
         --imgsz 1024 --split val --json variants/SDD-YOLO26n/results.json
 
     # 只跑前 20 张做冒烟（合成数据集自检用）
-    python tools/val.py --weights runs/x/weights/best.pt \
+    python3 tools/val.py --weights runs/x/weights/best.pt \
         --data tests/.tmp/tiny-detect/dataset.yaml --max-images 20 --device cpu
 
 results.json 里带 git commit / 权重 mtime 等复现信息（PLAN §2.7 要求记录 commit hash）。
@@ -33,6 +33,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 
 def _git_commit() -> str:

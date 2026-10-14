@@ -7,7 +7,7 @@
 
 新增模块时请同时：
   1. 在 ``tests/test_modules.py`` 增加形状/数值测试；
-  2. 跑 ``python tools/catalog.py --write`` 刷新 docs/VARIANTS.md。
+  2. 跑 ``python3 tools/catalog.py --write`` 刷新 docs/VARIANTS.md。
 """
 
 # 导入即注册。集中列在这里，保证 ``import tod.modules`` 能拿到全部零件。

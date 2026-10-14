@@ -3,13 +3,13 @@
 用法::
 
     # 0) 先物化变体（生成 variant.yaml / model.yaml / card.md）
-    python tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
+    python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
 
     # 1) 只做结构自检：建模型 + 一次前向，不训练（不需要数据集）
-    python tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --dry-run
+    python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --dry-run
 
     # 2) 真训练
-    python tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml \
+    python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml \
         --data configs/_base_/datasets/visdrone2019-det.yaml --epochs 150 --batch 4
 """
 
@@ -21,6 +21,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 
 def build_parser() -> argparse.ArgumentParser:

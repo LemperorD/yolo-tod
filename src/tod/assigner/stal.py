@@ -6,7 +6,7 @@
     正文："This is coupled with STAL (Small-Target-Aware Label Assignment), which
            assigns adaptive higher weights to micro-target anchors."
 
-    ↳ **论文没有给出 STAL 的公式、伪代码或超参**，也没有说明"higher weights"加在哪里。
+    -> **论文没有给出 STAL 的公式、伪代码或超参**，也没有说明"higher weights"加在哪里。
 
 框架侧的事实（ultralytics 8.4，``TaskAlignedAssigner.select_candidates_in_gts``）::
 

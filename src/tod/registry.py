@@ -187,7 +187,7 @@ def catalog() -> str:
     文档一律由代码生成，禁止手工维护（PLAN.md §9.10）。
     """
     lines: list[str] = ["# 模块总表（自动生成，请勿手工编辑）", "",
-                        "运行 `python tools/catalog.py --write` 重新生成。", ""]
+                        "运行 `python3 tools/catalog.py --write` 重新生成。", ""]
     for ep, ep_name in EXTENSION_POINTS.items():
         specs = list_specs(ep)
         if not specs:

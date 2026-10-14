@@ -1,6 +1,6 @@
 # 模块总表（自动生成，请勿手工编辑）
 
-运行 `python tools/catalog.py --write` 重新生成。
+运行 `python3 tools/catalog.py --write` 重新生成。
 
 ## EP1 Backbone（1 项）
 

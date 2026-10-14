@@ -14,7 +14,7 @@
 用法::
 
     # 真实权重评测（把 results.json 的 metrics 直接贴进变体卡片）
-    python tools/val_pose.py \
+    python3 tools/val_pose.py \
         --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml \
         --weights results/visdrone-yolo26n-pose-p2-p16/weights/best.pt \
         --data configs/_base_/datasets/visdrone2019-pose.yaml \
@@ -22,12 +22,12 @@
         --json variants/visdrone-yolo26n-pose-p2-p16/results.json
 
     # 合成数据冒烟（几秒钟）
-    python tools/val_pose.py --weights runs/x/weights/best.pt \
+    python3 tools/val_pose.py --weights runs/x/weights/best.pt \
         --data tests/.tmp/tiny-pose/dataset.yaml --max-images 4 --device cpu
 
 results.json 里带 git commit / 权重 mtime（PLAN §2.7）。
 
-⚠️ 口径提醒：本入口的 OKS-AP 用**框 IoU 匹配**（默认 0.5），不是 COCO 的 OKS 匹配，
+[!] 口径提醒：本入口的 OKS-AP 用**框 IoU 匹配**（默认 0.5），不是 COCO 的 OKS 匹配，
 因此**不等于** COCO keypoints AP，两者不可直接比较。
 """
 
@@ -42,6 +42,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 
 def _git_commit() -> str:

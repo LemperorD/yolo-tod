@@ -16,18 +16,18 @@
 用法::
 
     # 1) 只转模型（推荐先跑，看量化后精度掉多少）
-    python tools/convert_rknn.py \\
+    python3 tools/convert_rknn.py \\
         --onnx exports/SPAE-YOLOv8n.onnx \\
         --target rk3588 --out exports/spae_yolov8n.rk3588.rknn \\
         --dataset exports/calib.txt
 
     # 2) 顺带把 C++ 部署配置改成 RKNN 路径（前处理自动切成 uint8 NHWC）
-    python tools/convert_rknn.py --onnx ... --out ... \\
+    python3 tools/convert_rknn.py --onnx ... --out ... \\
         --deploy-config configs/deploy/spae-yolov8n.json
 
     # 3) 若已有 VisDrone 的量化数据集描述（rknn-toolkit2 的 dataset.txt 格式），
     #    直接用它做混合量化，精度更稳：
-    python tools/convert_rknn.py --onnx ... --out ... --quantized-dataset dataset.txt
+    python3 tools/convert_rknn.py --onnx ... --out ... --quantized-dataset dataset.txt
 
 校准集（--dataset）是每行一个图片路径的文本文件，建议 100–300 张，覆盖真实场景
 （白天/夜间、不同高度、有无小目标）。小目标对量化误差非常敏感，**务必复测 AP_small**。
@@ -42,6 +42,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
+try:
+    import tod
+
+    tod.configure_stdio()
+except Exception:
+    pass
 
 # 支持的 SoC：决定 NPU 的算子支持与量化策略
 TARGETS = ("rk3588", "rk3588s", "rk3568", "rk3566", "rk3562", "rk3576")
@@ -140,7 +148,7 @@ def convert(args) -> Path:
     elif args.dataset:
         dataset = str(args.dataset)
     if do_quant and dataset is None:
-        print("[RKNN] ⚠️ 没有给 --dataset：toolkit 会用随机数据做量化校准，"
+        print("[RKNN] [!] 没有给 --dataset：toolkit 会用随机数据做量化校准，"
               "精度通常明显更差。强烈建议给 100–300 张真实场景图片。")
 
     print(f"[RKNN] 构建（do_quantization={do_quant}）...")

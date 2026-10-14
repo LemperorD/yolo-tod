@@ -58,7 +58,9 @@ yolo-tod/
 ├─ PLAN.md                     # 本文档
 ├─ README.md                   # 快速开始
 ├─ pyproject.toml              # 依赖（含 ultralytics / mmyolo 引脚）
-├─ requirements-lock.txt       # 完整锁定版本，用于复现实验
+├─ requirement.txt             # venv 依赖清单（其余依赖 + 可选导出/分析依赖）
+├─ requirement-torch.txt       # torch/torchvision 单独一步，走 PyTorch CUDA 索引
+├─ tools/setup_venv.ps1        # 一键建 .venv（建venv→引导pip→装torch栈→装依赖→可编辑安装→自检）
 │
 ├─ configs/                    # 只放配置，不放代码
 │  ├─ _base_/

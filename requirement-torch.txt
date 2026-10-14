@@ -1,0 +1,25 @@
+# yolo-tod —— torch 栈（单独一步安装，从 PyTorch CUDA 索引取 GPU 轮子）
+# ---------------------------------------------------------------------------
+# 为什么单独一个文件：PyPI 上的 torch / torchvision 是 CPU-only 构建。
+# GPU 版必须走 https://download.pytorch.org/whl/cuXXX。把 --extra-index-url
+# 留在 requirement.txt 里会让 pip 在两个索引间混用同名包，容易装成 CPU 版；
+# 因此这里只放 torch 栈，并在命令行上显式指定索引：
+#
+#   python -m pip install -r requirement-torch.txt --index-url https://download.pytorch.org/whl/cu128
+#
+# 换 CUDA 版本 / 换纯 CPU：
+#   cu126 : https://download.pytorch.org/whl/cu126
+#   cu129 : https://download.pytorch.org/whl/cu129
+#   cu130 : https://download.pytorch.org/whl/cu130
+#   CPU   : https://download.pytorch.org/whl/cpu   （并把 +cu128 后缀去掉，
+#           或直接写 torch / torchvision 不写本地版本号，由索引解析）
+#
+# 本机：RTX 5060 Laptop 8 GB（Blackwell, sm_120）→ 必须 cu128 及以上；
+#       conda base 实测 torch 2.11.0+cu128，torch.cuda.is_available() == True。
+# ---------------------------------------------------------------------------
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+
+# torchaudio 本仓库不使用，仅当复用其他音频代码时再打开
+# torchaudio==2.11.0+cu128

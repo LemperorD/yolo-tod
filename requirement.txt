@@ -1,0 +1,75 @@
+# yolo-tod 依赖清单（venv 版，不使用 conda）
+# ---------------------------------------------------------------------------
+# 本机实测通过的解释器版本：Python 3.13.13（另有 3.12.14 环境，同样可用）
+# 最低要求：Python 3.10（见 pyproject.toml 的 requires-python）
+# 支持的区间：3.10 ~ 3.14；torchvision 明确排除 3.14.1，其余 3.14.x 可用
+#
+# 重要：torch / torchvision 必须从 PyTorch 的 CUDA 索引装，PyPI 上的同名包是
+# CPU-only 版本。本文件刻意不写 --extra-index-url，避免 pip 跨索引混淆依赖；
+# 请分两步安装（见下方“安装”），第二步由 requirement-torch.txt 承担。
+# ---------------------------------------------------------------------------
+#
+# 安装（PowerShell，仓库根目录）：
+#   py -3.12 -m venv .venv                    # 或 py -3.14 -m venv .venv
+#   .\.venv\Scripts\Activate.ps1
+#   python -m pip install -U pip
+#   python -m pip install -r requirement-torch.txt                        # 第一步：torch 栈（CUDA 12.8）
+#   python -m pip install -r requirement.txt                              # 第二步：其余依赖
+#   python -m pip install -e . --no-deps                                  # 第三步：本仓库可编辑安装（依赖已装齐）
+#
+# 一键脚本（等价，且带 GPU 自检）：
+#   powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1
+#
+# CUDA 版本：本机 RTX 5060 Laptop（Blackwell, sm_120）需 CUDA 12.8 及以上的轮子。
+# 换机器时改 requirement-torch.txt 里的 +cu128 / 索引 URL 即可（cu126 / cu129 / cu130
+# 或纯 CPU 的 https://download.pytorch.org/whl/cpu）。
+#
+# 版本口径：下面带版本号的都是【当前实测环境里真实安装的版本】，用于精确复现；
+# 没有必要时可整体放宽（注释里给了下界，均与 ultralytics 8.4 的声明一致）。
+#
+# 参考环境（跑通全部测试：smoke 77 + modules 105 + pose 220 + mav6d 49）：
+#   Python 3.13.13 / Windows 11 / RTX 5060 Laptop
+#   torch 2.11.0+cu128, torchvision 0.26.0+cu128, torchaudio 2.11.0+cu128
+#   ultralytics 8.4.60, ultralytics-thop 2.0.20, numpy 2.4.4, scipy 1.17.1,
+#   pillow 12.2.0, opencv-python 4.13.0.92, matplotlib 3.10.9, polars 1.41.2,
+#   PyYAML 6.0.3, requests 2.33.1, psutil 7.2.2, tqdm 4.67.3
+#   （Windows 上 torch 的 CUDA 运行库打包在 torch 轮子内，没有 Linux 那种 nvidia-*-cu12 系列包）
+#
+# 网络慢可加镜像；torch 的 CUDA 轮子必须走官方索引或它的镜像（如
+# https://mirror.sjtu.edu.cn/pytorch-wheels/cu128），PyPI 镜像上没有 GPU 版。
+# ---------------------------------------------------------------------------
+
+# ---- 1) 运行时基础（仓库自有代码直接 import 的第三方包）-------------------
+numpy>=2.0,<3.0             # 实测 2.4.4；仓库数据/评测代码直接 import numpy
+pillow>=10.0                # 实测 12.2.0；data/pose6d.py、eval/pose.py、eval/scales.py
+pyyaml>=6.0                 # 实测 6.0.3；compat.py 读 ultralytics 配置
+scipy>=1.11                 # 实测 1.17.1；tools/mav6d_calibrate.py（DLT + RQ 分解）
+opencv-python>=4.6          # 实测 4.13.0.92；eval/pose.py 的 PnP 与图像读写
+
+# ---- 2) 主干框架：ultralytics（AGPL-3.0）--------------------------------
+# 本库不 fork 其源码，只注入模块命名空间（src/tod/compat.py）。
+# 实测区间 8.2 → 8.4；8.4 才自带 end2end / MuSGD / TAL 小目标先验。
+ultralytics>=8.4,<9.0
+
+# 说明：以下包由 ultralytics 自动带入，无需在此重复列出，仅备注用途 ——
+#   matplotlib（训练曲线）、requests、psutil、polars（结果表）、
+#   ultralytics-thop（FLOPs 统计，tools/measure.py 用）。
+
+# ---- 3) 开发工具（跑测试与 lint 必需）-----------------------------------
+pytest>=8.0                 # 实测环境未装；tests/ 全部为独立脚本，pytest 可选
+ruff>=0.5                   # pyproject.toml 已配好 [tool.ruff]
+
+# ---- 4) 可选：导出 / 部署 -------------------------------------------------
+# 只在需要导出 ONNX / TensorRT 时安装（tools/export_onnx.py）
+# onnx>=1.16
+# onnxruntime>=1.20
+# tensorrt>=10.0            # 依赖本机 CUDA/cuDNN，建议单独装
+# onnxslim>=0.1.82
+
+# ---- 5) 可选：实验分析 / 算子编译（对应 pyproject.toml 的 ops extra）------
+# 仓库自有代码不 import 这些；仅手工分析结果或编译 DCNv4 等算子时需要
+# pandas>=2.0
+# matplotlib>=3.8
+# seaborn>=0.13
+# tqdm>=4.66
+# ninja>=1.11

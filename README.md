@@ -21,6 +21,8 @@
   `end2end`/`MuSGD`/TAL 小目标先验，SDD-YOLO 依赖这三项）
 - 第一主战场：**VisDrone2019-DET**（航拍小目标）
 - 本机：RTX 5060 Laptop **8 GB** ／ Python 3.14.5 → 建议另建 **Python 3.12** 虚拟环境
+  （3.14 也能用：torch 2.11 有 cp314 的 cu128 轮子；唯一要避开的是 **3.14.1**，
+  因为 torchvision 明确排除了它。见 `requirement.txt` / `tools/setup_venv.ps1`）
 - 部署端：**Linux**，四个可选后端 —— TensorRT（NVIDIA / Jetson DLA）、**RKNN（RK3588 NPU）**、
   **ONNX Runtime（通用 CPU，AMD x86 主力）**、**OpenVINO（x86 CPU / Intel iGPU）**；
   见 [`docs/DEPLOY.md`](docs/DEPLOY.md)
@@ -207,11 +209,19 @@ python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
 
 ## 快速开始
 
+依赖清单与建环境脚本都在仓库里：`requirement.txt`（其余依赖）、`requirement-torch.txt`
+（torch 栈，单独走 CUDA 索引）、`tools/setup_venv.ps1`（一键建 `.venv`）。
+
 ```powershell
-# 1) 建环境（强烈建议 3.12，torch 轮子最稳）
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-pip install -e .[dev]
+# 1) 建环境。本机只有 3.14.5（torch 2.11 有 cp314 的 cu128 轮子，可直接用）
+powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1
+
+# 等价的手工三步（脚本做的就是这些）
+py -3.12 -m venv .venv                    # 若装了 3.12 建议优先；3.10~3.14 均可（3.14.1 除外）
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirement-torch.txt --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirement.txt
+python -m pip install -e . --no-deps      # 本仓库可编辑安装
 
 # 2) 架构层冒烟测试（不需要 GPU / torch）
 python tests\smoke.py
@@ -219,6 +229,15 @@ python tests\smoke.py
 # 3) 查看已登记的魔改模块总表
 python tools\catalog.py
 ```
+
+> `torch` / `torchvision` **不能**从 PyPI 装：PyPI 上是 CPU-only 构建。
+> GPU 版只在 `https://download.pytorch.org/whl/cuXXX` 上，所以清单里把它拆成单独一步，
+> 避免 pip 跨索引混用同名包而静默装成 CPU 版。RTX 5060 Laptop（Blackwell, sm_120）需 cu128 及以上。
+> 换机器只改 `requirement-torch.txt` 的 `+cu128` 与索引 URL（cu126 / cu129 / cu130 / cpu）。
+>
+> `tools/setup_venv.ps1` 刻意写成**纯 ASCII**：Windows PowerShell 5.1 会用 ANSI 代码页
+> （本机 936/GBK）解析无 BOM 的 UTF-8 脚本，中文注释会被解坏并导致语法错误。
+
 
 ## 最小示例：构造一个「P2 头 + DySample + NWD」变体
 

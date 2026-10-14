@@ -209,17 +209,17 @@ python tools\train.py --variant variants\SDD-YOLO26n\variant.yaml --dry-run
 
 ## 快速开始
 
-依赖清单与建环境脚本都在仓库里：`requirement.txt`（其余依赖）、`requirement-torch.txt`
-（torch 栈，单独走 CUDA 索引）、`tools/setup_venv.ps1`（一键建 `.venv`）。
+**完整全流程（拉取 → 建环境 → 数据 → 训练 → 测试）见 [`WORKFLOW.md`](WORKFLOW.md)**，
+下面只是最短路径。用到的文件：`requirement.txt`（必需依赖）、`tools/setup_venv.ps1`（一键建 `.venv`）。
 
 ```powershell
-# 1) 建环境。本机只有 3.14.5（torch 2.11 有 cp314 的 cu128 轮子，可直接用）
+# 1) 建环境 + 装依赖 + 自检（一键）
 powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1
 
-# 等价的手工三步（脚本做的就是这些）
-py -3.12 -m venv .venv                    # 若装了 3.12 建议优先；3.10~3.14 均可（3.14.1 除外）
+# 等价的手工步骤（脚本做的就是这些）
+python -m venv .venv                      # 3.10~3.14 均可（唯一要避开 3.14.1）
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirement-torch.txt --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128  # 按你的 CUDA 换 cuXXX
 python -m pip install -r requirement.txt
 python -m pip install -e . --no-deps      # 本仓库可编辑安装
 
@@ -230,10 +230,10 @@ python tests\smoke.py
 python tools\catalog.py
 ```
 
-> `torch` / `torchvision` **不能**从 PyPI 装：PyPI 上是 CPU-only 构建。
-> GPU 版只在 `https://download.pytorch.org/whl/cuXXX` 上，所以清单里把它拆成单独一步，
-> 避免 pip 跨索引混用同名包而静默装成 CPU 版。RTX 5060 Laptop（Blackwell, sm_120）需 cu128 及以上。
-> 换机器只改 `requirement-torch.txt` 的 `+cu128` 与索引 URL（cu126 / cu129 / cu130 / cpu）。
+> `torch` / `torchvision` **不能**从 PyPI 装：PyPI 上是 CPU-only 构建，GPU 版只在
+> `https://download.pytorch.org/whl/cuXXX` 上。所以清单里**不含 torch**，由你自己按显卡与驱动
+> 选索引（RTX 5060 这类 Blackwell 卡需 cu128 及以上；`nvidia-smi` 可看驱动支持的 CUDA 版本）。
+> 顺序也别反：**先 torch 后 `requirement.txt`**，否则 pip 会在装 `ultralytics` 时把 CPU 版 torch 盖上去。
 >
 > `tools/setup_venv.ps1` 刻意写成**纯 ASCII**：Windows PowerShell 5.1 会用 ANSI 代码页
 > （本机 936/GBK）解析无 BOM 的 UTF-8 脚本，中文注释会被解坏并导致语法错误。
@@ -295,12 +295,17 @@ variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + car
 tools/              make_variant.py / train.py / val.py / **val_pose.py** / ablation.py / catalog.py
                     / **check_pose_dataset.py**（关键点数据开训前校验）
                     / make_dummy_dataset.py（--task detect|pose --layout person|uav --kpt-shape N,D）
+                    / **train_mav6d.py + test_mav6d.py**（MAV6D 训练与全指标测试）
+                    / **setup_venv.ps1**（一键建 .venv，纯 ASCII）
                     / export_onnx.py / convert_rknn.py
+WORKFLOW.md         **全流程命令**：拉取 → 建 venv → 数据 → 训练 → 测试 → 消融 → 导出
+requirement.txt     venv 依赖清单（**不含 torch**：GPU 轮子按自己的 CUDA 版本单独装）
 docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
 docs/KEYPOINTS.md   **9 点机体关键点定义（唯一编号来源，含 flip_idx 与推断状态）**
 docs/VARIANTS.md    模块总表（由 tools/catalog.py 自动生成）
 tests/              smoke.py（无 torch 依赖，77 项）+ test_modules.py（105 项）
                     + test_pose.py（**姿态/关键点/6D 位姿/L_rep，220 项**）
+                    + **test_mav6d.py**（MAV6D 工具链，49 项；`--skip-real` 可跳过真实数据）
                     + train_smoke.py（检测回路真训练，opt-in）
                     + train_pose_smoke.py（**姿态回路真训练 + L_rep + ADD 断言，32 项**）
 ```

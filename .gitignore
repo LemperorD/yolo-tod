@@ -1,7 +1,5 @@
 # 环境
-.venv/*
-!.venv/.gitkeep
-
+.venv/
 __pycache__/
 *.py[cod]
 *.egg-info/

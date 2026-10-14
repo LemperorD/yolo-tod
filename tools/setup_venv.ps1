@@ -3,15 +3,19 @@
     Create a venv-based (NOT conda) training environment for yolo-tod.
 
 .DESCRIPTION
-    Steps: create .venv -> bootstrap pip -> install the torch stack from the PyTorch
-    CUDA index -> install requirement.txt -> editable install of this repo -> self-check.
+    Steps: create .venv -> bootstrap pip -> install torch/torchvision from a PyTorch
+    index -> install requirement.txt -> editable install of this repo -> self-check.
 
-    Why the torch stack is a separate step: the torch/torchvision wheels on PyPI are
-    CPU-only builds. GPU builds live only on https://download.pytorch.org/whl/cuXXX,
-    so installing them from their own index avoids pip mixing same-named packages
+    Why torch is a separate step: the torch/torchvision wheels on PyPI are CPU-only
+    builds. GPU builds live only on https://download.pytorch.org/whl/cuXXX, so
+    installing them from their own index avoids pip mixing same-named packages
     across indexes and silently landing on the CPU build.
 
-    RTX 5060 Laptop (Blackwell, sm_120) needs cu128 or newer.
+    Pick the index for your own CUDA via -TorchIndex (cu118/cu126/cu128/cu129/cu130
+    or .../whl/cpu). Default cu128 works for Blackwell cards such as the RTX 5060.
+
+    A local requirement-torch.txt is used to pin exact versions when present; it is
+    optional, and this repo does not ship one.
 
 .NOTES
     This file is deliberately ASCII-only. Windows PowerShell 5.1 decodes BOM-less
@@ -152,11 +156,18 @@ Ok ((& $venvPy -m pip --version 2>$null | Out-String).Trim())
 
 # ------------------------------------------------------- 3) torch stack
 Step "3/6 install torch stack from $TorchIndex"
+# torch/torchvision come from their own index (PyPI ships CPU-only builds). A local
+# requirement-torch.txt, if present, pins the versions; otherwise let pip resolve them.
 $torchReq = Join-Path $root "requirement-torch.txt"
-if (-not (Test-Path $torchReq)) { Die "missing $torchReq" }
-& $venvPy -m pip install -r $torchReq --index-url $TorchIndex
+if (Test-Path $torchReq) {
+    Ok "using $torchReq"
+    & $venvPy -m pip install -r $torchReq --index-url $TorchIndex
+} else {
+    Ok "no requirement-torch.txt; resolving the newest wheels on the index"
+    & $venvPy -m pip install torch torchvision --index-url $TorchIndex
+}
 if ($LASTEXITCODE -ne 0) {
-    Die "torch install failed. Check that the index has wheels for this Python version (requirement-torch.txt has the cu126/cu129/cu130/CPU variants)"
+    Die "torch install failed. Check that the index has wheels for this Python version. Use -TorchIndex to pick another CUDA build (cu118 / cu126 / cu128 / cu129 / cu130, or https://download.pytorch.org/whl/cpu)"
 }
 Ok "torch stack installed"
 
@@ -199,7 +210,7 @@ try {
         Ok ("GPU available: " + $cudaLines[1])
     } else {
         Warn "torch cannot see a GPU ($cudaOut). If a CPU build was installed, rerun:"
-        Warn "  $venvPy -m pip install -r requirement-torch.txt --index-url $TorchIndex"
+        Warn "  $venvPy -m pip install --force-reinstall torch torchvision --index-url $TorchIndex"
     }
 
     & $venvPy "tests\smoke.py"

@@ -233,3 +233,50 @@ def build_pose_criterion(model, ep7: dict | None = None, stal: bool | None = Non
     )
     criterion._tod_patched = report
     return criterion, report
+
+
+def build_reproj_criterion(criterion: Any, spec: dict, *,
+                           data_cfg: dict | None = None) -> Any:
+    """按变体 spec 决定是否给姿态准则加上论文的 ``L_rep``（几何重投影项）。
+
+    论文式 (6)/(8)（Keypoint-Guided, T-RO 2024）：``L_reg = L_loc + L_rep``，
+    ``L_rep`` 罚"预测 2D 关键点对应的相机射线"与"真值 3D 关键点"之间的**横向**偏差
+    （沿视线的深度误差不可从单目 2D 观测判别，故不罚）。论文消融显示它是
+    三个组件里增益最大的一个（10°10cm 提升 >10%）。
+
+    需要的量（都在**数据集配置**里，见 docs/KEYPOINTS.md §5）：
+      ``tod.camera_matrix``（3×3 内参）、``tod.object_points``（n_kpt×3 机体坐标）、
+      ``tod.reproj_warmup_epochs``（论文默认 15），以及 batch 里的 ``gt_pose``。
+
+    Args:
+        criterion: 已由 ``build_pose_criterion`` 处理过的姿态准则。
+        spec: 变体 spec（读 ``eps.EP7.reproj`` / ``reproj_weight``）。
+        data_cfg: 数据集 YAML 内容；``None`` 时回退到 ``spec["dataset_cfg"]``。
+
+    Returns:
+        原准则（未启用时）或 ``ReprojCriterion``（启用时）。
+    """
+    from tod.loss.reproj import build_reproj_loss
+
+    ep7 = ((spec.get("eps") or {}).get("EP7") or {})
+    flag = ep7.get("reproj", False)
+    enabled = not (flag is False or flag is None
+                   or str(flag).lower() in {"", "off", "none", "false"})
+    if not enabled:
+        return criterion
+    cfg = data_cfg if data_cfg is not None else (spec.get("dataset_cfg") or {})
+    tod = cfg.get("tod") or {}
+    wrapper = build_reproj_loss(
+        criterion, {"data_cfg": cfg},
+        enabled=True,
+        weight=float(ep7.get("reproj_weight", 1.0) or 1.0),
+        warmup_epochs=int(tod.get("reproj_warmup_epochs",
+                                  ep7.get("reproj_warmup_epochs", 15)) or 0),
+    )
+    base_report = list(getattr(criterion, "_tod_patched", []))
+    wrapper._tod_patched = base_report + [
+        f"reproj: L_rep 已启用（论文式 (8)，权重 {wrapper.weight}，"
+        f"前 {wrapper.warmup_epochs} epoch 只用 2D 项；"
+        f"{wrapper.reproj.n_kpt}/{len(tod.get('object_points') or [])} 个关键点参与）"
+    ]
+    return wrapper

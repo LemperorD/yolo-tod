@@ -83,6 +83,11 @@ class Variant:
     data_cfg: dict[str, Any] = field(default_factory=dict)
     train_cfg: dict[str, Any] = field(default_factory=dict)
     model_cfg: dict[str, Any] = field(default_factory=dict)
+    #: 数据集 YAML 的内容快照（由 ``tools/train.py`` 在开训前填入）。
+    #: 为什么让 spec 携带它：EP7 的几何重投影损失 ``L_rep`` 需要
+    #: ``tod.camera_matrix`` / ``tod.object_points`` 这些**数据集侧**的量，
+    #: 训练器只有 spec 一个上下文入口；不填也不影响其它 EP（用到才读）。
+    dataset_cfg: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     notes: str = ""
 

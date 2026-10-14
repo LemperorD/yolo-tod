@@ -22,10 +22,12 @@ MuSGD、蒸馏、resume 兜底）与 ``TODDetectionTrainer`` 完全一致 ——
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from tod import runtime
 from tod.engine.distill import build_kd
 from tod.engine.trainer import TODDetectionTrainer, _has_prog_loss, stal_flag
-from tod.loss.criterion import build_pose_criterion
+from tod.loss.criterion import build_pose_criterion, build_reproj_criterion
 
 try:  # pragma: no cover - 环境相关
     from ultralytics.models.yolo.pose import PoseTrainer as _PoseTrainer
@@ -56,6 +58,54 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
     ``overrides["task"] = "pose"`` 并正确传递 ``DEFAULT_CFG``。
     """
 
+    # ---------------------------------------------------------------- 数据
+    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0,
+                       mode: str = "train"):
+        """训练/验证 dataloader：启用 ``L_rep`` 时把数据集换成带 **6D 位姿**的版本。
+
+        为什么必须在这里替换：``L_rep``（论文式 8）需要逐目标的 ``R, t``，而框架标准的
+        ``YOLODataset`` 只产出框 + 关键点。本库不改框架，而是在 ``build_dataset``
+        外面把 ``ultralytics.data.dataset.YOLODataset`` 临时换成子类（子类在
+        ``__getitem__`` 里附加 ``gt_pose`` / ``gt_pose_mask``，由框架的 ``collate_fn``
+        自动收集进 batch）。这样：
+          * 不改框架源码，也不复制它的 dataset 实现；
+          * 只有真的启用 ``L_rep`` 时才生效（关掉时行为与纯姿态训练**完全一致**）；
+          * 校验失败会**直接报错**，不会静默退化成"没有几何监督"。
+        """
+        if not self._needs_pose6d():
+            return super().get_dataloader(dataset_path, batch_size, rank, mode)
+
+        from tod.data.pose6d import pose6d_dataset
+        from tod import compat
+
+        data = self.data or {}
+        pose_dir = (data.get("tod") or {}).get("pose_labels")
+        if not pose_dir:
+            raise compat.CompatError(
+                "EP7.reproj 已开启，但数据集配置里没有 tod.pose_labels（labels_6d 目录名）。\n"
+                "请按 docs/KEYPOINTS.md §5.2 提供逐目标 6D 位姿，或把 EP7.reproj 关掉。"
+            )
+        root = Path(str(data.get("path") or "."))
+        if not root.is_absolute():
+            root = (Path(self.args.data).parent / root).resolve()
+        dataset_cls = pose6d_dataset(root / str(pose_dir), mode)
+
+        import ultralytics.data.dataset as ds_module
+
+        original = ds_module.YOLODataset
+        ds_module.YOLODataset = dataset_cls
+        try:
+            return super().get_dataloader(dataset_path, batch_size, rank, mode)
+        finally:
+            ds_module.YOLODataset = original
+
+    def _needs_pose6d(self) -> bool:
+        """当前变体是否真的需要 6D 位姿（即 ``L_rep`` 已启用）。"""
+        ep7 = ((runtime.active().get("eps") or {}).get("EP7") or {})
+        flag = ep7.get("reproj", False)
+        return not (flag is False or flag is None
+                    or str(flag).lower() in {"", "off", "none", "false"})
+
     # ---------------------------------------------------------------- 准则
     def _install_criterion(self):
         """按变体 spec 重建姿态准则（EP6 分配 + EP7 框/关键点损失 + EP9 蒸馏）。"""
@@ -73,6 +123,9 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
         criterion, report = build_pose_criterion(
             model, ep7=ep7, stal=stal_flag(ep6), use_dfl=use_dfl,
         )
+        # EP7 的几何重投影项 L_rep（论文式 6/8）：需要数据集侧的相机内参与机体 3D 关键点
+        criterion = build_reproj_criterion(criterion, spec)
+        report = list(getattr(criterion, "_tod_patched", report))
 
         distill = ep9.get("distill")
         teacher = ep9.get("teacher")
@@ -94,6 +147,10 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
         print(f"[EP7] 关键点分支：kpt_shape={getattr(head, 'kpt_shape', '?')}、"
               f"增益 pose={getattr(self.args, 'pose', '?')} / kobj={getattr(self.args, 'kobj', '?')}"
               f" | dfl 增益={dfl_gain}")
+        if hasattr(criterion, "active"):        # ReprojCriterion：报告 L_rep 的 warm-up 状态
+            print(f"[EP7] 几何重投影 L_rep：权重={criterion.weight}、"
+                  f"warm-up={criterion.warmup_epochs} epoch、当前 epoch={criterion.epoch}、"
+                  f"本期{'生效' if criterion.active else '未生效（warm-up 中）'}")
         print(f"[EP4/EP5] 已生效 EP：{sorted(k for k, v in eps.items() if v)}"
               f" | ProgLoss={'框架原生 E2ELoss.update' if _has_prog_loss(criterion) else '不适用'}")
 

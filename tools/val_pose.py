@@ -65,8 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--match-iou", type=float, default=0.5,
                     help="预测与 GT 的**匹配**框 IoU 阈值（与 OKS 无关，见模块说明）")
     ap.add_argument("--sigma-strategy", default="auto",
-                    choices=("person", "framework", "auto", "balanced"),
-                    help="第二套 sigma 口径；一般填与 EP7 训练时一致的策略")
+                    choices=("uniform", "auto", "person", "framework", "balanced"),
+                    help="第二套 sigma 口径；一般填与 EP7 训练时一致的策略"
+                         "（9 点机体关键点默认 uniform）")
     ap.add_argument("--device", default=None)
     ap.add_argument("--max-det", type=int, default=300)
     ap.add_argument("--max-images", type=int, default=None, help="只评测前 N 张（冒烟用）")

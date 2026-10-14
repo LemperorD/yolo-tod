@@ -5,13 +5,14 @@
 
 **当前状态：M0 骨架已完成（`tests/smoke.py` 77 项全绿，`tests/test_modules.py` 105 项全绿）；
 两个论文级变体已实现 —— SPAE-YOLOv8n 与 SDD-YOLO26n（结构自检全通）；
-**姿态式关键点检测（pose）已打通完整回路**（`tests/test_pose.py` 195 项全绿 +
-`tests/train_pose_smoke.py` 合成关键点数据真训练 23 项），已有两个姿态变体：
-`spae-yolov8n-pose`（**SPAE 加 9 点机体关键点，面向 RflySim 仿真数据**）与
+**姿态式关键点检测（pose）已打通完整回路**（`tests/test_pose.py` 220 项全绿 +
+`tests/train_pose_smoke.py` 合成关键点数据真训练 32 项），已有两个姿态变体：
+`spae-yolov8n-pose`（**SPAE + 论文口径的 9 点机体关键点 + 3D 几何损失 L_rep**，
+面向 RflySim 仿真数据；预印本已存 `docs/`）与
 `visdrone-yolo26n-pose-p2-p16`（航拍行人 17 点，**数据集标注待准备**）；
 训练回路已用**合成数据**端到端跑通（`tests/train_smoke.py`：训练/验证/EMA/存权重/载权重/推理），
 并补齐了**尺度分层评测**（`tools/val.py`：整体 AP + AP_small/AP_tiny）、
-**姿态 OKS 分层评测**（`tools/val_pose.py`）、**关键点数据开训前校验**（`tools/check_pose_dataset.py`）与
+**姿态 OKS + ADD 分层评测**（`tools/val_pose.py`）、**关键点数据开训前校验**（`tools/check_pose_dataset.py`）与
 **消融流水线**（`tools/ablation.py`：leave-one-out + 逐字段 diff + 汇总表）。
 真实数据集上的精度数字待 M1。推理端（C++/TensorRT）工厂化骨架已落地：
 `src/todrt/`，CPU 自检 107 项全绿。**
@@ -26,10 +27,19 @@
 
 ## 已实现的变体
 
-### spae-yolov8n-pose —— SPAE **加关键点**（RflySim 仿真训练）
+### spae-yolov8n-pose —— SPAE **加关键点**（按预印本口径，RflySim 仿真训练）
 
 在 **既有 SPAE-YOLOv8n 上新增一条关键点输出支路**：四个 SPAE 组件全部保留，
 检测头换成姿态头，用于"检测框 + 9 点机体关键点"的多任务模型。
+预印本（IEEE T-RO 2024，*Keypoint-Guided Efficient Pose Estimation and Domain
+Adaptation for Micro Aerial Vehicles*）**已存于 `docs/`**，本变体按它落地了三件事：
+
+| 预印本内容 | 原文依据 | 本库落点 |
+|---|---|---|
+| **点结构**：1 个质心点 p0 + 8 个角点 p1~p8 | §III-A-1："one centroid point (numbered p0) and eight corner points (numbered p1 ∼ p8)" | `docs/KEYPOINTS.md`、数据集 `kpt_names`/`flip_idx` |
+| **3D 几何损失 `L_rep`**（只罚垂直于相机射线的横向偏差） | 式 (6)/(8)；消融显示 **10°10cm 提升 >10%**，是三个组件里增益最大的 | `src/tod/loss/reproj.py`（新增） |
+| **训练策略**：前 15 epoch 只用 2D 项，之后加入 `L_rep` | §IV-A-2 原文 | `tod.reproj_warmup_epochs: 15` |
+| **指标**：ADD / ADD(0.5d)（阈值 = 0.5×机型直径） | 式 (13) | `tod/eval/pose.py::add_metric`、`tools/val_pose.py` |
 
 | SPAE 组件 | 在姿态头上的落点（实测） |
 |---|---|
@@ -42,19 +52,21 @@
 python tools\make_variant.py variants\spae-yolov8n-pose\recipe.py
 python tools\train.py --variant variants\spae-yolov8n-pose\variant.yaml --dry-run
 python tools\check_pose_dataset.py --data configs\_base_\datasets\rflysim-pose.yaml   # 开训前校验
-python tests\train_pose_smoke.py --layout uav        # 合成 9 点数据跑通回路
+python tests\train_pose_smoke.py --layout uav --warmup 0   # 合成数据端到端（含 L_rep 与 ADD）
 ```
 
-> ⚠️ 三条必须知道的边界：
-> ① 这是**新组合，不是论文复现** —— SPAE 论文只出框（没有关键点），而 9 点定义来自
-> *Keypoint-Guided Efficient Pose Estimation and Domain Adaptation for MAVs*（IEEE T-RO 2024）；
-> 本库用的是 **YOLO 姿态头 + OKS 损失**，**没有**采用该论文的自定义质心引导定位网络与
-> 域适应方法，结构不等价，**不能宣称复现其精度**。
-> ② **9 个关键点的顺序是推断**（论文付费墙 + 作者仓库只有 README），定义在
-> [`docs/KEYPOINTS.md`](docs/KEYPOINTS.md)，状态 `inferred`；校正只改数据集 YAML 的
-> `kpt_names` / `flip_idx` 两行，**无需改代码**。
-> ③ 数据集是 **RflySim 仿真**，与 SPAE 论文的 Det-Fly 真实空对空不同域；
-> 仿真数字不能直接当真实场景指标。
+> ⚠️ 四条必须知道的边界：
+> ① **不是论文复现**：论文用 **CPKL-Net**（1×1 卷积 + EfficientRep + Rep-PAN + MFMF +
+> 网格三分支回归），本库用 **YOLOv8 Pose 头**承载关键点；2D 损失用 OKS 而非论文的像素 MSE。
+> **结构不等价，不能宣称复现其精度。**
+> ② **p1~p8 的逐一编号语义仍是推断**（论文 Fig. 2(a) 是图片，PDF 文本层给不出）——
+> 结构与质心/角点之分是论文明确，编号顺序按"前后×左右×上下"推定，状态
+> `paper-structured`；校正只改数据集 YAML 两行。
+> ③ **`tod.object_points` 与 `tod.camera_matrix` 必须换成你机型的真实几何**：
+> 论文**没有**给出这两张表（正文只有式 (12) 的记号），配置里是占位值。
+> ④ 数据集是 **RflySim 仿真**（论文是真实 MAV6D），域差异显著；
+> 本库的 **ADD 用真值深度、不含 PnP**，与论文含 PnP 的 ADD **不可直接比较**；
+> 域适应与 10°10cm 指标**未实现**。
 
 #### 关键点分支为什么默认"不压缩"
 
@@ -95,6 +107,39 @@ python tools\val_pose.py --weights results\...\best.pt `
 > `val_pose.py` 分层口径的原因；② 框架 OKS 项在 tiny 目标上会**饱和**（`1−exp(−e)`，e 随 1/area
 > 爆炸），本库的 σ 下限与 `balanced` 策略就是为这个现象准备的可消融开关；
 > ③ 本变体**不是** FlyPose（WACV 2026）的复现，只是问题设定重叠。
+
+### MAV6D —— 真实数据的小目标检测 + 9 点关键点（训练/测试脚本）
+
+把**作者原始 MAV6D 数据集**（`D:/MAV6D`，IEEE T-RO 2024 的公开数据）直接接进
+上面的 `spae-yolov8n-pose` 变体。三件套：
+
+| 脚本 | 作用 |
+|---|---|
+| `tools/mav6d_calibrate.py` | 从数据反解**相机内参与机体 3D 关键点**；`--check-util` 用作者公开标定核对投影链（实测 **0.0004 px / 300 帧**逐值吻合） |
+| `tools/mav6d_to_yolo.py` | 转成 YOLO-pose（检测 + 9 点）+ `labels_6d` 6D 位姿 + `dataset.yaml`（含全部 `tod.*`） |
+| `tools/train_mav6d.py` / `tools/test_mav6d.py` | 训练与测试（测试报**论文全部指标**：ADD / ADD(0.5d) / 10°10cm + OKS 分层 + 框 AP 分层） |
+
+```powershell
+python tools\mav6d_calibrate.py --mav6d D:\MAV6D --model phantom4 --check-util   # 核对投影链
+python tools\mav6d_to_yolo.py --mav6d D:\MAV6D --model phantom4 --out data\mav6d  # 转换
+python tools\check_pose_dataset.py --data data\mav6d\phantom4\dataset.yaml       # 开训前校验
+python tools\train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280  # 训练
+python tools\test_mav6d.py --model phantom4       # 测试（--model both 两机型一起报）
+```
+
+**本库从数据里实证核对过的四件事**（都写进了代码注释，别改）：
+
+1. `labels_yolo6d` 是 **21 列** = `cls` + 9 个点 ×2 + **(w,h)**。9 点 = 1 个 3D 框中心 +
+   8 个角点（与作者 `util.py` 的 `corners` 及论文 p0~p8 一致）。作者自己的
+   `unzip_tools.py` 报告里写成"10 个归一化点"**是错的**（本库用作者投影链逐值反解确认）。
+2. 归一化基准固定 **1920×1080**（转换时按各图实际尺寸重新归一化）。
+3. `labels` 每行 **16 个数**，只有**相机位姿**（`[9:12]` + `[12:16]`）可靠；目标位姿块是
+   `[1:4]`（平移）+ `[4:8]`（四元数），而 `[0]`/`[8]` 是纳秒时间戳 —— 偏移写错会差 670–1900 px。
+4. **标注含镜头畸变**（作者用了 5 个畸变系数，画幅边缘达几十像素）→ 转换时把 2D 关键点
+   **去畸变**，让标签与 `L_rep` 的针孔几何自洽。
+
+已转换工作量（可复算）：`phantom4` **11 674 帧**（10 622 训练 / 1 052 验证，按**序列**切分），
+**全部带有效 6D 位姿**；框长边归一化 0.099–0.273（1920 px 下约 190–520 px）。
 
 ### SPAE-YOLOv8n —— 空对空微小型无人机检测（Sensors 2026）
 
@@ -208,9 +253,11 @@ src/tod/            训练侧（Python）
 ├─ assigner/stal.py  STAL 小目标感知分配（EP6，可消融开关）
 ├─ optim/musgd.py    MuSGD（EP9，Muon 式 NS 正交化 + SGD 分量）
 ├─ loss/box.py + criterion.py  SIoU / Wise-IoU v3 与训练准则接入（EP7）
-├─ loss/pose.py      **TinyPoseLoss**：OKS 关键点损失（EP7，sigma 策略 person/auto/balanced/uniform + σ 下限 + 可见性开关）
+├─ loss/pose.py      **TinyPoseLoss**：OKS 关键点损失（EP7，sigma 策略 person/uniform/auto/balanced + σ 下限 + 可见性开关）
+├─ loss/reproj.py    **L_rep 几何重投影损失**（EP7，论文式 6/8/9：只罚垂直于相机射线的横向偏差 + warm-up 调度）
+├─ data/pose6d.py    6D 位姿旁挂数据（EP0，labels_6d CSV → batch 的 gt_pose / gt_image_size）
 ├─ eval/scales.py    尺度分层评测（整体 AP + AP_small/AP_tiny，COCO 式 101 点插值）
-├─ eval/pose.py      **姿态 OKS 评测**（EP8：OKS-AP 50:95 + 按目标/关键点尺度分层）
+├─ eval/pose.py      **姿态 OKS + ADD 评测**（EP8：OKS-AP 50:95 + 按目标/关键点尺度分层 + 论文 ADD(0.5d)）
 └─ engine/           trainer.py + **pose_trainer.py**（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
                     / distill.py（EP9 特征对齐蒸馏）
 
@@ -234,9 +281,9 @@ docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）
 docs/KEYPOINTS.md   **9 点机体关键点定义（唯一编号来源，含 flip_idx 与推断状态）**
 docs/VARIANTS.md    模块总表（由 tools/catalog.py 自动生成）
 tests/              smoke.py（无 torch 依赖，77 项）+ test_modules.py（105 项）
-                    + test_pose.py（**姿态/关键点模块与口径，195 项**）
+                    + test_pose.py（**姿态/关键点/6D 位姿/L_rep，220 项**）
                     + train_smoke.py（检测回路真训练，opt-in）
-                    + train_pose_smoke.py（**姿态回路真训练 + OKS 分层断言，23 项**）
+                    + train_pose_smoke.py（**姿态回路真训练 + L_rep + ADD 断言，32 项**）
 ```
 
 ## 评测与消融（可归因对比）

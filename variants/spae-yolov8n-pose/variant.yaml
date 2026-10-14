@@ -6,29 +6,36 @@ status: planned
 dataset: rflysim-pose
 tags: [self-designed, keypoint, pose, small-object, uav, air-to-air, spae, p2-head,
   adown, rflysim, sim2real]
-notes: '= SPAE-YOLOv8n（SIoU + P2 浅层 + ADown + Efficient_UAVDet）+ 9 点机体关键点。
+notes: '= SPAE-YOLOv8n（SIoU + P2 浅层 + ADown + Efficient_UAVDet）+ 论文口径的 9 点机体关键点。
 
 
-  ⚠️ 这不是 SPAE 论文的复现（该论文只出框，没有关键点），也不能宣称复现了 Keypoint-Guided（T-RO 2024）的精度：本库用的是 YOLO
-  姿态头 + OKS 损失，而后者用的是自定义的质心引导关键点定位网络，结构不等价。
+  按 Keypoint-Guided（T-RO 2024，预印本存于 docs/）落地三件事：① 点结构 = 1 个质心点 p0 + 8 个角点 p1~p8（§III-A-1
+  原文）；② 3D 几何损失 L_rep（式 6/8）——只罚垂直于相机射线的横向偏差，论文消融里增益最大（10°10cm 提升 >10%）；③ 训练策略：前 15
+  epoch 只用 2D 项，之后加入 L_rep（§IV-A-2）。
 
 
-  ⚠️ 9 个关键点的**顺序是推断**（论文付费墙 + 作者仓库只有 README），定义在 docs/KEYPOINTS.md，状态 tod.kpt_definition_status=inferred；校正只需改数据集
-  YAML 的 kpt_names / flip_idx 两行，无需改代码。
+  本库对论文唯一一处**明确修正**：式 (8) 的文字把 v_i 说成「预测的关键点」，照字面取 v=预测像素坐标会得到与预测无关、梯度恒 0 的量；本库按几何唯一说得通的读法取「穿过预测点的相机射线方向」，详见
+  paper-notes §3.2。
 
 
-  ⚠️ 数据集是 RflySim **仿真**录制（域：simulation），与 SPAE 论文的 Det-Fly 真实空对空数据不同域；仿真数字不能直接当真实场景指标
-  （Keypoint-Guided 论文专门做无监督域适应正是因为这个 gap）。
+  ⚠️ 这不是论文复现：论文用 CPKL-Net（EfficientRep + Rep-PAN + MFMF + 网格三分支），本库用 YOLOv8 Pose 头承载关键点；2D
+  损失用 OKS 而非论文的像素 MSE。不能宣称复现其精度。
+
+  ⚠️ 数据集是 RflySim **仿真**（论文是真实 MAV6D），域差异显著。
+
+  ⚠️ p1~p8 的逐一编号语义在 Fig. 2(a)（图片）里，按「前后×左右×上下」推定，状态见 docs/KEYPOINTS.md；校正只改数据集 YAML
+  两行。
+
+  ⚠️ tod.object_points 与 tod.camera_matrix 必须换成你机型的真实几何（论文没给这两张表，配置里是占位值）。
 
 
-  关键点分支的压缩策略：**不压缩**（保持原生两层 3×3）。原因是论文的 g=x/16 只针对检测头，且关键点分支的中间通道 c4=max(ch[0]//4,
-  nk)=max(8,27)=27 不被 16 的约数整除，强行分组会退化成 g=1 的**静默失效**（本库已把这种情况改成报错）。要压请显式给 EP5.keypoint_per_group（例如
-  9 → g=3）。
+  关键点分支的压缩策略：**不压缩**（论文的 g=x/16 只针对检测头，且 c4=max(ch[0]//4, nk)=27 与输入 32 的公约数为 1，强行分组只会静默退化成
+  g=1）。
 
 
-  消融列（都只需改配置）：① EP7.pose=False（退回框架原生 KeypointLoss）；② EP7.sigma_strategy=auto/uniform/balanced；③
-  EP5.keypoint_branches=False；④ 去掉 P2（v.without(''add_p2'')）看框与关键点各自的代价；⑤ EP7.box=ciou
-  对照 SIoU 的贡献。'
+  消融列（都只需改配置）：① EP7.reproj=False / reproj_weight=0（复现论文 baseline 列）；② tod.reproj_warmup_epochs=0（关
+  warm-up）；③ EP7.pose=False（退回框架 KeypointLoss）；④ EP7.sigma_strategy=auto/balanced；⑤
+  EP5.keypoint_per_group；⑥ v.without(''add_p2'') 看 P2 对框与关键点各自的代价。'
 eps:
   EP1:
     downsample: ADown
@@ -40,7 +47,8 @@ eps:
     levels: [2, 3, 4, 5]
     keypoint_branches: true
     keypoint_per_group: null
-  EP7: {box: siou, theta: 4.0, pose: oks, sigma_strategy: uniform, min_sigma: 0.001}
+  EP7: {box: siou, theta: 4.0, pose: oks, sigma_strategy: uniform, min_sigma: 0.001,
+    reproj: true, reproj_weight: 1.0}
 data: {imgsz: 640}
 model:
   nc: 1

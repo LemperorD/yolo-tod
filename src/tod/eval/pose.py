@@ -277,6 +277,24 @@ def evaluate_pose(
         sigmas = list(custom)                 # 非 17 点没有 COCO 标准值，两套口径合一
         custom_note += "（非 17 点：COCO 口径不可用，两套指标相同）"
 
+    # ---- 论文的 ADD / ADD(0.5d) 所需：6D 位姿 + 相机内参 + 机体 3D 点（有则算）----
+    tod = data_cfg.get("tod") or {}
+    K = tod.get("camera_matrix")
+    obj_pts = tod.get("object_points")
+    diameter = tod.get("model_diameter")
+    pose_table: dict[str, list[list[float]]] = {}
+    if K and obj_pts and tod.get("pose_labels"):
+        from tod.data.pose6d import Pose6DError, load_pose_csv
+
+        pose_csv = Path(str(data_cfg.get("path") or ".")) / str(tod["pose_labels"]) / f"{split}.csv"
+        if pose_csv.is_file():
+            try:
+                pose_table = load_pose_csv(pose_csv)
+            except Pose6DError as exc:
+                print(f"[pose-eval] 警告：6D 位姿不可用，跳过 ADD（{exc}）")
+        else:
+            print(f"[pose-eval] 提示：{pose_csv} 不存在，跳过 ADD 指标。")
+
     collected: list[dict[str, Any]] = []
     for image in images:
         with Image.open(image) as im:
@@ -287,7 +305,8 @@ def evaluate_pose(
             box = gbox[4 * i:4 * i + 4]
             side = math.sqrt(max(0.0, (box[2] - box[0]) * (box[3] - box[1])))
             gts.append({"cls": cls, "box": box, "side": side, "kpts": gkpt[i]})
-        collected.append({"image": image, "gts": gts, "preds": list(predictor(image))})
+        collected.append({"image": image, "gts": gts, "preds": list(predictor(image)),
+                          "poses": pose_table.get(image.stem, [])})
 
     # ---- 主循环：整体 + 各尺度层，两套 sigma 口径 ----
     bins_std: dict[str, dict[str, float]] = {}
@@ -341,9 +360,60 @@ def evaluate_pose(
             "note": "OKS-AP 用框 IoU 匹配（非 COCO 的 OKS 匹配），与 COCO keypoints AP 不可直接比较",
         },
     }
+    # ---- 论文的 ADD / ADD(0.5d)（有 6D 位姿时才算）----
+    add_stats: dict[str, Any] = {"available": False}
+    if pose_table and K and obj_pts:
+        add_stats = _add_stats(collected, K, obj_pts, diameter)
+        out["add"] = add_stats
     if verbose:
         print(format_pose_table(out))
     return out
+
+
+def _add_stats(collected: list[dict], K, obj_pts, diameter) -> dict[str, Any]:
+    """逐图算论文式 (13) 的 ADD（用真值深度，见 ``add_metric`` 的口径说明）。"""
+    values: list[float] = []
+    per_bin: dict[str, list[float]] = {}
+    n_skip = 0
+    bins = dataset_bins({"tod": {}})                     # 默认分层（与其它表一致）
+    for item in collected:
+        poses = item.get("poses") or []
+        gts = item["gts"]
+        for cls, _conf, gt_index, pred_index in match_pose_image(item["preds"], gts, 0.5):
+            if gt_index < 0:
+                continue
+            if gt_index >= len(poses):
+                n_skip += 1
+                continue
+            pred = item["preds"][pred_index]
+            if len(pred) < 4 or not pred[3]:
+                continue
+            depths = gt_depths(poses[gt_index], obj_pts, K)
+            value = add_metric(pred[3], gts[gt_index]["kpts"], depths, K)
+            if math.isnan(value):
+                continue
+            values.append(value)
+            side = gts[gt_index]["side"]
+            for b in bins:
+                if b.contains(side):
+                    per_bin.setdefault(b.name, []).append(value)
+                    break
+    mean_add = sum(values) / len(values) if values else float("nan")
+    threshold = (ADD_THRESHOLD_RATIO * float(diameter)) if diameter else float("nan")
+    ratio_correct = (sum(1 for v in values if v < threshold) / len(values)
+                     if values and diameter else float("nan"))
+    return {
+        "available": bool(values),
+        "n": len(values),
+        "n_skipped_no_pose": n_skip,
+        "add_m": mean_add,
+        "add_median_m": sorted(values)[len(values) // 2] if values else float("nan"),
+        "threshold_m": threshold,
+        "add_0.5d_ratio": ratio_correct,
+        "by_bin": {k: sum(v) / len(v) for k, v in per_bin.items()},
+        "note": "本库的 ADD 用真值深度（未做 PnP），是「关键点层面」的 3D 误差，"
+                "与论文含 PnP 的 ADD 不可直接比较",
+    }
 
 
 def _accumulate(collected: list[dict], bin_spec: Bin, sigmas: Sequence[float],
@@ -444,6 +514,29 @@ def format_pose_table(result: dict) -> str:
         "提示：小目标关键点必须看 lt8 / 8-16 两层与「关键点尺度诊断」——"
         "整体 OKS-AP 涨而小目标层掉，是 OKS 分母面积小导致的典型假象。",
     ]
+    add = result.get("add")
+    if add is not None:
+        if add.get("available"):
+            lines += [
+                "",
+                "论文指标（Keypoint-Guided, T-RO 2024 §IV-A-3）：",
+                f"  ADD = {_fmt(add['add_m'])} m（中位数 {_fmt(add['add_median_m'])} m，"
+                f"{add['n']} 个匹配目标）",
+                f"  ADD(0.5d) 命中率 = {_fmt(add['add_0.5d_ratio'])}"
+                f"（阈值 {_fmt(add['threshold_m'])} m = 0.5 × 机型直径）",
+                f"  {add['note']}",
+            ]
+            if add.get("by_bin"):
+                per = "  ".join(f"{k}={v:.4f}" for k, v in sorted(add["by_bin"].items()))
+                lines.append(f"  按尺度层：{per}")
+        else:
+            skipped = add.get("n_skipped_no_pose", 0)
+            lines += [
+                "",
+                "论文指标 ADD：本次**没有可用的匹配对**"
+                f"（6D 位姿缺失跳过 {skipped} 个）。"
+                "常见原因：模型还没检出任何目标（早期 epoch 正常），或 conf 阈值过高。",
+            ]
     return "\n".join(lines)
 
 
@@ -451,11 +544,247 @@ def _fmt(value: float) -> str:
     return "nan" if value is None or math.isnan(value) else f"{value:.4f}"
 
 
+# ------------------------------------------------------------------ 论文指标（ADD）
+
+#: 论文（Keypoint-Guided, T-RO 2024 §IV-A-3）的 ADD 判据：ADD < 50% × 机型直径。
+ADD_THRESHOLD_RATIO = 0.5
+
+
+def add_metric(pred_kpts_px: Sequence[Sequence[float]],
+               gt_kpts_px: Sequence[Sequence[float]],
+               depth_m: float,
+               K: Sequence[Sequence[float]]) -> float:
+    """按论文式 (13) 的口径算 **ADD**（米）：真值 3D 关键点与预测 3D 关键点的平均距离。
+
+    论文的 ADD 需要先把预测的 2D 关键点做 PnP 估出位姿 ``R̃, t̃``，再算
+    ``mean_p ‖(R p + t) − (R̃ p + t̃)‖``。**本库不做 PnP**，改用等价而更直接的做法：
+
+    每个关键点在相机系下的位置是 ``p_c = p_o + d·u``（``u`` 是相机射线方向，
+    ``d`` 是该点的深度）。因此同一个关键点的"真值 vs 预测"之差**与深度无关**：
+
+        ‖p_c^gt − p_c^pred‖ = d · ‖u^gt − u^pred‖
+
+    于是 ``ADD = mean_i[ d_i · ‖u_i^gt − u_i^pred‖ ]``。
+    其中 ``d_i`` 用**真值深度**（由 6D 位姿与机体 3D 点算出）—— 这也是它相对纯像素
+    误差的价值所在：**同样的像素误差，远处的目标 ADD 更大**，正好符合"深度越大、
+    同一像素对应的物理偏差越大"的直觉。
+
+    ⚠️ **口径差异（引用前必读）**：论文的 ADD 含"PnP 估计位姿"这一步，本函数没有。
+    所以本库的 ADD 是"关键点层面的 3D 误差"，**不是**位姿层面的 ADD，两者不可直接比较。
+    变体卡片与论文数字对比时必须写清这一点。
+
+    Args:
+        pred_kpts_px: ``(n_kpt, 2)`` 预测关键点像素坐标。
+        gt_kpts_px: ``(n_kpt, 2)`` 真值关键点像素坐标。
+        depth_m: 各关键点的真值深度（米）；标量或长度 ``n_kpt`` 的序列。
+        K: 3×3 相机内参。
+
+    Returns:
+        ADD（米）；无有效点时返回 ``nan``。
+    """
+    fx, fy = float(K[0][0]), float(K[1][1])
+    cx, cy = float(K[0][2]), float(K[1][2])
+    if not fx or not fy:
+        return float("nan")
+    depths = ([float(depth_m)] * len(pred_kpts_px) if isinstance(depth_m, (int, float))
+              else [float(d) for d in depth_m])
+    total, n = 0.0, 0
+    for i, (pp, gp) in enumerate(zip(pred_kpts_px, gt_kpts_px)):
+        xu, yu = (pp[0] - cx) / fx, (pp[1] - cy) / fy
+        xv, yv = (gp[0] - cx) / fx, (gp[1] - cy) / fy
+        d = depths[i] if i < len(depths) else depths[-1]
+        total += d * math.sqrt((xu - xv) ** 2 + (yu - yv) ** 2)
+        n += 1
+    return total / n if n else float("nan")
+
+
+def gt_depths(pose_row: Sequence[float], object_points: Sequence[Sequence[float]],
+              K: Sequence[Sequence[float]]) -> list[float]:
+    """由一帧 6D 位姿 ``(tx,ty,tz,qx,qy,qz,qw)`` 与机体 3D 点算出各关键点的**相机系深度**。
+
+    这是 ``add_metric`` 需要的 ``d_i``（也是论文式 (8) 里 ``p_i^c`` 的 z 分量）。
+    """
+    if len(pose_row) < 7:
+        raise ValueError(f"位姿需要 7 个数 (t + 四元数)，收到 {len(pose_row)}")
+    R = _quat_to_rot(list(pose_row[3:7]))
+    t = list(pose_row[:3])
+    out = []
+    for p in object_points:
+        cam = [sum(R[i][j] * p[j] for j in range(3)) + t[i] for i in range(3)]
+        out.append(float(cam[2]))
+    return out
+
+
+def _quat_to_rot(q: Sequence[float]) -> list[list[float]]:
+    """四元数 ``(qx,qy,qz,qw)`` → 3×3 旋转（与 tod/data/pose6d.py 同式）。"""
+    x, y, z, w = (float(v) for v in q)
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
 def evaluate_pose_ap(*args: Any, **kwargs: Any) -> dict:
     """``evaluate_pose`` 的稳定别名（工具脚本与测试都用这个入口名）。"""
     return evaluate_pose(*args, **kwargs)
 
 
-__all__ = ["KPX_HIT_PX", "default_pose_predictor", "evaluate_pose", "evaluate_pose_ap",
-           "extract_pose_preds", "format_pose_table", "keypoint_predictor",
-           "load_pose_labels", "match_pose_image", "oks"]
+# ------------------------------------------------------ 论文的位姿层面指标（PnP）
+
+#: 10°10cm 判据（论文式 14/15）：旋转误差 < 10° 且平移误差 < 10 cm。
+ROT_THRESHOLD_DEG = 10.0
+TRANS_THRESHOLD_M = 0.10
+
+
+def _numpy():
+    """延迟导入 numpy。
+
+    为什么不在模块顶部导入：本模块的 OKS/ADD/10°10cm 核心计算是纯 Python，
+    只有 PnP 需要 numpy+cv2。让"没装 numpy 也能评测 OKS"成为可能
+    （`tests/test_pose.py` 里的纯数值断言就靠这个）。
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("PnP 需要 numpy：pip install numpy") from exc
+    return np
+
+
+def rotation_error_deg(R_pred: Sequence[Sequence[float]],
+                       R_gt: Sequence[Sequence[float]]) -> float:
+    """论文式 (14)：``arccos((trace(R̃·Rᵀ) − 1)/2)``（返回**度**）。
+
+    数值保护：``trace`` 会因浮点误差略微越界，直接 ``acos`` 会得到 nan。
+    """
+    a = [[float(v) for v in row] for row in R_pred]
+    b = [[float(v) for v in row] for row in R_gt]
+    tr = 0.0
+    for i in range(3):
+        for k in range(3):
+            tr += a[i][k] * b[i][k]          # trace(A·Bᵀ)
+    cos_t = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
+    return math.degrees(math.acos(cos_t))
+
+
+def translation_error_m(t_pred: Sequence[float], t_gt: Sequence[float]) -> float:
+    """论文式 (15)：``‖t − t̃‖₂``（米）。"""
+    return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(t_pred, t_gt)))
+
+
+def pose_to_rt(pose_row: Sequence[float]) -> tuple[list[list[float]], list[float]]:
+    """``(tx,ty,tz,qx,qy,qz,qw)`` → ``(R, t)``；``t`` 单位与输入一致。"""
+    if len(pose_row) < 7:
+        raise ValueError(f"位姿需要 7 个数，收到 {len(pose_row)}")
+    return _quat_to_rot(list(pose_row[3:7])), [float(v) for v in pose_row[:3]]
+
+
+def add_pose_metric(R_pred, t_pred, object_points: Sequence[Sequence[float]],
+                    R_gt, t_gt) -> float:
+    """论文式 (13) 的**原始形式**：``mean_p ‖(R̃p + t̃) − (Rp + t)‖₂``（米）。
+
+    与 ``add_metric``（关键点层面、用真值深度）不同，这里用的是 PnP 估出来的位姿，
+    **与论文完全同口径**，可直接比较。
+    """
+    total, n = 0.0, 0
+    for p in object_points:
+        a = [sum(R_pred[i][j] * p[j] for j in range(3)) + t_pred[i] for i in range(3)]
+        b = [sum(R_gt[i][j] * p[j] for j in range(3)) + t_gt[i] for i in range(3)]
+        total += math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
+        n += 1
+    return total / n if n else float("nan")
+
+
+def solve_pnp(kpts_px: Sequence[Sequence[float]],
+              object_points: Sequence[Sequence[float]],
+              K: Sequence[Sequence[float]]):
+    """``cv2.solvePnP`` → ``(R, t, ok)``。
+
+    为什么把 ``ok`` 单独返回：PnP 会失败（点太少 / 共面退化 / 不收敛）。
+    失败帧**不能**算成"误差很大"，否则会把 ADD/10°10cm 拉飞；本库的做法是单独计数
+    （``n_pnp_failed``），与论文口径的差异在报告里写明。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None, None, False
+    np = _numpy()
+    pts2d = np.asarray(kpts_px, dtype=np.float64).reshape(-1, 1, 2)
+    pts3d = np.asarray(object_points, dtype=np.float64).reshape(-1, 1, 3)
+    K_np = np.asarray(K, dtype=np.float64)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(pts3d, pts2d, K_np, None,
+                                      flags=cv2.SOLVEPNP_ITERATIVE)
+    except Exception:  # noqa: BLE001 - PnP 失败不应中断评测
+        return None, None, False
+    if not ok:
+        return None, None, False
+    Rm, _ = cv2.Rodrigues(rvec)
+    return Rm.tolist(), [float(v) for v in np.asarray(tvec).reshape(-1)], True
+
+
+def evaluate_pnp_metrics(collected: list[dict], K, object_points, diameter) -> dict:
+    """对"匹配上的目标对"做 PnP，算论文式的 ADD / ADD(0.5d) / 10°10cm。"""
+    adds: list[float] = []
+    rots: list[float] = []
+    transs: list[float] = []
+    adds_hit: list[float] = []
+    ten_ten: list[float] = []
+    n_failed = 0
+    for item in collected:
+        poses = item.get("poses") or []
+        gts = item["gts"]
+        for _cls, _conf, gt_index, pred_index in match_pose_image(item["preds"], gts, 0.5):
+            if gt_index < 0 or gt_index >= len(poses):
+                continue
+            pred = item["preds"][pred_index]
+            if len(pred) < 4 or not pred[3]:
+                continue
+            R_pred, t_pred, ok = solve_pnp(pred[3], object_points, K)
+            if not ok:
+                n_failed += 1
+                continue
+            R_gt, t_gt = pose_to_rt(poses[gt_index])
+            a = add_pose_metric(R_pred, t_pred, object_points, R_gt, t_gt)
+            r = rotation_error_deg(R_pred, R_gt)
+            tr = translation_error_m(t_pred, t_gt)
+            adds.append(a)
+            rots.append(r)
+            transs.append(tr)
+            if diameter:
+                adds_hit.append(1.0 if a < 0.5 * float(diameter) else 0.0)
+            ten_ten.append(1.0 if (r < ROT_THRESHOLD_DEG
+                                   and tr < TRANS_THRESHOLD_M) else 0.0)
+
+    def _mean(v: Sequence[float]) -> float:
+        return sum(v) / len(v) if v else float("nan")
+
+    return {
+        "available": bool(adds),
+        "n": len(adds),
+        "n_pnp_failed": n_failed,
+        "add_m": _mean(adds),
+        "add_median_m": sorted(adds)[len(adds) // 2] if adds else float("nan"),
+        "add_0.5d_ratio": _mean(adds_hit),
+        "rot_err_deg_mean": _mean(rots),
+        "rot_err_deg_median": sorted(rots)[len(rots) // 2] if rots else float("nan"),
+        "trans_err_m_mean": _mean(transs),
+        "trans_err_m_median": sorted(transs)[len(transs) // 2] if transs else float("nan"),
+        "10deg10cm_ratio": _mean(ten_ten),
+        "threshold_note": (f"判据：ADD < {0.5 * float(diameter):.3f} m（=0.5d）、"
+                           f"旋转 < {ROT_THRESHOLD_DEG:.0f}°、平移 < "
+                           f"{TRANS_THRESHOLD_M * 100:.0f} cm")
+        if diameter else "缺 tod.model_diameter，ADD(0.5d) 不可用",
+        "note": "与论文式 (13)/(14)/(15) **同口径**（用 PnP 估出的位姿）。",
+    }
+
+
+__all__ = ["ADD_THRESHOLD_RATIO", "KPX_HIT_PX", "ROT_THRESHOLD_DEG",
+           "TRANS_THRESHOLD_M", "add_metric", "add_pose_metric",
+           "default_pose_predictor", "evaluate_pnp_metrics", "evaluate_pose",
+           "evaluate_pose_ap", "extract_pose_preds", "format_pose_table",
+           "gt_depths", "keypoint_predictor", "load_pose_labels",
+           "match_pose_image", "oks", "pose_to_rt", "rotation_error_deg",
+           "solve_pnp", "translation_error_m"]

@@ -312,6 +312,120 @@ def summarize_scale(stats: dict, cfg: dict, report: Report) -> None:
     )
 
 
+def check_pose6d(cfg: dict, split: str, report: Report) -> dict:
+    """校验 ``L_rep``（论文式 8）需要的 6D 位姿旁挂数据与相机/机体参数。
+
+    论文启用几何重投影项后 10°10cm 提升 >10%，但它的输入有三处**极易错且静默**：
+      1. CSV 的 ``obj_index`` 与标签行序错位 → 几何监督配到别的目标上；
+      2. ``object_points`` 的个数/顺序与 ``kpt_names`` 不一致 → 监督到错误的机体点；
+      3. 相机内参缺失或不是 3×3 → 射线算错，损失变成一个与几何无关的量。
+    因此这里逐条检查，缺任何一项都报**错误**（不是警告）。
+    """
+    tod = cfg.get("tod") or {}
+    stats: dict = {"split": split, "pose_rows": 0, "pose_images": 0, "labels": 0}
+    pose_dir = tod.get("pose_labels")
+    if not pose_dir:
+        report.note(
+            "数据集未声明 tod.pose_labels：若变体启用了 EP7.reproj（几何重投影损失），"
+            "训练会直接报错；不启用则没有影响。"
+        )
+        return stats
+
+    root = Path(str(cfg.get("path") or "."))
+    csv_path = root / str(pose_dir) / f"{split}.csv"
+    if not csv_path.is_file():
+        report.error(
+            f"找不到 6D 位姿文件 {csv_path}（tod.pose_labels={pose_dir!r}）。"
+            "EP7.reproj 启用时这是必需的；格式见 docs/KEYPOINTS.md §5.2。"
+        )
+        return stats
+
+    from tod.data.pose6d import Pose6DError, load_pose_csv
+
+    try:
+        table = load_pose_csv(csv_path)
+    except Pose6DError as exc:
+        report.error(str(exc))
+        return stats
+    stats["pose_images"] = len(table)
+    stats["pose_rows"] = sum(len(v) for v in table.values())
+
+    # ---- 与标签行数逐图对齐（错位是静默错误里最危险的一种）----
+    label_dir = resolve_labels_dir(cfg, split)
+    if label_dir and label_dir.is_dir():
+        mismatched = []
+        for path in sorted(label_dir.glob("*.txt")):
+            lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            stats["labels"] += len(lines)
+            have = len(table.get(path.stem, []))
+            if have != len(lines):
+                mismatched.append(f"{path.stem}(csv={have} labels={len(lines)})")
+        if mismatched:
+            report.error(
+                f"{len(mismatched)} 张图的 6D 位姿行数与标签行数不一致（前 5 个："
+                f"{mismatched[:5]}）。obj_index 必须与标签行序一一对应，"
+                "否则几何监督会配到别的目标上，而训练**不会报错**。"
+            )
+
+    # ---- 相机内参 ----
+    K = tod.get("camera_matrix")
+    if not K:
+        report.error("缺少 tod.camera_matrix（3×3 相机内参），L_rep 无法计算。")
+    else:
+        try:
+            import numpy as np
+
+            Karr = np.asarray(K, dtype=float)
+            if Karr.shape != (3, 3):
+                report.error(f"tod.camera_matrix 必须是 3×3，实际 {Karr.shape}。")
+            elif Karr[2, 2] == 0 or Karr[0, 0] <= 0 or Karr[1, 1] <= 0:
+                report.error(f"tod.camera_matrix 数值可疑：{Karr.tolist()}")
+            else:
+                report.note(f"相机内参：fx={Karr[0, 0]:.1f}, fy={Karr[1, 1]:.1f}, "
+                            f"cx={Karr[0, 2]:.1f}, cy={Karr[1, 2]:.1f}")
+        except ImportError:  # pragma: no cover
+            pass
+
+    # ---- 机体 3D 关键点 ----
+    obj = tod.get("object_points")
+    n_kpt = int((cfg.get("kpt_shape") or [0])[0] or 0)
+    if not obj:
+        report.error(
+            "缺少 tod.object_points（机体坐标系下 n_kpt×3 的关键点坐标），L_rep 无法计算。"
+        )
+    else:
+        if n_kpt and len(obj) != n_kpt:
+            report.error(
+                f"tod.object_points 有 {len(obj)} 个点，与 kpt_shape[0]={n_kpt} 不一致；"
+                "两者必须一一对应（顺序还要与 kpt_names 一致）。"
+            )
+        bad = [i for i, p in enumerate(obj) if len(p) != 3]
+        if bad:
+            report.error(f"tod.object_points 的第 {bad} 项不是 3 维坐标。")
+        else:
+            status_ok = str(tod.get("kpt_definition_status") or "").lower()
+            if status_ok in ("synthetic", "paper-structured", "paper-verified"):
+                report.note(
+                    f"机体 3D 关键点已声明 {len(obj)} 个（来源状态 {status_ok}："
+                    "几何来自作者公开实现或本库标定，不是占位值）"
+                )
+            else:
+                report.note(
+                    f"机体 3D 关键点已声明 {len(obj)} 个；"
+                    "请确认它们是**你机型**的真实几何（论文正文未给坐标表）"
+                )
+        d = tod.get("model_diameter")
+        if not d:
+            report.warn("缺少 tod.model_diameter：ADD(0.5d) 指标无法计算（其它指标不受影响）。")
+
+    warm = tod.get("reproj_warmup_epochs")
+    if warm is None:
+        report.note("未声明 tod.reproj_warmup_epochs，将用论文默认的 15（前 15 epoch 只用 2D 项）。")
+    else:
+        report.note(f"L_rep warm-up：前 {int(warm)} 个 epoch 只用 2D 定位损失（论文 §IV-A-2）。")
+    return stats
+
+
 def check_image_pairing(cfg: dict, split: str, report: Report) -> None:
     """标签与图像的配对是否完整（漏标/多余标签是常见的数据集事故）。"""
     root = Path(str(cfg.get("path") or "."))
@@ -360,6 +474,7 @@ def main() -> int:
         stats = check_labels(cfg, kpt_shape, flip_idx, args.split, args.sample, report)
         summarize_scale(stats, cfg, report)
         check_image_pairing(cfg, args.split, report)
+        stats["pose6d"] = check_pose6d(cfg, args.split, report)
 
     print(f"\n[check] {args.data}  (split={args.split})")
     print(f"        kpt_shape={list(kpt_shape)}  flip_idx={flip_idx}  nc={cfg.get('nc')}")

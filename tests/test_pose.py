@@ -681,8 +681,11 @@ def test_spae_pose_variant(fast: bool = False) -> None:
     check("数据集为 rflysim-pose", variant.dataset == "rflysim-pose", variant.dataset)
     check("rflysim-pose 数据集配置存在",
           (ROOT / "configs" / "_base_" / "datasets" / "rflysim-pose.yaml").is_file())
-    check("笔记里写清了「非论文复现」与推断状态",
-          "不是" in variant.notes and ("推断" in variant.notes or "inferred" in variant.notes))
+    check("笔记里写清了「非论文复现」（CPKL-Net 结构不等价）",
+          "CPKL-Net" in variant.notes and "不可等价" not in variant.notes
+          and ("不是" in variant.notes or "不是复现" in variant.notes))
+    check("笔记里写清了编号语义的推断状态",
+          "推定" in variant.notes or "推断" in variant.notes, variant.notes[:120])
 
     # ---- 数据集配置三件套 ----
     from tod.compat import load_yaml
@@ -695,12 +698,19 @@ def test_spae_pose_variant(fast: bool = False) -> None:
           len(flip) == 9, str(flip))
     check("flip_idx 是对换置换（翻转两次回到自身）",
           all(flip[flip[i]] == i for i in range(9)), str(flip))
-    check("flip_idx 与 docs/KEYPOINTS.md 的镜像配对一致",
-          flip == [1, 0, 3, 2, 4, 6, 5, 8, 7], str(flip))
+    check("flip_idx 与 docs/KEYPOINTS.md §2 的镜像配对一致"
+          "（质心 p0 在镜像轴上自配对，4 对左右角点互换）",
+          flip == [0, 2, 1, 4, 3, 6, 5, 8, 7], str(flip))
+    check("质心（0 号点）自配对 —— 论文的 p0 不可自遮挡，是引导锚点",
+          flip[0] == 0, str(flip))
     names = (data_cfg.get("kpt_names") or {}).get(0) or (data_cfg.get("kpt_names") or {}).get("0")
     check("rflysim-pose 的 kpt_names 有 9 个名字", len(names or []) == 9, str(names))
-    check("rflysim-pose 标注了关键点定义状态为 inferred",
-          ((data_cfg.get("tod") or {}).get("kpt_definition_status")) == "inferred",
+    check("0 号点名字是 centroid（论文 p0）", (names or [None])[0] == "centroid", str(names))
+    check("1..8 号点是 8 个角点（论文 p1~p8）",
+          all(str(n).startswith("corner_") for n in (names or [])[1:]),
+          str(names[1:] if names else None))
+    check("rflysim-pose 标注了关键点定义状态",
+          ((data_cfg.get("tod") or {}).get("kpt_definition_status")) == "paper-structured",
           str((data_cfg.get("tod") or {}).get("kpt_definition_status")))
 
     if fast:
@@ -788,6 +798,160 @@ def test_spae_pose_variant(fast: bool = False) -> None:
     check("梯度到达关键点分支", any(p.grad is not None for p in head.cv4.parameters()))
     check("梯度到达分组卷积（框/分类分支）",
           any(p.grad is not None for p in head.cv2.parameters()))
+
+
+def test_reproj_loss() -> None:
+    """``L_rep``（论文式 6/8/9）：几何零点、横向 vs 深度的非对称、smooth L1、子集、warm-up。"""
+    torch = _need()
+    if torch is None:
+        return skip("L_rep", "未安装 torch")
+
+    from tod.loss.reproj import (ReprojLoss, camera_ray_dirs, project_points,
+                                 smooth_l1)
+
+    # ---- 式 (9) smooth L1 与论文逐元素一致 ----
+    x = torch.tensor([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0])
+    expect = torch.tensor([1.5, 0.5, 0.125, 0.0, 0.125, 0.5, 1.5])
+    check("smooth L1 与论文式 (9) 一致",
+          bool(torch.allclose(smooth_l1(x, 1.0), expect)), str(smooth_l1(x, 1.0).tolist()))
+
+    K = torch.tensor([[320.0, 0.0, 320.0], [0.0, 320.0, 240.0], [0.0, 0.0, 1.0]])
+    obj = torch.tensor([
+        [0.0, 0.0, 0.0],
+        [0.1, 0.1, 0.03], [0.1, -0.1, 0.03], [0.1, 0.1, -0.03], [0.1, -0.1, -0.03],
+        [-0.1, 0.1, 0.03], [-0.1, -0.1, 0.03], [-0.1, 0.1, -0.03], [-0.1, -0.1, -0.03],
+    ])
+    loss = ReprojLoss(K, obj)
+
+    # ---- 几何零点：预测点 = 真值点的投影时 L_rep 必须为 0 ----
+    R = torch.eye(3).unsqueeze(0)
+    t = torch.tensor([[0.0, 0.0, 2.0]])
+    px_true = project_points(obj @ R[0].t() + t[0], K)
+    zero = float(loss(px_true.unsqueeze(0), R, t))
+    check("完美预测 → L_rep ≈ 0", zero < 1e-6, f"实际 {zero:.3e}")
+
+    # ---- 中心像素的射线应指向 +z ----
+    dirs = camera_ray_dirs(torch.tensor([[[320.0, 240.0]]]), K)
+    check("中心像素射线 ≈ (0,0,1)",
+          bool(torch.allclose(dirs[0, 0], torch.tensor([0.0, 0.0, 1.0]), atol=1e-6)))
+
+    # ---- 像素偏移 → 损失 > 0，且可导 ----
+    # 注意：必须用**新张量**做偏移，不能对 px_true 就地加（那会改掉后面用的真值）；
+    # 早先写成 `px_true + 4.0` 再与 px_true 比较，等于"预测=真值"，损失当然是 0。
+    shifted_px = (px_true + torch.tensor([0.05, 0.03])).unsqueeze(0).requires_grad_(True)
+    value = loss(shifted_px, R, t)
+    check("像素偏移产生损失", float(value) > 1e-9, f"实际 {float(value):.3e}")
+    value.backward()
+    check("L_rep 对预测像素可导",
+          shifted_px.grad is not None and bool(shifted_px.grad.abs().sum() > 0))
+
+    # ---- 核心性质：同样的**横向**像素偏移，在画面中心 vs 边缘的损失不同
+    #      （因为射线角度不同：边缘的同一像素差对应更大的横向偏差）----
+    centre_far = (px_true + torch.tensor([4.0, 0.0])).unsqueeze(0)
+    corner_target = px_true + torch.tensor([[200.0, 0.0]])
+    corner_shift = (corner_target + torch.tensor([4.0, 0.0])).unsqueeze(0)
+    centre_loss = float(loss(centre_far, R, t))
+    edge_loss = float(loss(corner_shift, R, t))
+    check("L_rep 依赖射线角度（中心 vs 边缘同像素偏移的损失不同）",
+          abs(centre_loss - edge_loss) > 1e-9,
+          f"中心 {centre_loss:.3e} vs 边缘 {edge_loss:.3e}")
+
+    # ---- reduction / kpt_indices 子集（论文式 (5) 只对 8 个角点求和）----
+    shifted = (px_true + torch.tensor([3.0, 0.0])).unsqueeze(0)
+    mean_loss = float(loss(shifted, R, t))
+    sum_loss = float(ReprojLoss(K, obj, reduction="sum")(shifted, R, t))
+    check("reduction='sum' = 9 × mean", abs(sum_loss - 9 * mean_loss) < 1e-9,
+          f"{sum_loss:.3e} vs {mean_loss:.3e}")
+    corner_only = ReprojLoss(K, obj, kpt_indices=list(range(1, 9)))
+    check("kpt_indices 子集：参与点数为 8", corner_only.n_kpt == 8)
+    check("kpt_indices 子集：同时切了预测点与 3D 点（不报维度错）",
+          float(corner_only(shifted, R, t)) > 0)
+    try:
+        ReprojLoss(K, obj, kpt_indices=[99])
+        raise AssertionError("[FAIL] 越界 kpt_indices 未报错")
+    except ValueError:
+        PASSED.append("L_rep 拒绝越界 kpt_indices")
+
+    # ---- 论文的 warm-up：前 N epoch 不计入，之后才生效 ----
+    from tod.loss.reproj import ReprojCriterion
+
+    class _DummyBase:
+        def __call__(self, preds, batch):
+            return torch.zeros(()), torch.zeros(5)
+
+        def update(self):
+            pass
+
+    wrapper = ReprojCriterion(_DummyBase(), loss, weight=1.0, warmup_epochs=15)
+    check("warm-up：epoch 0/1/15 未生效", not wrapper.active and wrapper.epoch == 0)
+    for _ in range(15):
+        wrapper.update()
+    check("warm-up：15 轮 update 后仍在 warm-up",
+          not wrapper.active and wrapper.epoch == 15, f"epoch={wrapper.epoch}")
+    wrapper.update()
+    check("warm-up：第 16 个 epoch 起生效", wrapper.active and wrapper.epoch == 16)
+
+
+def test_pose6d_dataset() -> None:
+    """6D 位姿旁挂数据：解析、置换校验、四元数、以及"行序必须对齐"的硬约束。"""
+    torch = _need()
+    if torch is None:
+        return skip("6D 位姿数据", "未安装 torch")
+
+    from tod.data.pose6d import Pose6DError, parse_pose_rows, quat_to_rot
+
+    good = {"image": "a", "obj_index": "0", "tx": "0.1", "ty": "0", "tz": "2",
+            "qx": "0", "qy": "0", "qz": "0", "qw": "1"}
+    table = parse_pose_rows([good])
+    check("解析 6D 位姿", table == {"a": [[0.1, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0]]},
+          str(table))
+
+    # obj_index 必须从 0 连续（否则行序错位 → 几何监督配到别的目标上，静默错误）
+    bad = dict(good, obj_index="1")
+    try:
+        parse_pose_rows([bad])
+        raise AssertionError("[FAIL] 不连续的 obj_index 未报错")
+    except Pose6DError as exc:
+        check("拒绝不连续的 obj_index", "连续" in str(exc), str(exc)[:80])
+
+    # 重复 obj_index
+    try:
+        parse_pose_rows([good, dict(good, obj_index="0")])
+        raise AssertionError("[FAIL] 重复 obj_index 未报错")
+    except Pose6DError as exc:
+        check("拒绝重复的 obj_index", "重复" in str(exc), str(exc)[:80])
+
+    # 四元数模为 0
+    try:
+        parse_pose_rows([dict(good, qw="0")])
+        raise AssertionError("[FAIL] 零四元数未报错")
+    except Pose6DError as exc:
+        check("拒绝零四元数", "四元数" in str(exc), str(exc)[:80])
+
+    # 缺列
+    incomplete = {k: v for k, v in good.items() if k != "tz"}
+    try:
+        parse_pose_rows([incomplete])
+        raise AssertionError("[FAIL] 缺列未报错")
+    except Pose6DError as exc:
+        check("拒绝缺列", "缺少列" in str(exc), str(exc)[:80])
+
+    # 四元数 → 旋转：绕 z 轴 90° 把 x 轴映射到 y 轴
+    q = torch.tensor([0.0, 0.0, 2 ** -0.5, 2 ** -0.5])
+    Rm = quat_to_rot(q)
+    check("quat_to_rot：绕 z 轴 90° → x 映射到 y",
+          bool(torch.allclose(Rm @ torch.tensor([1.0, 0.0, 0.0]),
+                              torch.tensor([0.0, 1.0, 0.0]), atol=1e-6)))
+
+    # 两处四元数实现（data 与 loss）必须一致
+    from tod.loss.reproj import _quat_to_rot
+
+    q2 = torch.tensor([0.2, -0.3, 0.1, 0.9])
+    check("data 与 loss 的四元数实现一致",
+          bool(torch.allclose(quat_to_rot(q2), _quat_to_rot(q2))))
+    check("四元数实现保持正交（RᵀR = I）",
+          bool(torch.allclose(quat_to_rot(q2).t() @ quat_to_rot(q2),
+                              torch.eye(3), atol=1e-5)))
 
 
 def test_pose_dataset_checker(fast: bool = False) -> None:
@@ -953,7 +1117,8 @@ def main() -> int:
 
     tests = [test_tiny_pose_loss_vs_framework, test_sigma_strategies,
              test_pose_criteria_detection, test_oks_metric, test_pose_label_io,
-             test_pose_match_image, test_pose_dummy_dataset, test_pose_dummy_uav_layout,
+             test_pose_match_image, test_reproj_loss, test_pose6d_dataset,
+             test_pose_dummy_dataset, test_pose_dummy_uav_layout,
              test_pose_variant_dsl,
              test_keypoint_head_surgery, test_pose_variant_recipe]
     failures: list[str] = []

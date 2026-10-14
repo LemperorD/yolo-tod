@@ -67,6 +67,8 @@ def main() -> int:
     ap.add_argument("--kpt-shape", default=None, metavar="N,D",
                     help="合成数据的关键点形状（默认取变体 model.kpt_shape）")
     ap.add_argument("--keep", action="store_true", help="保留实验输出目录")
+    ap.add_argument("--warmup", type=int, default=None,
+                    help="覆盖 L_rep 的 warm-up epoch 数（默认取数据集配置里的值 / 15）")
     ap.add_argument("--allow-threaded-cache", action="store_true",
                     help="保留框架默认的并行标签缓存（受限沙箱下会 WinError 5）")
     args = ap.parse_args()
@@ -107,6 +109,11 @@ def main() -> int:
         kpt_shape=kpt_shape, layout=layout)
     check("合成姿态数据集配置已生成", data_yaml.is_file())
     cfg = load_yaml(data_yaml)
+    if args.warmup is not None:              # 自检要的是"L_rep 真的接进训练"，
+        cfg.setdefault("tod", {})            # 不该为了 warm-up 白跑 15 个 epoch
+        cfg["tod"]["reproj_warmup_epochs"] = int(args.warmup)
+        from tod.compat import dump_yaml
+        dump_yaml(cfg, data_yaml)
     check(f"合成数据声明 kpt_shape={list(kpt_shape)}",
           list(cfg.get("kpt_shape") or []) == list(kpt_shape),
           f"实际 {cfg.get('kpt_shape')}")
@@ -122,6 +129,9 @@ def main() -> int:
     check("变体声明的任务为 pose", variant.task == "pose", f"实际 {variant.task!r}")
     model_yaml = args.work / "model.yaml"
     variant.model_yaml(model_yaml, write=True)
+    # L_rep 需要数据集侧的相机内参 / 机体 3D 关键点：把数据集配置快照塞进 spec
+    # （与 tools/train.py 的做法一致；训练器与准则都从 spec 读它）。
+    spec["dataset_cfg"] = load_yaml(data_yaml)
     runtime.set_active(spec)
 
     from ultralytics import YOLO
@@ -167,6 +177,35 @@ def main() -> int:
     check("pose_loss 数值有限且非零",
           all(abs(float(r[pose_col])) < 1e4 and float(r[pose_col]) > 0 for r in rows),
           f"实际 {[r[pose_col] for r in rows]}")
+
+    # ---- 3b) L_rep（论文式 8）真的接进来了：数据集带 6D 位姿时会写进日志 ----
+    rep_enabled = bool(((spec.get("eps") or {}).get("EP7") or {}).get("reproj"))
+    if rep_enabled:
+        check("数据集含 6D 位姿旁挂（labels_6d/<split>.csv）",
+              (args.work / "data" / "labels_6d" / "val.csv").is_file())
+        check("数据集声明了 L_rep 需要的相机内参与机体 3D 点",
+              bool((cfg.get("tod") or {}).get("camera_matrix")
+                   and (cfg.get("tod") or {}).get("object_points")))
+        # 用训练出的权重重建准则，确认 L_rep 包装器与 warm-up 状态都在
+        from tod.loss.criterion import build_pose_criterion, build_reproj_criterion
+        from ultralytics.cfg import get_cfg
+
+        probe = YOLO(str(model_yaml), task="pose").model
+        args_p = get_cfg()
+        args_p.pose, args_p.kobj = 12.0, 1.0
+        probe.args = args_p
+        crit, _rep = build_pose_criterion(probe, ep7=spec["eps"]["EP7"])
+        crit = build_reproj_criterion(crit, spec)
+        check("L_rep 包装器已生效", hasattr(crit, "active") and crit.enabled)
+        check("L_rep 参与点数为 9（与 object_points 一致）",
+              int(crit.reproj.n_kpt) == 9, f"实际 {getattr(crit.reproj, 'n_kpt', '?')}")
+        crit.set_epoch(int(cfg["tod"]["reproj_warmup_epochs"]))
+        check("warm-up 期间 L_rep 不生效（论文：前 N epoch 只用 2D 项）",
+              not crit.active, f"epoch={crit.epoch} active={crit.active}")
+        crit.set_epoch(int(cfg["tod"]["reproj_warmup_epochs"]) + 1)
+        check("warm-up 之后 L_rep 生效", crit.active)
+        print(f"       ↳ L_rep：warm-up={crit.warmup_epochs} epoch、"
+              f"{crit.reproj.n_kpt} 个关键点参与")
 
     # ---- 4) 断点能被新进程载入并输出 (n_kpt, 3) 关键点 ----
     reloaded = YOLO(str(best))           # 任务由 checkpoint 里的 model.task 决定
@@ -219,6 +258,22 @@ def main() -> int:
           diag is not None and abs(diag["mean_err_px"]) < 1e-9
           and abs(diag["hit_rate@1px"] - 1.0) < 1e-9,
           f"实际 {diag}")
+
+    # 论文指标 ADD / ADD(0.5d)（有 6D 位姿时才可用）
+    if scored.get("add", {}).get("available"):
+        check("完美预测：ADD = 0 m", abs(scored["add"]["add_m"]) < 1e-9,
+              f"实际 {scored['add']['add_m']}")
+        check("完美预测：ADD(0.5d) 命中率 = 1",
+              abs(scored["add"]["add_0.5d_ratio"] - 1.0) < 1e-9,
+              f"实际 {scored['add']['add_0.5d_ratio']}")
+        check("ADD 阈值 = 0.5 × 机型直径",
+              abs(scored["add"]["threshold_m"] - 0.5 * 0.45) < 1e-9,
+              f"实际 {scored['add']['threshold_m']}")
+        print(f"       ↳ 论文指标：ADD={scored['add']['add_m']:.4f} m、"
+              f"ADD(0.5d)={scored['add']['add_0.5d_ratio']:.2f}"
+              f"（阈值 {scored['add']['threshold_m']:.3f} m）")
+    else:
+        print("       ↳ 本次数据没有 6D 位姿，跳过 ADD 指标")
 
     # 半像素偏移：OKS 必须**下降**，且小目标层下降得更狠（口径有效性的核心断言）
     def shifted(image: Path):

@@ -82,6 +82,16 @@ def main() -> int:
 
     runtime.set_active(spec)
 
+    # L_rep（论文式 6/8）需要数据集侧的相机内参 / 机体 3D 关键点。这里把数据集 YAML
+    # 的内容快照塞进 spec，训练器与 --dry-run 都能从 spec 读到，不必各自再解析路径。
+    def _attach_dataset_cfg(data_path) -> None:
+        if not data_path:
+            return
+        try:
+            spec["dataset_cfg"] = load_yaml(data_path)
+        except Exception as exc:  # noqa: BLE001 - 不影响其它 EP
+            print(f"[warn ] 未能读取数据集配置（L_rep 将不可用）：{exc}")
+
     # 受限沙箱（Windows 命名管道被禁）下必须把标签缓存换成顺序实现，
     # 否则 dataloader 一建就 PermissionError [WinError 5]（见 tod/compat.py 的说明）。
     if not args.allow_threaded_cache:
@@ -108,7 +118,13 @@ def main() -> int:
         from ultralytics.cfg import get_cfg
 
         from tod.engine.surgery import apply_spec
-        from tod.loss.criterion import build_detection_loss, build_pose_criterion
+        from tod.loss.criterion import (build_detection_loss, build_pose_criterion,
+                                       build_reproj_criterion)
+
+        if args.data:
+            _attach_dataset_cfg(args.data)
+        elif _default_data(variant.dataset, task):
+            _attach_dataset_cfg(_default_data(variant.dataset, task))
 
         imgsz = args.imgsz or int(spec.get("data", {}).get("imgsz", 640))
         n_before = sum(p.numel() for p in model.model.parameters())
@@ -133,6 +149,8 @@ def main() -> int:
             criterion, report = build_pose_criterion(
                 model.model, ep7=ep7, stal=stal_flag(ep6), use_dfl=use_dfl,
             )
+            criterion = build_reproj_criterion(criterion, spec)
+            report = list(getattr(criterion, "_tod_patched", report))
         else:
             criterion = build_detection_loss(
                 model.model, kind=box_kind,
@@ -179,6 +197,7 @@ def main() -> int:
             "未指定数据集：请用 --data 传入数据集 YAML，"
             "或在变体配置里写 data.dataset。"
         )
+    _attach_dataset_cfg(train_args.get("data"))
 
     # 实验输出目录：变体里写的可能是相对路径（如 "results"），必须锚到仓库根，
     # 否则 ultralytics 会把它解析成 runs/detect/results/...（散落在仓库里）

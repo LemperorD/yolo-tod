@@ -17,6 +17,10 @@ __pycache__/
 # 数据与权重（体积大，不入库）；只忽略仓库根的 data/ 与 datasets/
 /data/
 /datasets/
+
+# 数据集注册表的机器相关覆盖（路径/挂载点因机器而异，不入库）；
+# 入库的是 configs/datasets.yaml，这里只放"这台服务器新硬盘在哪"
+/configs/datasets.local.yaml
 *.pt
 *.onnx
 *.engine

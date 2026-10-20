@@ -14,10 +14,11 @@
 用法::
 
     # 真实权重评测（把 results.json 的 metrics 直接贴进变体卡片）
+    # --data 用注册表里的名字（configs/datasets.yaml），也接受数据集目录 / YAML 路径
     python3 tools/val_pose.py \
         --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml \
         --weights results/visdrone-yolo26n-pose-p2-p16/weights/best.pt \
-        --data configs/_base_/datasets/visdrone2019-pose.yaml \
+        --data visdrone2019-pose \
         --imgsz 1024 --sigma-strategy person \
         --json variants/visdrone-yolo26n-pose-p2-p16/results.json
 
@@ -25,7 +26,8 @@
     python3 tools/val_pose.py --weights runs/x/weights/best.pt \
         --data tests/.tmp/tiny-pose/dataset.yaml --max-images 4 --device cpu
 
-results.json 里带 git commit / 权重 mtime（PLAN §2.7）。
+results.json 里带 git commit / 权重 mtime（PLAN §2.7），
+以及注册表解析出的 ``dataset_name / dataset_root``（换盘后仍可追溯读的是哪块盘）。
 
 [!] 口径提醒：本入口的 OKS-AP 用**框 IoU 匹配**（默认 0.5），不是 COCO 的 OKS 匹配，
 因此**不等于** COCO keypoints AP，两者不可直接比较。
@@ -65,7 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="姿态 OKS-AP 评测（含尺度分层）")
     ap.add_argument("--variant", type=Path, default=None, help="变体 spec（用于记录 meta）")
     ap.add_argument("--weights", type=Path, required=True, help="姿态模型权重 .pt")
-    ap.add_argument("--data", type=Path, required=True, help="数据集 YAML（必须含 kpt_shape）")
+    ap.add_argument("--data", required=True, metavar="名字|目录|YAML",
+                    help="姿态数据集：注册表里的名字（如 mav6d-phantom4）/ 数据集目录 / "
+                         "数据集 YAML（必须含 kpt_shape）")
+    ap.add_argument("--data-root", default=None, metavar="DIR",
+                    help="覆盖注册表里的数据根目录（也可用环境变量 TOD_DATA_ROOT）")
+    ap.add_argument("--datasets", type=Path, default=None, metavar="YAML",
+                    help="数据集注册表 YAML（默认 configs/datasets.yaml）")
     ap.add_argument("--split", default="val", help="val / test / train")
     ap.add_argument("--imgsz", type=int, default=None, help="默认取变体配置里的 imgsz")
     ap.add_argument("--conf", type=float, default=0.001, help="评测用低阈值，避免截断召回")
@@ -88,26 +96,38 @@ def main() -> int:
 
     from tod.compat import load_yaml
     from tod.eval.pose import evaluate_pose
+    from tod.paths import DatasetPathError, resolve
 
     if not args.weights.is_file():
         raise SystemExit(f"权重不存在：{args.weights}")
 
+    # 数据集位置与训练同源：注册表（configs/datasets.yaml）说了算
+    try:
+        paths = resolve(args.data, registry_path_hint=args.datasets,
+                        data_root=args.data_root, splits=(args.split,))
+    except DatasetPathError as exc:
+        raise SystemExit(f"[错误] {exc}") from exc
+    if paths is None:
+        raise SystemExit("--data 不能为空")
+    for line in paths.report():
+        print(line)
+
     spec = load_yaml(args.variant) if args.variant and args.variant.is_file() else {}
     imgsz = args.imgsz or int((spec.get("data") or {}).get("imgsz", 640))
 
-    data_cfg = load_yaml(args.data)
+    data_cfg = load_yaml(paths.yaml)
     if not data_cfg.get("kpt_shape"):
         raise SystemExit(
-            f"{args.data} 缺少 kpt_shape（姿态数据集必需）。"
+            f"{paths.yaml} 缺少 kpt_shape（姿态数据集必需）。"
             "参考 configs/_base_/datasets/visdrone2019-pose.yaml。"
         )
 
-    print(f"[pose-eval] weights={args.weights} | data={args.data} | split={args.split} "
+    print(f"[pose-eval] weights={args.weights} | data={paths.root} | split={args.split} "
           f"| imgsz={imgsz} | conf={args.conf} | match_iou={args.match_iou} "
           f"| sigma={args.sigma_strategy}")
     started = time.time()
     result = evaluate_pose(
-        args.data, weights=args.weights, split=args.split, imgsz=imgsz,
+        paths.yaml, weights=args.weights, split=args.split, imgsz=imgsz,
         conf=args.conf, iou=args.iou, device=args.device, max_det=args.max_det,
         match_iou=args.match_iou, sigma_strategy=args.sigma_strategy,
         max_images=args.max_images,
@@ -123,6 +143,9 @@ def main() -> int:
         "weights": str(args.weights),
         "weights_mtime": args.weights.stat().st_mtime,
         "dataset": str(args.data),
+        "dataset_name": paths.name,
+        "dataset_root": str(paths.root),
+        "dataset_yaml": str(paths.yaml),
         "split": args.split,
         "imgsz": imgsz,
         "conf": args.conf,

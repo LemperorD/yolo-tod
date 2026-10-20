@@ -315,6 +315,15 @@ class ReprojCriterion:
         self.enabled = bool(enabled)
         self.epoch = 0
         self.last_value: float | None = None      # 供日志/自检读取
+        self._terms = 0                           # 累计"真的算出几何项"的次数（自检用）
+
+    def reproj_terms(self) -> int:
+        """累计成功计算的几何项数量（``L_rep`` 是否真的跑过，看这个计数最客观）。
+
+        为什么需要：``active`` 只说明"该生效"，不说明"真的算出了数"。曾经的故障是
+        数据集替换静默失效 / 解码头通道数不对，训练能一路跑但几何项根本没参与。
+        """
+        return int(self._terms)
 
     # ---- 与框架训练循环的接口 ----
     def set_epoch(self, epoch: int) -> None:
@@ -418,7 +427,10 @@ class ReprojCriterion:
         b = kpts.shape[0]
         raw = kpts.permute(0, 2, 1).contiguous().view(b, -1, int(kpt_shape[0]),
                                                      int(kpt_shape[1]))
-        decoded = criterion.kpts_decode(anchor_points, raw)          # (B,A,K,d) 归一化
+        # ``kpts_decode`` 只对前两维做锚点偏移，**第三个通道是可见性/置信度**——
+        # 所以这里必须切到 ``[..., :2]`` 再用。不切的话后面拿 (A,K,3) 去乘 [w,h]
+        # 会直接 RuntimeError: size of tensor a (3) must match ... (2)。
+        decoded = criterion.kpts_decode(anchor_points, raw)[..., :2]  # (B,A,K,2) 归一化
 
         # ---- 锚点 ↔ GT 目标（最近中心，贪心一对一）----
         poses, orig_sizes = _pose_lookup(batch)
@@ -447,6 +459,8 @@ class ReprojCriterion:
             value = self.reproj(sel_norm * _t.tensor([img_w, img_h], device=sel_norm.device,
                                                      dtype=sel_norm.dtype),
                                 R, t, K=K)
+            if value is not None:
+                self._terms += 1                    # 客观计数：几何项真的算出来了几次
             total = value if total is None else total + value
         return total
 
@@ -496,9 +510,18 @@ def _scaled_intrinsics(K, size, aug_w: float, aug_h: float):
     """
     import torch as _t
 
-    if not size:
+    if size is None:
         return K
-    w0, h0 = max(float(size[0]), 1e-6), max(float(size[1]), 1e-6)
+    # 注意：size 可能是 Tensor（batch 里的 gt_image_size），**不能**写 `if not size:`
+    # —— 多元素张量的真值判断会抛 "Boolean value of Tensor with more than one value
+    # is ambiguous"。统一转成 (w0, h0) 两个 float 再判断。
+    try:
+        w0, h0 = float(size[0]), float(size[1])
+    except (IndexError, TypeError, ValueError):
+        return K
+    if w0 <= 0.0 or h0 <= 0.0:                    # 数据集没给尺寸 -> 不做缩放校正
+        return K
+    w0, h0 = max(w0, 1e-6), max(h0, 1e-6)
     ratio = max(aug_w / w0, aug_h / h0)
     K2 = K.clone() if isinstance(K, _t.Tensor) else _t.as_tensor(K, dtype=_t.float32).clone()
     K2[0, 0] *= ratio
@@ -526,11 +549,19 @@ def _sub_criterion(base: Any, branch: str):
 
 
 def _pose_lookup(batch: dict) -> tuple[dict, dict]:
-    """从 batch 建立 ``{图内序号: [位姿行]}``（``(B, G, 7)`` + ``gt_pose_mask``）。
+    """从 batch 建立 ``{图内序号: [位姿行]}``。
 
     ``gt_pose`` 由 ``Pose6DDataset`` 按"每张图的行序"给出（与标签行序一致，
     ``tod/data/pose6d.py`` 会强校验行数一致、indices 从 0 连续；
     ``tools/check_pose_dataset.py`` 开训前再校验一次）。
+
+    **形状要小心**：框架的 ``YOLODataset.collate_fn`` 只对白名单键
+    （``img`` / ``text_feats`` / ``semantic_mask`` / ``sem_masks``）做 ``torch.stack``，
+    其余键一律 ``zip(*...)`` —— 所以 ``gt_pose`` 拿到的是**逐图张量的 tuple**，
+    元素形状 ``(n_obj_i, 7)``（每张图目标数可以不同，本来也没法 stack）。
+    ``gt_pose_mask`` 同理。早先这里直接假定 ``(B, G, 7)`` 张量并调用 ``.dim()``，
+    于是真的跑到 ``L_rep`` 时抛 ``AttributeError: 'tuple' object has no attribute 'dim'``。
+    两种形态都接受，且每张图**各自**用自己那行掩码过滤。
 
     注意本函数**不做**任何内部索引猜测：返回的就是"每张图的目标列表"（按行序）。
     与锚点的对应关系由 ``_nearest_anchor_per_box`` 用几何最近邻确定，
@@ -540,20 +571,42 @@ def _pose_lookup(batch: dict) -> tuple[dict, dict]:
         ``({图内序号: [位姿行]}, {图内序号: (原图宽, 原图高)})``；第二个字典来自
         batch 里的 ``gt_image_size``（没有则为空 → 退化为不做 letterbox 缩放校正）。
     """
+    import torch as _t
+
     poses = batch.get("gt_pose")
     if poses is None:
         return {}, {}
     mask = batch.get("gt_pose_mask")
     out: dict[int, list] = {}
-    if poses.dim() == 3:                          # (B, G, 7)
-        for i in range(poses.shape[0]):
-            rows = []
-            for j in range(poses.shape[1]):
-                if mask is not None and not bool(mask[i, j]):
+
+    def _rows_of(pose_img, mask_img) -> list:
+        rows = []
+        n = int(pose_img.shape[0]) if hasattr(pose_img, "shape") else len(pose_img)
+        for j in range(n):
+            if mask_img is not None:
+                keep = bool(mask_img[j]) if hasattr(mask_img, "__getitem__") else bool(mask_img)
+                if not keep:
                     continue
-                rows.append([float(v) for v in poses[i, j].tolist()])
+            rows.append([float(v) for v in _t.as_tensor(pose_img[j]).reshape(-1).tolist()])
+        return rows
+
+    if isinstance(poses, (list, tuple)):              # 逐图张量（collate_fn 的实际产物）
+        for i, pose_img in enumerate(poses):
+            mask_img = None
+            if isinstance(mask, (list, tuple)) and i < len(mask):
+                mask_img = mask[i]
+            elif mask is not None:
+                mask_img = mask
+            rows = _rows_of(pose_img, mask_img)
             if rows:
                 out[i] = rows
+    elif hasattr(poses, "dim") and poses.dim() == 3:  # (B, G, 7) 堆叠张量（兼容包装后的 batch）
+        for i in range(poses.shape[0]):
+            mask_img = mask[i] if mask is not None and hasattr(mask, "__getitem__") else None
+            rows = _rows_of(poses[i], mask_img)
+            if rows:
+                out[i] = rows
+
     sizes = batch.get("gt_image_size") or {}
     if isinstance(sizes, (list, tuple)):          # 也接受逐图的 (w,h) 列表
         sizes = {i: sizes[i] for i in range(len(sizes))}

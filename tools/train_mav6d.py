@@ -16,7 +16,7 @@
     python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model phantom4 --out data/mav6d
 
     # 1) 结构自检（不需要数据，几秒钟）
-    python3 tools/train_mav6d.py --model phantom4 --data data/mav6d/phantom4/dataset.yaml --dry-run
+    python3 tools/train_mav6d.py --model phantom4 --dry-run
 
     # 2) 只跑 2 个 epoch 做冒烟（确认数据/损失/显存都没问题）
     python3 tools/train_mav6d.py --model phantom4 --smoke
@@ -62,7 +62,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-
 # Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
@@ -71,16 +70,18 @@ try:
 except Exception:
     pass
 
-#: 机型 → 变体 spec 与默认数据集路径（都可用命令行覆盖）。
+#: 机型 → 变体 spec 与**注册表里的数据集名**（都可用命令行覆盖）。
+#: 数据集位置由 configs/datasets.yaml 决定（换盘只改注册表，不改这里）：
+#:   mav6d-phantom4 / mav6d-mavic2 → <data_root>/mav6d/<机型>
 MODEL_DEFAULTS = {
     "phantom4": {
         "variant": ROOT / "variants" / "spae-yolov8n-pose" / "variant.yaml",
-        "data": ROOT / "data" / "mav6d" / "phantom4" / "dataset.yaml",
+        "data": "mav6d-phantom4",
         "name": "mav6d-phantom4",
     },
     "mavic2": {
         "variant": ROOT / "variants" / "spae-yolov8n-pose" / "variant.yaml",
-        "data": ROOT / "data" / "mav6d" / "mavic2" / "dataset.yaml",
+        "data": "mav6d-mavic2",
         "name": "mav6d-mavic2",
     },
 }
@@ -121,8 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--model", choices=tuple(MODEL_DEFAULTS), required=True,
                     help="MAV6D 机型（两机型要**分别**训练，见论文 Table IV）")
-    ap.add_argument("--data", type=Path, default=None,
-                    help="数据集 YAML（默认 data/mav6d/<机型>/dataset.yaml）")
+    ap.add_argument("--data", default=None, metavar="名字|目录|YAML",
+                    help="数据集：默认取注册表里的 mav6d-<机型>，"
+                         "也可写数据集目录或 dataset.yaml 路径")
+    ap.add_argument("--data-root", default=None, metavar="DIR",
+                    help="覆盖注册表里的数据根目录（换盘/临时切换用；"
+                         "也可用环境变量 TOD_DATA_ROOT）")
+    ap.add_argument("--datasets", type=Path, default=None, metavar="YAML",
+                    help="数据集注册表 YAML（默认 configs/datasets.yaml）")
     ap.add_argument("--variant", type=Path, default=None, help="变体 spec（默认 SPAE-pose）")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch", type=int, default=None)
@@ -151,6 +158,18 @@ def _coerce(text: str):
         return text
 
 
+def _reproj_enabled(spec: dict) -> bool:
+    """变体是否启用了 L_rep（EP7.reproj）。"""
+    flag = ((spec.get("eps") or {}).get("EP7") or {}).get("reproj", False)
+    return not (flag is False or flag is None
+                or str(flag).lower() in {"", "off", "none", "false"})
+
+
+def explicit_set_keys(items: list[str]) -> set[str]:
+    """``--set K=V`` 里显式给出的键（这些优先于脚本施加的安全默认）。"""
+    return {item.split("=", 1)[0].strip() for item in items if "=" in item}
+
+
 def main() -> int:
     args = build_parser().parse_args()
 
@@ -158,17 +177,39 @@ def main() -> int:
     from tod import compat, runtime
     from tod.compat import CompatError, load_yaml
     from tod.compose import Variant
+    from tod.data.pose6d import pose_safe_augment_overrides
+    from tod.paths import DatasetPathError, resolve
 
     variant_path = args.variant or MODEL_DEFAULTS[args.model]["variant"]
-    data_path = args.data or MODEL_DEFAULTS[args.model]["data"]
     if not variant_path.is_file():
         raise SystemExit(f"变体 spec 不存在：{variant_path}")
+
+    # ---- 训练集位置：注册表（configs/datasets.yaml）说了算 ----
+    try:
+        data_paths = resolve(args.data or MODEL_DEFAULTS[args.model]["data"],
+                             registry_path_hint=args.datasets, data_root=args.data_root,
+                             require_train=not args.dry_run)
+    except DatasetPathError as exc:
+        if not args.dry_run:
+            raise SystemExit(
+                f"[数据] {exc}\n"
+                "换盘后请把 configs/datasets.yaml 的 data_root 指向新硬盘，或先重新转换数据：\n"
+                f"  python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D "
+                f"--model {args.model} --out <新硬盘>/mav6d"
+            ) from exc
+        print(f"[warn ] 数据集未就绪（--dry-run 继续）：{exc}")
+        data_paths = None
+    if data_paths is not None:
+        for line in data_paths.report():
+            print(line)
+    data_path = data_paths.yaml if data_paths is not None else (
+        ROOT / "data" / "mav6d" / args.model / "dataset.yaml")
     if not args.dry_run and not data_path.is_file():
         raise SystemExit(
             f"数据集不存在：{data_path}\n"
             "请先转换数据：\n"
             f"  python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model {args.model} "
-            "--out data/mav6d"
+            "--out <新硬盘>/mav6d"
         )
 
     if not args.allow_threaded_cache and compat.allow_threadless_label_cache():
@@ -194,7 +235,7 @@ def main() -> int:
         weights = _pretrained_for(variant.base)
 
     print(f"[mav6d] 机型={args.model} | 任务={variant.task} | 变体={variant.name}")
-    print(f"[mav6d] 数据={data_path}")
+    print(f"[mav6d] 数据={data_paths.root if data_paths else data_path.parent}")
     print(f"[mav6d] 预训练={weights or '不用（从零训）'}")
 
     if args.dry_run:
@@ -222,6 +263,19 @@ def main() -> int:
     project = train_args.get("project")
     if not project or not Path(str(project)).is_absolute():
         train_args["project"] = str(ROOT / (str(project) if project else "results"))
+
+    # ---- L_rep 与"会丢目标的几何增强"互斥（见 pose_safe_augment_overrides）----
+    # 启用 6D 位姿监督时，框与位姿必须保持一一对应；而 RandomPerspective 会把
+    # 变换后面积占比 <10% 的框连同类丢掉（实测 MAV6D 有 0.68% 的图被丢成 0 框），
+    # 那之后就无法认定"CSV 的哪几行还对应得上"。命令行显式 --set 的优先级更高。
+    if _reproj_enabled(spec):
+        safe = pose_safe_augment_overrides()
+        forced = {k: v for k, v in safe.items() if k not in explicit_set_keys(args.set)}
+        train_args.update(forced)
+        print(f"[mav6d] L_rep 启用 -> 关闭会丢目标的几何增强："
+              f"{', '.join(f'{k}={v}' for k, v in forced.items())}")
+        print("         （要保留某项就显式 --set 覆盖它，自担位姿错配风险）")
+
     train_args = {k: v for k, v in train_args.items() if v is not None}
 
     print(f"[mav6d] imgsz={train_args.get('imgsz')} batch={train_args.get('batch')} "

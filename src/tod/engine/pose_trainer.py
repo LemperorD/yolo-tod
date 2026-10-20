@@ -65,18 +65,23 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
 
         为什么必须在这里替换：``L_rep``（论文式 8）需要逐目标的 ``R, t``，而框架标准的
         ``YOLODataset`` 只产出框 + 关键点。本库不改框架，而是在 ``build_dataset``
-        外面把 ``ultralytics.data.dataset.YOLODataset`` 临时换成子类（子类在
-        ``__getitem__`` 里附加 ``gt_pose`` / ``gt_pose_mask``，由框架的 ``collate_fn``
-        自动收集进 batch）。这样：
+        外面把框架的 ``YOLODataset`` 临时换成子类（子类在 ``__getitem__`` 里附加
+        ``gt_pose`` / ``gt_pose_mask``，由框架的 ``collate_fn`` 自动收集进 batch）。这样：
           * 不改框架源码，也不复制它的 dataset 实现；
           * 只有真的启用 ``L_rep`` 时才生效（关掉时行为与纯姿态训练**完全一致**）；
           * 校验失败会**直接报错**，不会静默退化成"没有几何监督"。
+
+        **注意替换的是两个命名空间**（``ultralytics.data.dataset`` 与
+        ``ultralytics.data.build``）：``build_yolo_dataset()`` 用的是后者自己的全局名，
+        只换前者等于没换 —— 详见 ``tod.data.pose6d.pose6d_dataset_context``。
+        建完 loader 立刻用 ``verify_pose_in_loader`` 校验，避免"替换失效"拖到
+        warm-up 结束后的第一个 batch 才炸。
         """
         if not self._needs_pose6d():
             return super().get_dataloader(dataset_path, batch_size, rank, mode)
 
-        from tod.data.pose6d import pose6d_dataset
         from tod import compat
+        from tod.data.pose6d import pose6d_dataset_context, verify_pose_in_loader
 
         data = self.data or {}
         pose_dir = (data.get("tod") or {}).get("pose_labels")
@@ -88,16 +93,12 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
         root = Path(str(data.get("path") or "."))
         if not root.is_absolute():
             root = (Path(self.args.data).parent / root).resolve()
-        dataset_cls = pose6d_dataset(root / str(pose_dir), mode)
 
-        import ultralytics.data.dataset as ds_module
-
-        original = ds_module.YOLODataset
-        ds_module.YOLODataset = dataset_cls
-        try:
-            return super().get_dataloader(dataset_path, batch_size, rank, mode)
-        finally:
-            ds_module.YOLODataset = original
+        csv_name = f"{mode}.csv"
+        with pose6d_dataset_context(root / str(pose_dir), mode) as dataset_cls:
+            loader = super().get_dataloader(dataset_path, batch_size, rank, mode)
+            verify_pose_in_loader(loader, source=f"{mode}：{root / str(pose_dir) / csv_name}")
+            return loader
 
     def _needs_pose6d(self) -> bool:
         """当前变体是否真的需要 6D 位姿（即 ``L_rep`` 已启用）。"""
@@ -148,9 +149,19 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
               f"增益 pose={getattr(self.args, 'pose', '?')} / kobj={getattr(self.args, 'kobj', '?')}"
               f" | dfl 增益={dfl_gain}")
         if hasattr(criterion, "active"):        # ReprojCriterion：报告 L_rep 的 warm-up 状态
+            # 文案要说准：warmup=0 时"warm-up 中"是错的说法（前 0 个 epoch 只用 2D 项
+            # 意味着从第 1 个 epoch 起就该生效，只是框架此刻还没训完第 1 个 epoch）。
+            if criterion.active:
+                state = "本期生效"
+            elif not criterion.enabled:
+                state = "本期未生效（L_rep 已关闭）"
+            else:
+                remaining = max(0, int(criterion.warmup_epochs) - int(criterion.epoch))
+                state = (f"本期未生效：warm-up 还剩 {remaining} 个 epoch"
+                         f"（已训完 {criterion.epoch} / {criterion.warmup_epochs}）")
             print(f"[EP7] 几何重投影 L_rep：权重={criterion.weight}、"
                   f"warm-up={criterion.warmup_epochs} epoch、当前 epoch={criterion.epoch}、"
-                  f"本期{'生效' if criterion.active else '未生效（warm-up 中）'}")
+                  f"{state}")
         print(f"[EP4/EP5] 已生效 EP：{sorted(k for k, v in eps.items() if v)}"
               f" | ProgLoss={'框架原生 E2ELoss.update' if _has_prog_loss(criterion) else '不适用'}")
 

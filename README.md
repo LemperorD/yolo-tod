@@ -129,6 +129,9 @@ python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 128
 python3 tools/test_mav6d.py --model phantom4       # 测试（--model both 两机型一起报）
 ```
 
+> 训练集位置统一由 `configs/datasets.yaml` 决定（换盘/换机器只改它的 `data_root`，
+> 脚本里没有任何绝对路径）；`python3 tools/train.py --list-datasets` 可先确认解析结果。
+
 **本库从数据里实证核对过的四件事**（都写进了代码注释，别改）：
 
 1. `labels_yolo6d` 是 **21 列** = `cls` + 9 个点 ×2 + **(w,h)**。9 点 = 1 个 3D 框中心 +
@@ -161,8 +164,8 @@ python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
 # 结构自检：建模型 + 一次前向，不需要数据集
 python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --dry-run
 
-# 真训练（需先准备 VisDrone）
-python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --data configs/_base_/datasets/visdrone2019-det.yaml
+# 真训练（需先准备 VisDrone；数据集位置由 configs/datasets.yaml 决定，见 WORKFLOW §4.0）
+python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --data visdrone2019-det
 ```
 
 取证笔记（含论文原文摘录、消融表、**两处论文内部数据冲突**、以及"哪些是原文、哪些是我们的推断"）
@@ -328,7 +331,7 @@ python3 tests/train_smoke.py --epochs 2 --device 0
 # 2) 尺度分层评测：整体 AP **与** AP_small / AP_tiny 一起报（只看整体会掩盖小目标退化）
 python3 tools/val.py --variant variants/SDD-YOLO26n/variant.yaml `
     --weights results/SDD-YOLO26n/weights/best.pt `
-    --data configs/_base_/datasets/visdrone2019-det.yaml --imgsz 1024 `
+    --data visdrone2019-det --imgsz 1024 `
     --json variants/SDD-YOLO26n/results.json
 
 # 3) 消融流水线：先看网格与逐字段 diff（秒级、不训练），确认无误再真跑
@@ -336,6 +339,10 @@ python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan
 python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py `
     --data configs/_base_/datasets/visdrone2019-det.yaml --epochs 100 --imgsz 1024 --batch 4
 ```
+
+> `tools/ablation.py` 的 `--data` 仍按**路径**收（它直接读 YAML 内容）；
+> 换盘后写 `<data_root>/...` 的路径即可，`configs/_base_/datasets/*.yaml` 里的相对
+> `path` 不会被框架正确解析（详见 WORKFLOW §4.0）。
 
 > 消融的两条硬规矩（都写进了代码）：① 组件的"关掉"动作不能一律用 `without` ——
 > 由**框架继承**来的能力（STAL / MuSGD）删键只会退回框架默认（8.4 的默认 TAL 本身就带

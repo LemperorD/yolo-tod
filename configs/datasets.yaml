@@ -1,0 +1,68 @@
+# 数据集注册表 —— 训练/评测脚本「训练集在哪」的唯一事实来源。
+#
+# 为什么要有这个文件（两个都不会变的约束）：
+#   1. ultralytics 对数据集 YAML 里**相对** path 的解析口径不是"按 YAML 所在目录"，
+#      而是按它自己的 datasets_dir：ultralytics/data/utils.py::check_det_dataset
+#      里 `path = (DATASETS_DIR / path).resolve()`。所以 configs/_base_/datasets/*.yaml
+#      里写 `path: ./data/xxx` 换台机器就指错地方（甚至静默读到别的同名目录）。
+#   2. 训练集可以整体挪到另一块盘（本服务器新挂了机械硬盘）。把 `E:/datasets/...`
+#      这类绝对路径写进 configs/_base_/datasets/*.yaml 会污染版本库，也与别的机器冲突。
+#
+# ============================ 换盘：只改 data_root 这一行 ============================
+#   默认 ./data（仓库内的 data/，已 gitignore，当前 MAV6D 数据就在这里）。
+#   要把训练集整体放到新硬盘上：把 data_root 改成新硬盘的挂载点，
+#   并把数据按同样布局放过去（<data_root>/<下面各数据集的 root>）：
+#
+#     data_root: E:/datasets            # Windows 新盘
+#     data_root: /mnt/hdd/datasets      # Linux 新盘（挂载点按实际写）
+#
+#   不想让机器相关路径进版本库：把 data_root（或个别数据集的 root）写进
+#   configs/datasets.local.yaml（已 gitignore），它**按字段覆盖**本文件。
+#   只想临时换一次：--data-root E:/datasets  或  export TOD_DATA_ROOT=E:/datasets
+#
+# ================================== 训练时怎么用 ==================================
+#   python3 tools/train.py --list-datasets                     # 看注册表解析结果（推荐先跑）
+#   python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --data visdrone2019-det
+#   python3 tools/train_mav6d.py --model phantom4              # 默认就用 mav6d-phantom4
+#
+#   解析优先级（高 → 低）：
+#     --data <目录 或 *.yaml>  >  --data-root  >  $TOD_DATA_ROOT
+#     >  datasets.<名>.root  >  data_root/<名>  >  数据集 YAML 自带的 path
+#
+#   字段说明：
+#     data_root   所有数据集的公共根目录（相对路径按**仓库根**解析；支持 ~ 与 $VAR）
+#     datasets.<名>:
+#       root      该数据集的根目录（含 images/、labels/）：相对 data_root，也可写绝对路径
+#       yaml      类别/关键点/字段模板（默认找 configs/_base_/datasets/<名>.yaml）。
+#                 不写 yaml 时要求 <root>/dataset.yaml 存在（MAV6D 转换产物就是这样）
+#       aliases   其它可用名字（变体 spec 的 dataset 字段、--data 都能直接用）
+
+data_root: ./data              # ← 换盘就改这一行（例如 E:/datasets 或 /mnt/hdd/datasets）
+
+datasets:
+  # ---- VisDrone2019（航拍小目标，第一主战场）----
+  visdrone2019-det:
+    root: visdrone2019-det
+    yaml: configs/_base_/datasets/visdrone2019-det.yaml
+    aliases: [visdrone, visdrone2019]
+  # 姿态版目前是接口占位（VisDrone 没有关键点标注），标注到位后直接用
+  visdrone2019-pose:
+    root: visdrone2019-pose
+    yaml: configs/_base_/datasets/visdrone2019-pose.yaml
+
+  # ---- RflySim 仿真（论文口径 9 点机体关键点）----
+  rflysim-pose:
+    root: rflysim-pose
+    yaml: configs/_base_/datasets/rflysim-pose.yaml
+
+  # ---- MAV6D（真实室内 VICON；两机型必须分别训练）----
+  # 这两个数据集没有模板 YAML：根目录里必须有 tools/mav6d_to_yolo.py 生成的
+  # dataset.yaml（内含 kpt_shape / flip_idx / tod.camera_matrix / tod.object_points）。
+  # 换盘后重新转换即可，转换脚本会把**转换时**的绝对 path 写进产物：
+  #   python3 tools/mav6d_to_yolo.py --mav6d <原数据> --model phantom4 --out E:/datasets/mav6d
+  mav6d-phantom4:
+    root: mav6d/phantom4
+    aliases: [phantom4]
+  mav6d-mavic2:
+    root: mav6d/mavic2
+    aliases: [mavic2]

@@ -153,6 +153,24 @@ def main() -> int:
           "Pose" in type(model.model.model[-1]).__name__,
           f"实际 {type(model.model.model[-1]).__name__}")
 
+    # 变体声明的训练超参（只取本自检关心的几项）
+    train_extra = {k: v for k, v in (spec.get("train") or {}).items()
+                   if k in {"dfl", "pose", "kobj", "rle", "optimizer", "lr0", "lrf",
+                            "momentum", "weight_decay", "warmup_epochs", "warmup_momentum",
+                            "close_mosaic", "mosaic", "mixup", "multi_scale", "seed",
+                            "deterministic"}}
+    # **L_rep 与"会丢目标的几何增强"互斥**：RandomPerspective 会把变换后面积占比
+    # <10% 的框连同类丢掉（实测 MAV6D 有 0.68% 的图被丢成 0 框），而 labels_6d 是
+    # 按原图逐目标给的位姿 —— 丢框后就无法认定"哪几行还对应得上"。口径见
+    # ``tod.data.pose6d.pose_safe_augment_overrides``。
+    if bool(((spec.get("eps") or {}).get("EP7") or {}).get("reproj")):
+        from tod.data.pose6d import pose_safe_augment_overrides
+
+        safe = pose_safe_augment_overrides()
+        train_extra.update(safe)
+        print(f"[env ] L_rep 已启用 -> 关闭会丢目标的几何增强："
+              f"{', '.join(f'{k}={v}' for k, v in safe.items())}")
+
     model.train(
         trainer=TODPoseTrainer,
         data=str(data_yaml), epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
@@ -162,10 +180,7 @@ def main() -> int:
         # （ultralytics.utils.checks.check_amp），本自检要的是"姿态回路跑通"，
         # 不需要把网络依赖拉进来；AMP 通路的验证由 tests/train_smoke.py 负责。
         amp=False,
-        **{k: v for k, v in (spec.get("train") or {}).items()
-           if k in {"dfl", "pose", "kobj", "rle", "optimizer", "lr0", "lrf", "momentum",
-                    "weight_decay", "warmup_epochs", "warmup_momentum", "close_mosaic",
-                    "mosaic", "mixup", "multi_scale", "seed", "deterministic"}},
+        **train_extra,
     )
 
     run_dir = project / variant.name
@@ -212,8 +227,38 @@ def main() -> int:
               not crit.active, f"epoch={crit.epoch} active={crit.active}")
         crit.set_epoch(int(cfg["tod"]["reproj_warmup_epochs"]) + 1)
         check("warm-up 之后 L_rep 生效", crit.active)
-        print(f"       -> L_rep：warm-up={crit.warmup_epochs} epoch、"
-              f"{crit.reproj.n_kpt} 个关键点参与")
+
+        # **关键**：上面那些只说明"配置对"。真正要证明的是"训练时几何项算出来了" ——
+        # 曾经的故障（数据集替换静默失效、解码头通道数不对）都能让训练一路跑完，
+        # 而 L_rep 根本没参与。计数来自训练时真正执行的准则对象。
+        from ultralytics.utils.torch_utils import unwrap_model
+
+        trained_crit = None
+        for holder in (getattr(model, "model", None),
+                       getattr(getattr(model, "trainer", None), "model", None)):
+            if holder is None:
+                continue
+            cand = getattr(unwrap_model(holder), "criterion", None)
+            if cand is None:
+                cand = getattr(holder, "criterion", None)
+            if cand is not None:
+                trained_crit = cand
+                break
+        terms = int(trained_crit.reproj_terms()) if hasattr(trained_crit, "reproj_terms") else -1
+        last = getattr(trained_crit, "last_value", None) if trained_crit is not None else None
+        if int(cfg["tod"]["reproj_warmup_epochs"]) == 0 and args.epochs >= 2:
+            check("训练中 L_rep 真的算出了几何项（reproj_terms > 0）", terms > 0,
+                  f"实际 {terms}（trainer 上的准则={type(trained_crit).__name__}）")
+            check("L_rep 数值有限", last is None or abs(float(last)) < 1e6,
+                  f"last_value={last}")
+            print(f"       -> L_rep：warm-up={crit.warmup_epochs} epoch、"
+                  f"{crit.reproj.n_kpt} 个关键点参与、"
+                  f"训练期实际计算 {terms} 次（last={last}）")
+        else:
+            print(f"       -> L_rep：warm-up={crit.warmup_epochs} epoch、"
+                  f"{crit.reproj.n_kpt} 个关键点参与；"
+                  "本次未断言训练期计算次数"
+                  "（需 --warmup 0 --epochs ≥2 才会真正走到 L_rep）")
 
     # ---- 4) 断点能被新进程载入并输出 (n_kpt, 3) 关键点 ----
     reloaded = YOLO(str(best))           # 任务由 checkpoint 里的 model.task 决定

@@ -191,6 +191,9 @@ python3 tests/test_modules.py
 # 3) 关键点/6D 位姿/L_rep：220 项
 python3 tests/test_pose.py
 
+# 3b) 数据集注册表与路径解析：33 项（不需要 torch；换盘后先跑它）
+python3 tests/test_dataset_paths.py
+
 # 4) 变体物化（生成 variant.yaml / model.yaml / card.md）
 python3 tools/make_variant.py variants/spae-yolov8n-pose/recipe.py
 
@@ -214,6 +217,59 @@ python3 tests/train_smoke.py   --epochs 2 --device 0   # 检测回路
 
 ## 4. 准备数据
 
+### 4.0 数据放哪：`configs/datasets.yaml`（换盘只改一行）
+
+训练/评测脚本里**没有**任何绝对路径，也不靠数据集 YAML 里的相对 `path`
+（框架会把它解析到它自己的 `datasets_dir`，换台机器就指错地方，见
+`ultralytics/data/utils.py::check_det_dataset`）。"训练集在哪"由**一份注册表**决定：
+
+```text
+# 先看注册表解析结果：每个数据集指向哪个根目录、train/val 各有多少张图
+python3 tools/train.py --list-datasets
+```
+
+```yaml
+# configs/datasets.yaml（入库）
+data_root: ./data                 # ← 所有数据集的公共根目录；换盘就改这一行
+datasets:
+  visdrone2019-det: {root: visdrone2019-det, yaml: configs/_base_/datasets/visdrone2019-det.yaml}
+  rflysim-pose:     {root: rflysim-pose,     yaml: configs/_base_/datasets/rflysim-pose.yaml}
+  mav6d-phantom4:   {root: mav6d/phantom4}   # 没 yaml 模板 → 用 <root>/dataset.yaml
+  mav6d-mavic2:     {root: mav6d/mavic2}
+```
+
+训练集整体挪到新硬盘时，二选一：
+
+```text
+# 方案 A（推荐）：数据整体放新盘，只改 data_root
+#   configs/datasets.yaml  ->  data_root: E:/datasets        # Linux 写 /mnt/hdd/datasets
+#   数据按 <data_root>/<root> 布局：
+#     E:/datasets/visdrone2019-det、E:/datasets/rflysim-pose、E:/datasets/mav6d/phantom4 ...
+
+# 方案 B（机器相关的路径不进版本库）：写 configs/datasets.local.yaml（已 gitignore），
+# 它按字段覆盖注册表，repo 里的 configs/datasets.yaml 保持原样：
+#   data_root: E:/datasets
+```
+
+临时换一次（不改任何文件）：`--data-root E:/datasets`，或
+`$env:TOD_DATA_ROOT="E:/datasets"`（Linux：`export TOD_DATA_ROOT=/mnt/hdd/datasets`）。
+
+解析优先级：`--data <目录|YAML>` > `--data-root` > `$TOD_DATA_ROOT` >
+`datasets.<名>.root` > `data_root/<名>` > 数据集 YAML 自带的 `path`。
+
+`--data` 三种写法都行，且**必须落到同一个根目录**（脚本会把结果打印出来）：
+
+```text
+--data visdrone2019-det                                       # 注册表名字（推荐）
+--data E:/datasets/visdrone2019-det                           # 数据集目录（要求目录里有 dataset.yaml）
+--data configs/_base_/datasets/visdrone2019-det.yaml          # 数据集 YAML（会反查注册表里的 root）
+```
+
+> 交给框架的是 `.cache/tod/datasets/<名>-<hash>.yaml`：一份 `path` 已被改写成**绝对路径**
+> 的副本。这样框架没有机会再按 `datasets_dir` 猜目录。
+> 数据不在盘上时脚本会**直接报错**并说明"解析出来的路径 + 来历 + 怎么修"，
+> 不会静默回落到仓库里那份旧的同名数据。
+
 ### 4.1 路线 A：MAV6D（本仓库已跑通，推荐）
 
 原始数据放在 `D:/MAV6D`（作者公开数据集；`phantom4` 与 `mavic2` 两个机型）。
@@ -230,6 +286,11 @@ python3 tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model mavic2   --out data/mav6
 python3 tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml
 python3 tools/check_pose_dataset.py --data data/mav6d/mavic2/dataset.yaml
 ```
+
+> `--out` 就是注册表里的 `root` 的上一级（默认 `data_root: ./data` → `data/mav6d`）。
+> 要把数据放到新硬盘上，直接 `--out E:/datasets/mav6d`，再把
+> `configs/datasets.yaml` 的 `data_root` 改成 `E:/datasets`（见 §4.0）。
+> 转换产物里的 `dataset.yaml` 已自带 **绝对** `path`，所以它放哪都能被直接定位。
 
 产物（实测规模）：
 
@@ -263,11 +324,11 @@ python3 tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.
 
 ### 4.3 路线 C：VisDrone2019-DET（纯检测）
 
-数据集需自行下载；配置已备好：
+数据集需自行下载；配置已备好（放 `<data_root>/visdrone2019-det`，见 §4.0）：
 
 ```text
 python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml `
-    --data configs/_base_/datasets/visdrone2019-det.yaml --dry-run   # 先看结构
+    --data visdrone2019-det --dry-run   # 先看结构（数据集没到位也能跑）
 ```
 
 > `visdrone2019-pose.yaml` 目前是**接口占位**（VisDrone 没有关键点标注），
@@ -302,7 +363,14 @@ fliplr=0.5 / pose=12 / kobj=1 / amp=True / workers=4 / seed=0`。
 
 为什么 1280 而不是 640：MAV6D 目标只占画面长边 10–17%（1920 下约 190–320 px），
 640 会把 190 px 的目标缩到 63 px，关键点定位精度直接损失。
-`mosaic=0` 是因为拼接会改变尺度分布，与关键点回归的尺度一致性冲突。
+
+> ⚠️ **启用 6D 位姿监督（`EP7.reproj`，即 SPAE-pose 的默认）时，脚本会自动关掉会丢目标的
+> 几何增强**：`degrees / scale / translate / shear / perspective / mosaic / copy_paste /
+> mixup = 0`（保留 `fliplr` 与颜色抖动）。原因不是口味问题：
+> 框架的 `RandomPerspective` 会把变换后面积占比 <10% 的框**连同类一起丢掉**，
+> 实测 MAV6D 有 **0.68%** 的图被丢成 0 个框；而 `labels_6d` 是**按原图逐目标**给的位姿，
+> 一旦丢框就无法认定"CSV 的哪几行还对应得上"，数据集的一一对应校验会直接报错。
+> 要保留某项就显式 `--set degrees=10` 覆盖它（自担位姿错配风险）。
 
 产物：
 
@@ -319,11 +387,10 @@ results/mav6d-phantom4/
 # 物化变体（生成 model.yaml / variant.yaml / card.md）
 python3 tools/make_variant.py variants/SDD-YOLO26n/recipe.py
 
-# 结构自检 → 真训练
+# 结构自检 → 真训练（--data 用注册表名字；也可用变体里的 data.dataset 默认值）
 python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml --dry-run
 python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml `
-    --data configs/_base_/datasets/visdrone2019-det.yaml `
-    --epochs 100 --batch 4 --imgsz 1024
+    --data visdrone2019-det --epochs 100 --batch 4 --imgsz 1024
 ```
 
 产物在 `results/<变体 id>\weights\best.pt`。
@@ -363,19 +430,24 @@ python3 tools/test_mav6d.py --model phantom4 --max-images 200
 ### 6.2 通用评测
 
 ```text
-# 检测：整体 AP + AP_small / AP_tiny 分层
+# 检测：整体 AP + AP_small / AP_tiny 分层（--data 用注册表名字）
 python3 tools/val.py --weights results/SDD-YOLO26n/weights/best.pt `
-    --data configs/_base_/datasets/visdrone2019-det.yaml --imgsz 1024 `
+    --data visdrone2019-det --imgsz 1024 `
     --json variants/SDD-YOLO26n/results.json
 
 # 姿态：OKS-AP 50:95 + 尺度分层 + 逐关键点诊断
 python3 tools/val_pose.py --weights results/mav6d-phantom4/weights/best.pt `
-    --data data/mav6d/phantom4/dataset.yaml --imgsz 1280 --sigma-strategy uniform
+    --data mav6d-phantom4 --imgsz 1280 --sigma-strategy uniform
 
 # 只测前 N 张，先确认口径通了
 python3 tools/val_pose.py --weights results/mav6d-phantom4/weights/best.pt `
-    --data data/mav6d/phantom4/dataset.yaml --max-images 100
+    --data mav6d-phantom4 --max-images 100
 ```
+
+> 评测结果 JSON 里同时记录 `dataset_name / dataset_root / dataset_yaml`：
+> 换盘后仍能追溯这次评测读的是哪块盘上的哪份数据。
+> `tools/ablation.py` 与 `tools/check_pose_dataset.py` 仍按**路径**收 `--data`
+> （它们直接读 YAML 内容），需要换盘时把路径换成 `<data_root>/...` 即可。
 
 > **只看整体 OKS-AP 会掩盖小目标退化**：OKS 的分母含框面积，3 px 误差在 120 px 人体上
 > OKS≈0.95、在 8 px 行人上 OKS≈0.2。所以评测一律带尺度分层。
@@ -421,6 +493,7 @@ C++/TensorRT 侧（Linux）见 `docs/DEPLOY.md` 与 `src/todrt/README.md`。
 | 架构自检 | `python3 tests/smoke.py` |
 | 模块/姿态自检 | `python3 tests/test_modules.py` / `python3 tests/test_pose.py` |
 | 数据转换 | `python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model phantom4 --out data/mav6d` |
+| 数据集注册表 | `python3 tools/train.py --list-datasets`（换盘只改 `configs/datasets.yaml` 的 `data_root`） |
 | 数据校验 | `python3 tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml` |
 | 训练 | `python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280` |
 | 测试 | `python3 tools/test_mav6d.py --model both` |
@@ -441,6 +514,13 @@ C++/TensorRT 侧（Linux）见 `docs/DEPLOY.md` 与 `src/todrt/README.md`。
 **`python3 -m venv .venv` 报 ensurepip 失败。** 受限/被管控的终端会拦住 pip 往临时目录写文件。
 脚本会自动改走 `--without-pip` 并尝试用系统 pip 引导；仍失败时请换一个普通终端（不要用受限沙箱会话）。
 
+**报 `数据集根目录不存在：E:\...` 或训到了仓库里那份旧数据。** 「训练集在哪」由
+`configs/datasets.yaml` 决定（§4.0），脚本里没有硬编码路径。换盘后先跑
+`python3 tools/train.py --list-datasets` 看解析结果：`[ ok ]` 的才是真找到的。
+修法三选一：① 改注册表的 `data_root` 指向新盘挂载点；② 在 `configs/datasets.local.yaml`
+（已 gitignore）里写 `data_root: <新盘>`；③ 临时 `--data-root <新盘>` 或
+`export TOD_DATA_ROOT=<新盘>`。报错里会打印"解析出来的路径 + 来历"，先看那一行。
+
 **Windows 上标签缓存报 `PermissionError [WinError 5]`。** ultralytics 的标签缓存用命名管道
 （`multiprocessing.Pool`），受限的终端/沙箱会话里会失败。`tools/train_mav6d.py` 默认已改用
 顺序缓存；通用脚本可加 `--set workers=0`（多数情况够用），或给 `tools/train.py` 加
@@ -452,3 +532,19 @@ C++/TensorRT 侧（Linux）见 `docs/DEPLOY.md` 与 `src/todrt/README.md`。
 **`git status` 里 `results/` 一大堆权重。** `.gitignore` 本意是 `results/*` 只保留 `.gitkeep`，
 但 `git add -A --force`（本仓库的自动提交脚本用的就是 force）会无视忽略规则把权重一起提交。
 清理：`git rm -r --cached results` 后确认 `.gitignore` 生效。
+
+**报 `EP7.reproj 已开启，但 batch 里没有 'gt_pose'`。** 这**不是**你没挂位姿，而是数据集替换
+没生效。框架的 `build_yolo_dataset()` 用的是 `ultralytics.data.build` **自己模块里**的
+`YOLODataset` 名字（`from .dataset import YOLODataset` 是值拷贝），只替换
+`ultralytics.data.dataset.YOLODataset` 等于没换。本库已改用
+`tod.data.pose6d.pose6d_dataset_context()`（两个命名空间一起换）并在建完 loader 立刻校验；
+回归测试见 `python3 tests/test_pose6d_swap.py`。若还报这个错，先跑它。
+
+**报 `图像 'xxx'：labels_6d 里有 N 个目标的位姿，但标签文件里有 M 个 GT 框`。**
+两种情况：① `N != M` 且是**原图**层面的错位 → 数据问题，用
+`python3 tools/check_pose_dataset.py --data <dataset.yaml>` 查（它会逐图对齐 CSV 与标签行数）；
+② 训练时 `M == 0` 或 M 明显变小 → 是**增强把框丢了**：`RandomPerspective` 丢弃变换后面积占比
+<10% 的框（实测 MAV6D 0.68% 的图会变成 0 框），此时请确认脚本已施加
+`pose_safe_augment_overrides()`（`tools/train_mav6d.py` 与姿态自检会自动做，并打印
+"关闭会丢目标的几何增强"）。用 `--set` 手动打开 `degrees/scale/translate/shear/perspective/mosaic`
+会重新引入这个错，属于自担风险。

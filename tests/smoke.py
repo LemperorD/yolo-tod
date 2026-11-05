@@ -1,11 +1,4 @@
-"""M0 冒烟测试：不需要 torch / GPU，验证 registry 与 compose 的核心逻辑。
-
-运行::
-
-    python3 tests/smoke.py
-
-只要这一步失败，就不要进入训练阶段 —— 说明架构层已经有问题。
-"""
+"""M0 冒烟测试：不需要 torch / GPU，验证 registry 与 compose 的核心逻辑。"""
 
 from __future__ import annotations
 
@@ -16,7 +9,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -55,9 +47,6 @@ def check(label: str, cond: bool, detail: str = "") -> None:
     PASSED.append(label)
 
 
-# --------------------------------------------------------------- 1. registry
-
-
 def test_registry() -> None:
     @register(ep="EP3", paper="Dummy Upsample", url="https://example.com",
               year=2024, license="MIT", cost="free", aliases=("DummyUp",))
@@ -70,14 +59,12 @@ def test_registry() -> None:
     check("出现在列表中", any(s.name == "_Dummy" for s in list_specs("EP3")))
     check("EP 过滤生效", all(s.ep == "EP3" for s in list_specs("EP3")))
 
-    # 重复注册必须报错，防止无意覆盖
     try:
         register(ep="EP3")(_Dummy)
         raise AssertionError("[FAIL] 重复注册未报错")
     except RegistryError:
         PASSED.append("重复注册被拒绝")
 
-    # 非法 EP 必须报错，强制归档到扩展点
     try:
         register(ep="EP99")(type("_X", (), {}))
         raise AssertionError("[FAIL] 非法 EP 未报错")
@@ -86,9 +73,6 @@ def test_registry() -> None:
 
     check("catalog 含表头", "模块总表" in catalog())
     check("扩展点齐全", set(EXTENSION_POINTS) == {f"EP{i}" for i in range(10)})
-
-
-# ------------------------------------------------------------- 2. compose DSL
 
 
 def test_compose() -> None:
@@ -112,8 +96,6 @@ def test_compose() -> None:
     depth.without("_Dummy")
     check("without 可剥离模块", depth.used_modules() == [])
 
-    # 消融必须覆盖 model 段与 train 段：P2 注入这类结构性改动记在 model_cfg 里，
-    # 早期只扫 eps 会让 v.without("add_p2") 静默失效（消融会得出假结论）
     ablation = (Variant("abl", base="yolov8n")
                 .model(add_p2=True, p2_fuse_block="C3")
                 .strategy(optimizer="MuSGD"))
@@ -133,7 +115,6 @@ def test_compose() -> None:
     except KeyError:
         PASSED.append("未知 EP 被拒绝")
 
-    # 用工作区内的临时目录（系统 temp 可能被文件沙箱禁止写入）
     tmp = ROOT / "tests" / ".tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     if not has_yaml():
@@ -147,42 +128,39 @@ def test_compose() -> None:
         check("卡片含来源表", "引用模块来源" in text)
         check("卡片含尺度指标", "AP_small" in text)
         check("卡片含 base", "yolov8n" in text)
-    except Exception as exc:  # noqa: BLE001 - 冒烟测试要求给出可读失败原因
+    except Exception as exc:  # noqa: BLE001
         raise AssertionError(f"[FAIL] 配置/卡片落盘失败：{exc!r}") from exc
 
 
-# --------------------------------------------------------- 3. 模型图改造逻辑
-
-#: 与官方 yolov8.yaml 同构的最小图（含 backbone/head 两段与全局索引）
 YOLOV8_LIKE = {
     "nc": 80,
     "scales": {"n": [0.33, 0.25, 1024]},
     "backbone": [
-        [-1, 1, "Conv", [64, 3, 2]],        # 0  P1/2
-        [-1, 1, "Conv", [128, 3, 2]],       # 1  P2/4
-        [-1, 3, "C2f", [128, True]],        # 2  ← P2 源
-        [-1, 1, "Conv", [256, 3, 2]],       # 3  P3/8
-        [-1, 6, "C2f", [256, True]],        # 4
-        [-1, 1, "Conv", [512, 3, 2]],       # 5  P4/16
-        [-1, 6, "C2f", [512, True]],        # 6
-        [-1, 1, "Conv", [1024, 3, 2]],      # 7  P5/32
-        [-1, 3, "C2f", [1024, True]],       # 8
-        [-1, 1, "SPPF", [1024, 5]],         # 9
+        [-1, 1, "Conv", [64, 3, 2]],
+        [-1, 1, "Conv", [128, 3, 2]],
+        [-1, 3, "C2f", [128, True]],
+        [-1, 1, "Conv", [256, 3, 2]],
+        [-1, 6, "C2f", [256, True]],
+        [-1, 1, "Conv", [512, 3, 2]],
+        [-1, 6, "C2f", [512, True]],
+        [-1, 1, "Conv", [1024, 3, 2]],
+        [-1, 3, "C2f", [1024, True]],
+        [-1, 1, "SPPF", [1024, 5]],
     ],
     "head": [
-        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],   # 10
-        [[-1, 6], 1, "Concat", [1]],                    # 11
-        [-1, 3, "C2f", [512]],                          # 12
-        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],   # 13
-        [[-1, 4], 1, "Concat", [1]],                    # 14
-        [-1, 3, "C2f", [256]],                          # 15 P3 → Detect 输入
-        [-1, 1, "Conv", [256, 3, 2]],                   # 16
-        [[-1, 12], 1, "Concat", [1]],                   # 17
-        [-1, 3, "C2f", [512]],                          # 18 P4
-        [-1, 1, "Conv", [512, 3, 2]],                   # 19
-        [[-1, 9], 1, "Concat", [1]],                    # 20
-        [-1, 3, "C2f", [1024]],                         # 21 P5
-        [[15, 18, 21], 1, "Detect", [80]],              # 22 Detect(P3,P4,P5)
+        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+        [[-1, 6], 1, "Concat", [1]],
+        [-1, 3, "C2f", [512]],
+        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+        [[-1, 4], 1, "Concat", [1]],
+        [-1, 3, "C2f", [256]],
+        [-1, 1, "Conv", [256, 3, 2]],
+        [[-1, 12], 1, "Concat", [1]],
+        [-1, 3, "C2f", [512]],
+        [-1, 1, "Conv", [512, 3, 2]],
+        [[-1, 9], 1, "Concat", [1]],
+        [-1, 3, "C2f", [1024]],
+        [[15, 18, 21], 1, "Detect", [80]],
     ],
 }
 
@@ -207,23 +185,19 @@ def test_inject_p2() -> None:
     check("融合块通道正确", head[14][2] == "C2f" and head[14][3] == [64])
     check("backbone 未被改动", cfg["backbone"] == YOLOV8_LIKE["backbone"])
 
-    # 幂等：已有 4 路输入时不再重复注入
     inject_p2_head(cfg, p2_idx=2)
     check("重复注入被识别", cfg["_p2_status"] == "already_present")
     check("重复注入不改变长度", len(cfg["head"]) == len(YOLOV8_LIKE["head"]) + 3)
 
-    # 自定义上采样模块（对应 EP3 覆盖）
     cfg2 = copy.deepcopy(YOLOV8_LIKE)
     inject_p2_head(cfg2, p2_idx=2, upsample="DySample", fuse_block="C2f_EMA")
     check("可换成注册的上采样模块", cfg2["head"][12][2] == "DySample")
     check("可换成自定义融合块", cfg2["head"][14][2] == "C2f_EMA")
 
-    # model: 单列表形式也必须支持
     flat = {"nc": 8, "model": YOLOV8_LIKE["backbone"] + YOLOV8_LIKE["head"]}
     inject_p2_head(flat, p2_idx=2)
     check("支持单一 model 列表形式", flat["model"][-1][0] == [24, 15, 18, 21])
 
-    # 回归测试：浅拷贝时节点对象是共享的，改造不得就地污染调用方的原图
     check("浅拷贝输入不污染原图", YOLOV8_LIKE["head"][-1][0] == [15, 18, 21],
           f"实际 {YOLOV8_LIKE['head'][-1][0]}")
 
@@ -238,9 +212,6 @@ def test_type_map() -> None:
     check("backbone Conv 全部替换", convs == 5, f"实际 {convs}")
     check("上采样全部替换", ups == 2, f"实际 {ups}")
     check("替换统计正确", cfg["_type_map_applied"]["Conv"] == 7)
-
-
-# ------------------------------------------------- 3b. 主干下采样替换 / P2 预处理
 
 
 def test_downsample_replacement() -> None:
@@ -298,7 +269,6 @@ def test_from_spec_roundtrip() -> None:
     check("from_spec 往返一致", restored.spec() == data,
           f"\n{restored.spec()}\n!=\n{data}")
 
-    # 任务字段（task）也必须能往返：姿态变体丢了它就是静默按 detect 跑
     pose = (Variant("RoundTripPose", base="yolo26n").pose(kpt_shape=(17, 3))
             .loss(box="_Dummy", pose="oks").model(nc=10))
     pose_data = pose.spec()
@@ -311,9 +281,6 @@ def test_from_spec_roundtrip() -> None:
         raise AssertionError("[FAIL] 非法任务未报错")
     except ValueError:
         PASSED.append("非法任务被拒绝")
-
-
-# ------------------------------------------------------------ 4. 可选：真模型
 
 
 def test_real_model_if_available() -> None:
@@ -331,15 +298,11 @@ def test_real_model_if_available() -> None:
     detect = (cfg.get("head") or cfg.get("model"))[-1]
     check("真实图 P2 头注入成功", len(detect[0]) == 4)
 
-    # 所选规模必须显式生效：框架的 yaml_model_load 用**文件名**猜规模，猜不到就把
-    # d["scale"] 置空，parse_model 于是退化为 next(iter(scales.keys()))。
-    # 我们生成的 model.yaml 靠 compose 把所选规模排在首位来保证正确。
     scales = cfg.get("scales")
     if isinstance(scales, dict) and scales:
         check("生成图的 scales 首位 = 所选规模", next(iter(scales)) == "n",
               f"实际 {list(scales)[:3]}")
 
-    # YOLO26 base：原生 DFL-free（reg_max=1）+ NMS-free（end2end）—— SDD-YOLO 依赖这两点
     try:
         compat.base_model_yaml("yolo26")
     except compat.CompatError:
@@ -355,7 +318,6 @@ def test_real_model_if_available() -> None:
         check("P2 融合块按论文 §4.2 用 C3",
               any(str(n[2]) == "C3" for n in cfg26["head"]))
 
-    # 检测头不做 YAML 改名，而是记录为建模后手术
     cfg2 = (Variant("RealHead", base="yolov8n")
             .head("Efficient_UAVDet").model(nc=10, add_p2=True).model_yaml(write=False))
     check("检测头记录为建模后手术", cfg2.get("_head_surgery") == "Efficient_UAVDet")
@@ -363,7 +325,6 @@ def test_real_model_if_available() -> None:
           str((cfg2.get("head") or cfg2.get("model"))[-1][2]) == "Detect")
 
 
-#: 与官方 yolo26-pose.yaml 同构的最小图（姿态头的 args 是 [nc, kpt_shape]，比 Detect 多一个参数）
 YOLO26_POSE_LIKE = {
     "nc": 80,
     "end2end": True,
@@ -371,30 +332,30 @@ YOLO26_POSE_LIKE = {
     "kpt_shape": [17, 3],
     "scales": {"n": [0.50, 0.25, 1024]},
     "backbone": [
-        [-1, 1, "Conv", [64, 3, 2]],         # 0  P1/2
-        [-1, 1, "Conv", [128, 3, 2]],        # 1  P2/4
-        [-1, 2, "C3k2", [256, False, 0.25]], # 2  ← P2 源
-        [-1, 1, "Conv", [256, 3, 2]],        # 3  P3/8
-        [-1, 2, "C3k2", [512, False, 0.25]], # 4
-        [-1, 1, "Conv", [512, 3, 2]],        # 5  P4/16
-        [-1, 2, "C3k2", [512, True]],        # 6
-        [-1, 1, "Conv", [1024, 3, 2]],       # 7  P5/32
-        [-1, 2, "C3k2", [1024, True]],       # 8
+        [-1, 1, "Conv", [64, 3, 2]],
+        [-1, 1, "Conv", [128, 3, 2]],
+        [-1, 2, "C3k2", [256, False, 0.25]],
+        [-1, 1, "Conv", [256, 3, 2]],
+        [-1, 2, "C3k2", [512, False, 0.25]],
+        [-1, 1, "Conv", [512, 3, 2]],
+        [-1, 2, "C3k2", [512, True]],
+        [-1, 1, "Conv", [1024, 3, 2]],
+        [-1, 2, "C3k2", [1024, True]],
     ],
     "head": [
-        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],   # 9
-        [[-1, 6], 1, "Concat", [1]],                    # 10
-        [-1, 2, "C3k2", [512, True]],                   # 11
-        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],   # 12
-        [[-1, 4], 1, "Concat", [1]],                    # 13
-        [-1, 2, "C3k2", [256, True]],                   # 14 P3 → 头输入
-        [-1, 1, "Conv", [256, 3, 2]],                   # 15
-        [[-1, 11], 1, "Concat", [1]],                   # 16
-        [-1, 2, "C3k2", [512, True]],                   # 17 P4
-        [-1, 1, "Conv", [512, 3, 2]],                   # 18
-        [[-1, 8], 1, "Concat", [1]],                    # 19
-        [-1, 1, "C3k2", [1024, True, 0.5, True]],       # 20 P5
-        [[14, 17, 20], 1, "Pose26", [80, [17, 3]]],     # 21 Pose26(P3,P4,P5)
+        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+        [[-1, 6], 1, "Concat", [1]],
+        [-1, 2, "C3k2", [512, True]],
+        [-1, 1, "nn.Upsample", [None, 2, "nearest"]],
+        [[-1, 4], 1, "Concat", [1]],
+        [-1, 2, "C3k2", [256, True]],
+        [-1, 1, "Conv", [256, 3, 2]],
+        [[-1, 11], 1, "Concat", [1]],
+        [-1, 2, "C3k2", [512, True]],
+        [-1, 1, "Conv", [512, 3, 2]],
+        [[-1, 8], 1, "Concat", [1]],
+        [-1, 1, "C3k2", [1024, True, 0.5, True]],
+        [[14, 17, 20], 1, "Pose26", [80, [17, 3]]],
     ],
 }
 
@@ -417,7 +378,6 @@ def test_inject_p2_pose_head() -> None:
     check("融合块按配置生成（C3，128 通道，紧邻头之前）",
           head[-2][2] == "C3" and head[-2][3] == [128], f"实际 {head[-2]}")
 
-    # 幂等 + 浅拷贝不污染（与 Detect 版同样的回归要求）
     inject_p2_head(cfg, p2_idx=2)
     check("姿态图重复注入被识别", cfg["_p2_status"] == "already_present")
     check("姿态图浅拷贝不污染原图", YOLO26_POSE_LIKE["head"][-1][0] == [14, 17, 20],

@@ -1,28 +1,4 @@
-"""导出入口：变体/权重 → ONNX → （可选）TensorRT engine + C++ 部署配置。
-
-为什么必须有这个脚本（而不是直接 `yolo export`）：
-  1. **检测头被"建模后手术"改过**（`tod.engine.surgery`：Efficient_UAVDet 的分组卷积
-     stem）。`yolo export` 拿到的是未经手术的模型，导出的 ONNX 与训练权重不一致。
-  2. 手术会改变分支输出，**检测头的 `stride` 缓存必须重算**，否则 ultralytics 会按
-     旧的 stride 生成 anchor，导出的 detect 输出与解码器对不上（框会全乱）。
-  3. C++ 端解码需要知道 `nc / reg_max / strides / layout`，这些信息只能由这里
-     **一次性导出成部署配置 JSON**（src/todrt 的唯一契约），避免在两处手抄。
-
-用法::
-
-    # 1) 检查导出链路（不需要 GPU 也能跑到 ONNX 这一步）
-    python3 tools/export_onnx.py --variant variants/SPAE-YOLOv8n/variant.yaml \\
-        --weights results/SPAE-YOLOv8n/weights/best.pt \\
-        --imgsz 640 --out exports/ --deploy-config configs/deploy/spae-yolov8n.json
-
-    # 2) 顺带构建 TensorRT engine（需要目标机上的 tensorrt Python 包）
-    python3 tools/export_onnx.py --variant ... --weights ... --build-engine \\
-        --engine-preset orin --save-engine exports/spae_orin_fp16.engine
-
-    # 3) INT8（需要校准数据列表）
-    python3 tools/export_onnx.py ... --build-engine --engine-preset orin \\
-        --int8 --calib-data exports/calib.txt
-"""
+"""导出入口：变体/权重 → ONNX → （可选）TensorRT engine + C++ 部署配置。"""
 
 from __future__ import annotations
 
@@ -34,7 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -42,7 +17,6 @@ try:
 except Exception:
     pass
 
-#: C++ 端（src/todrt）识别这个 schema；改动字段请同时改 src/todrt/src/config_io.cpp
 DEPLOY_SCHEMA = "todrt.deploy/v1"
 
 
@@ -81,9 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-# --------------------------------------------------------------------- 模型准备
-
-
 def load_model(args):
     """返回 (YOLO 模型, spec dict)。权重与变体同时给出时，先建变体图再压权重。"""
     import tod
@@ -114,7 +85,6 @@ def load_model(args):
         print("       [!] 未提供 --variant：无法应用 EP5 头部手术，"
               "导出的图只适合没有做检测头改造的变体。")
 
-    # 权重覆盖：变体图 + 训练好的权重
     if args.weights and variant is not None:
         import torch
 
@@ -128,7 +98,6 @@ def load_model(args):
         if unexpected:
             print(f"       多余示例：{unexpected[:5]}")
 
-    # ---- EP5 头部手术（必须与训练时一致，否则权重与图不匹配）----
     if spec:
         applied = apply_spec(model.model, spec)
         if applied:
@@ -142,12 +111,7 @@ def load_model(args):
 
 
 def recompute_stride(net) -> None:
-    """重算检测头的 stride 缓存。
-
-    为什么必须做：ultralytics 的 `Detect.__init__` 会按 stride=[8,16,32] 造 anchor 网格
-    （`_make_anchors`），并在 `bias_init` 里给出先验。头部手术改变了分支通道，但不会
-    自动更新 stride；一旦 stride 与真实下采样不一致，导出的输出与解码器就对不上。
-    """
+    """重算检测头的 stride 缓存。"""
     import torch
 
     head = net.model[-1]
@@ -160,7 +124,7 @@ def recompute_stride(net) -> None:
         with torch.no_grad():
             _ = net(torch.zeros(1, 3, s, s))
         print(f"[stride] 重算完成：{list(head.stride)}")
-    except Exception as exc:  # pragma: no cover - 依赖具体框架版本
+    except Exception as exc:  # pragma: no cover
         print(f"[stride] 重算失败（{exc}），沿用框架缓存值：{list(head.stride)}")
 
 
@@ -169,14 +133,11 @@ def infer_layout_and_strides(model, spec: dict, imgsz: int) -> tuple[str, list[i
     head = model.model.model[-1]
     strides = [int(s) for s in getattr(head, "stride", [8, 16, 32])]
     reg_max = int(getattr(head, "reg_max", 16))
-    # ultralytics 的 Detect.forward（推理态）是 anchor-major：cat([cv2, cv3]) 后按 anchor 展开
     layout = "anchor-major-dfl"
     return layout, strides, reg_max
 
 
-# --------------------------------------------------------------------- 部署配置
-
-
+# 部署配置记录实际输出布局与 stride，供 C++ 解码直接使用。
 def build_deploy_config(model, spec: dict, args, onnx_path: Path, layout: str,
                         strides: list[int], reg_max: int, imgsz: int,
                         anchors: int | None) -> dict:
@@ -231,9 +192,6 @@ def expected_anchors(imgsz: int, strides: list[int]) -> int:
     return sum((imgsz // s) ** 2 for s in strides)
 
 
-# --------------------------------------------------------------------- TensorRT
-
-
 def build_engine(onnx_path: Path, cfg: dict, args) -> Path:
     """用 tensorrt Python 包构建 engine（仅在实机上可用；开发机跳过即可）。"""
     try:
@@ -261,7 +219,7 @@ def build_engine(onnx_path: Path, cfg: dict, args) -> Path:
     hw = cfg["hardware"]
     try:
         config.set_flag(trt.BuilderFlag.FP16)
-    except Exception:  # TensorRT 11 强类型后该 flag 可能已移除
+    except Exception:
         pass
     if hw.get("precision") == "int8":
         config.set_flag(trt.BuilderFlag.INT8)
@@ -291,9 +249,6 @@ def build_engine(onnx_path: Path, cfg: dict, args) -> Path:
     return out_path
 
 
-# --------------------------------------------------------------------- 主流程
-
-
 def main() -> int:
     args = build_parser().parse_args()
     args.out = Path(args.out)
@@ -308,7 +263,6 @@ def main() -> int:
     print(f"[导出] {model_name}: imgsz={imgsz} strides={strides} reg_max={reg_max} "
           f"layout={layout} 预期 anchor={anchors}")
 
-    # ---- ONNX ----
     export_kwargs = dict(
         format="onnx",
         imgsz=imgsz,
@@ -324,7 +278,6 @@ def main() -> int:
     try:
         onnx_path = Path(model.export(**export_kwargs))
     except TypeError:
-        # 不同 ultralytics 版本对 batch/nms 参数的支持不一致，降级重试
         for drop in ("batch", "nms", "simplify"):
             export_kwargs.pop(drop, None)
         onnx_path = Path(model.export(**export_kwargs))
@@ -335,10 +288,8 @@ def main() -> int:
         print("[ONNX] 已把 NMS 导出进图：解码布局切换为 plugin-nms "
               "（阈值改动需重建 engine，注意记录）")
 
-    # ---- 校验输出形状（这一步能在导出阶段抓住绝大多数配置错误）----
     verify_onnx(onnx_path, anchors, layout)
 
-    # ---- 部署配置（C++ 端的唯一契约）----
     cfg = build_deploy_config(model, spec, args, onnx_path, layout, strides, reg_max, imgsz,
                               None if args.nms else anchors)
     deploy_path = args.deploy_config or (args.out / f"{model_name}.deploy.json")

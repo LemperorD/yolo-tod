@@ -1,9 +1,3 @@
-// nms.cpp —— IoU / 硬 NMS / soft-NMS
-//
-// 为什么不用 EfficientNMS 插件：插件的确更快，但（1）它把解码固定进引擎，
-// 阈值就只能靠重建 engine 才能改；（2）在密集小目标场景里 soft-NMS / 按类别
-// 分开抑制这类策略反而更实用。所以本项目把 NMS 放在 CPU（可选 GPU 实现），
-// 用同一个接口暴露，插件输出也能走同一套后处理。
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -29,12 +23,11 @@ float iou(const BBox& a, const BBox& b) {
 
 namespace {
 
-/// 两个检测是否属于"同一组"（class_agnostic = 不分类别一起抑制）。
 inline bool same_group(const Detection& a, const Detection& b, bool class_agnostic) {
   return class_agnostic || a.class_id == b.class_id;
 }
 
-}  // namespace
+}
 
 void nms_hard(const std::vector<Detection>& dets, float iou_threshold, bool class_agnostic,
               std::vector<int>& keep) {
@@ -42,8 +35,6 @@ void nms_hard(const std::vector<Detection>& dets, float iou_threshold, bool clas
   const size_t n = dets.size();
   if (n == 0) return;
 
-  // 假设 dets 已按分数降序（decode_predictions 保证）；这里不再重复排序，
-  // 但为了防御，若乱序则自己排一次。
   std::vector<size_t> order(n);
   for (size_t i = 0; i < n; ++i) order[i] = i;
   const bool sorted = std::is_sorted(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -70,10 +61,6 @@ void nms_hard(const std::vector<Detection>& dets, float iou_threshold, bool clas
 
 void nms_soft(std::vector<Detection>& dets, float iou_threshold, float sigma, float score_floor,
               bool class_agnostic, std::vector<int>& keep) {
-  // 高斯 soft-NMS：重叠度越高，邻框分数衰减越狠；衰减后低于下限的直接丢弃。
-  //
-  // 注意：本实现是"贪心 + 衰减"版本（与论文 Algorithm 1 的贪心形式一致）：
-  // 衰减只作用于当前最高分框之后的候选，因此结果与遍历顺序无关。
   keep.clear();
   const size_t n = dets.size();
   if (n == 0) return;
@@ -103,20 +90,15 @@ void nms_soft(std::vector<Detection>& dets, float iou_threshold, float sigma, fl
       const float ov = iou(dets[i].box, dets[j].box);
       if (ov > iou_threshold) {
         decay[j] *= std::exp(-(ov * ov) / denom);
-        dets[j].score *= std::exp(-(ov * ov) / denom);  // 就地衰减，供调用方观察
+        // Soft-NMS 原地衰减分数，最终结果应使用衰减后的置信度。
+        dets[j].score *= std::exp(-(ov * ov) / denom);
       }
     }
   }
 }
 
-// ------------------------------------------------------------------ NMS 后处理器
-
 namespace {
 
-/// 标准检测后处理：解码 → NMS → 坐标反变换 → 分数排序/截断。
-///
-/// 之所以把「解码 + NMS」放同一个后处理器里：两者共享同一份阈值语义，
-/// 拆开反而更容易出现"解码用 0.25 但 NMS 用 0.1"这种不可追溯的错配。
 class NmsPostprocessor : public IPostprocessor {
  public:
   NmsPostprocessor() = default;
@@ -135,8 +117,6 @@ class NmsPostprocessor : public IPostprocessor {
     const int batch = pre.batch > 0 ? pre.batch : 1;
     std::vector<std::vector<Detection>> result(static_cast<size_t>(batch));
 
-    // 目前只消费第 0 个输出（YOLOv8/SPAE 都是单输出）。
-    // 若将来接入多输出（如 P2-P5 每层一个 head），在此处按层合并即可。
     const TensorView& main = outputs[0];
     if (!main.valid()) throw TritError("主输出张量无效");
 
@@ -144,7 +124,6 @@ class NmsPostprocessor : public IPostprocessor {
       result[0] = decode_predictions(main, opt_.decode);
       Apply(result[0]);
     } else {
-      // 解码要求 batch=1：这里按 batch 维切分，逐帧解码（避免任何隐式假设）。
       result = DecodeBatched(main, batch);
     }
     return result;
@@ -170,11 +149,9 @@ class NmsPostprocessor : public IPostprocessor {
     dets.swap(out);
   }
 
-  /// 按 batch 维切片后逐帧解码（仅在确实提交了多图时才用到）。
   std::vector<std::vector<Detection>> DecodeBatched(const TensorView& main, int batch) {
     std::vector<std::vector<Detection>> out(static_cast<size_t>(batch));
     if (opt_.decode.layout == OutputLayout::kPluginNms) {
-      // [N,6/7]：直接按行过滤，不需要逐帧切分
       return {decode_predictions(main, opt_.decode)};
     }
     const DataType dt = main.dtype;
@@ -184,7 +161,6 @@ class NmsPostprocessor : public IPostprocessor {
       TensorView slice = main;
       slice.data = static_cast<const uint8_t*>(main.data) +
                    static_cast<size_t>(b) * static_cast<size_t>(per_batch) * elem;
-      // 切片后的形状：把 batch 维置 1
       slice.shape[0] = 1;
       out[static_cast<size_t>(b)] = decode_predictions(slice, opt_.decode);
       Apply(out[static_cast<size_t>(b)]);
@@ -200,7 +176,7 @@ std::unique_ptr<IPostprocessor> FactoryNmsPostproc() {
   return std::unique_ptr<IPostprocessor>(new NmsPostprocessor());
 }
 
-}  // namespace
+}
 
 TOD_RT_REGISTER_POSTPROC(detect_nms, FactoryNmsPostproc)
 TOD_RT_REGISTER_POSTPROC(nms, FactoryNmsPostproc)
@@ -210,4 +186,4 @@ std::unique_ptr<IPostprocessor> make_nms_postprocessor(const PostprocessOptions&
   return std::unique_ptr<IPostprocessor>(new NmsPostprocessor(o));
 }
 
-}  // namespace todrt
+}

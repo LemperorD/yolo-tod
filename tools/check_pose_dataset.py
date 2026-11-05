@@ -1,29 +1,4 @@
-"""RflySim / 任意 YOLO-pose 数据集的**开训前校验**：把静默错误变成明确报错。
-
-**为什么必须有一个独立校验器**：关键点数据的错误几乎全是**静默**的 —— 训练会照常跑、
-损失会照常降、指标看起来"有个数"，但学到的是错的解剖结构。已知的静默失败类型：
-
-    ==========================  ================================================
-    错误                          后果
-    ==========================  ================================================
-    kpt_shape 与标签列数不一致      框架在标签缓存阶段才报错（有时被 workers 吞掉），
-                                  或在多进程里变成难懂的异常
-    flip_idx 缺失/写错             框架**自动关掉 fliplr/flipud**（静默），
-                                  或把关键点配到错误的关节上（更糟）
-    flip_idx 不是对换置换           翻转两次不回到原状，标注被系统性打乱
-    v 全为 0 的点                   该点在 OKS 与 kobj 里被完全忽略（等于没标）
-    v 语义用反（0=可见）            掩码整体反转，学出来的点是"不可见点"
-    越界点被裁剪到边界            坐标合法但物理错误 → 关键点永远贴边
-    尺度分布失衡                   没有小目标样本时，AP_small 无从谈起
-    ==========================  ================================================
-
-用法::
-
-    python3 tools/check_pose_dataset.py --data configs/_base_/datasets/rflysim-pose.yaml
-    python3 tools/check_pose_dataset.py --data ... --split val --sample 20 --json out.json
-
-退出码：有 **错误** 时返回 1（可直接进 CI / 开训前置检查）；只有警告时返回 0。
-"""
+"""RflySim / 任意 YOLO-pose 数据集的**开训前校验**：把静默错误变成明确报错。"""
 
 from __future__ import annotations
 
@@ -36,16 +11,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
     tod.configure_stdio()
 except Exception:
     pass
-
-
-# ------------------------------------------------------------------ 检查工具
 
 
 class Report:
@@ -70,9 +41,6 @@ class Report:
         return not self.errors
 
 
-# ------------------------------------------------------------------ 配置检查
-
-
 def check_config(cfg: dict, report: Report) -> tuple[tuple[int, int], list[int], list[str]]:
     """校验 kpt_shape / flip_idx / kpt_names 三件套，返回 ``(kpt_shape, flip_idx, names)``。"""
     raw_shape = cfg.get("kpt_shape")
@@ -94,7 +62,6 @@ def check_config(cfg: dict, report: Report) -> tuple[tuple[int, int], list[int],
             "kobj（可见性）分支会退化成全 1 掩码，遮挡样本无法被忽略。"
         )
 
-    # ---- flip_idx：框架的硬行为（缺失即静默关掉翻转增强）----
     flip_idx = [int(x) for x in (cfg.get("flip_idx") or [])]
     if not flip_idx:
         report.error(
@@ -124,9 +91,7 @@ def check_config(cfg: dict, report: Report) -> tuple[tuple[int, int], list[int],
             fixed = [i for i, j in enumerate(flip_idx) if i == j]
             report.note(f"flip_idx 中自配对（在镜像轴上）的点：{fixed or '无'}")
 
-    # ---- kpt_names：按类别给；用于可视化和日志 ----
     names = cfg.get("kpt_names") or {}
-    # nc 缺省时按 names 的条目数推断（很多数据集只写 names 不写 nc）
     n_cls = int(cfg.get("nc") or len(cfg.get("names") or {}) or 1)
     if not names:
         report.warn(
@@ -158,16 +123,8 @@ def check_config(cfg: dict, report: Report) -> tuple[tuple[int, int], list[int],
     return kpt_shape, flip_idx, names
 
 
-# ------------------------------------------------------------------ 标签检查
-
-
 def dataset_root(cfg: dict, base: Path | None = None) -> Path:
-    """解析数据集 YAML 里 ``path`` 的根目录。
-
-    ``path`` 缺省时**回退到 YAML 所在目录**，而不是当前工作目录 —— 否则从仓库根目录
-    执行 ``python3 tools/check_pose_dataset.py --data tests/.tmp/x/dataset.yaml`` 会把
-    相对路径解析到仓库根，误报"找不到标签文件"。与 ``src/tod/eval/scales.py`` 同一口径。
-    """
+    """解析数据集 YAML 里 ``path`` 的根目录。"""
     raw = cfg.get("path")
     fallback = base if base is not None else Path(".")
     root = Path(str(raw)) if raw else Path(fallback)
@@ -177,15 +134,7 @@ def dataset_root(cfg: dict, base: Path | None = None) -> Path:
 
 
 def iter_label_files(root: Path, split: str) -> list[Path]:
-    """按 ultralytics 约定定位标签文件。
-
-    数据集 YAML 里 ``train:``/``val:`` 写的是**图像**路径（如 ``images/train``），
-    标签在同级 ``labels/train``。早先这里直接拼 ``root/split`` 会找不到任何标签、
-    误报"没有数据" —— 所以按优先级依次尝试，并把 ``/images/`` 换成 ``/labels/``。
-
-    列表文件（``.txt`` 里一行一个路径）统一按正斜杠解析：Windows 生成的清单在 Linux
-    上会被当成含 ``\\`` 的单个文件名，一条都读不到。
-    """
+    """按 ultralytics 约定定位标签文件。"""
     value = str(split)
     candidates: list[Path] = []
     if "images" in Path(value).parts:
@@ -199,7 +148,7 @@ def iter_label_files(root: Path, split: str) -> list[Path]:
             files = sorted(target.rglob("*.txt"))
             if files:
                 return files
-        elif target.suffix == ".txt" and target.is_file():     # 列表文件
+        elif target.suffix == ".txt" and target.is_file():
             lines = [ln.strip() for ln in target.read_text(encoding="utf-8").splitlines()
                      if ln.strip()]
             if lines:
@@ -224,7 +173,6 @@ def check_labels(cfg: dict, kpt_shape: tuple[int, int], flip_idx: list[int],
                  split: str, sample: int, report: Report, base: Path | None = None) -> dict:
     """逐行校验标签格式与数值，返回统计信息。"""
     n_kpt, n_dim = kpt_shape
-    # nc 缺省时按 names 的条目数推断（很多数据集只写 names 不写 nc）
     n_cls = int(cfg.get("nc") or len(cfg.get("names") or {}) or 1)
     root = dataset_root(cfg, base)
     files = iter_label_files(root, split)
@@ -268,9 +216,7 @@ def check_labels(cfg: dict, kpt_shape: tuple[int, int], flip_idx: list[int],
             cx, cy, bw, bh = vals[:4]
             if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0 and 0.0 < bw <= 1.0 and 0.0 < bh <= 1.0):
                 report.error(f"{path.name}:{lineno} 框不是合法的归一化 xywh：{vals[:4]}。")
-            # 尺度统计（按框的**归一化**边长收集，最后统一汇总）
             stats["box_sides_px"].append((bw, bh))
-            # 关键点
             for k in range(n_kpt):
                 x, y = vals[4 + k * n_dim], vals[5 + k * n_dim]
                 v = vals[4 + k * n_dim + 2] if n_dim == 3 else 1.0
@@ -287,7 +233,6 @@ def check_labels(cfg: dict, kpt_shape: tuple[int, int], flip_idx: list[int],
                             f"({x:.3f},{y:.3f}) 但 v={v}≠0；越界点应写 v=0（未标注），"
                             "不要裁剪到边界（裁剪会得到「永远贴边」的假样本）。"
                         )
-                # 点是否落在框内（Looser 判定：允许一定外扩，因为电机点常在框边缘）
                 if v > 0:
                     x1, y1 = cx - bw / 2, cy - bh / 2
                     x2, y2 = cx + bw / 2, cy + bh / 2
@@ -303,7 +248,6 @@ def check_labels(cfg: dict, kpt_shape: tuple[int, int], flip_idx: list[int],
     if stats["empty_files"]:
         report.warn(f"{stats['empty_files']} 个标签文件是空的（该图无目标；空图过多会让训练偏负样本）。")
 
-    # 每点的可见率：全 0 的点等于没标
     dead = [k for k, s in stats["kpt_per_index_vis"].items() if s["n"] and s["vis"] == 0]
     if dead:
         report.error(
@@ -340,14 +284,7 @@ def summarize_scale(stats: dict, cfg: dict, report: Report) -> None:
 
 
 def check_pose6d(cfg: dict, split: str, report: Report, base: Path | None = None) -> dict:
-    """校验 ``L_rep``（论文式 8）需要的 6D 位姿旁挂数据与相机/机体参数。
-
-    论文启用几何重投影项后 10°10cm 提升 >10%，但它的输入有三处**极易错且静默**：
-      1. CSV 的 ``obj_index`` 与标签行序错位 → 几何监督配到别的目标上；
-      2. ``object_points`` 的个数/顺序与 ``kpt_names`` 不一致 → 监督到错误的机体点；
-      3. 相机内参缺失或不是 3×3 → 射线算错，损失变成一个与几何无关的量。
-    因此这里逐条检查，缺任何一项都报**错误**（不是警告）。
-    """
+    """校验 ``L_rep``（论文式 8）需要的 6D 位姿旁挂数据与相机/机体参数。"""
     tod = cfg.get("tod") or {}
     stats: dict = {"split": split, "pose_rows": 0, "pose_images": 0, "labels": 0}
     pose_dir = tod.get("pose_labels")
@@ -376,8 +313,25 @@ def check_pose6d(cfg: dict, split: str, report: Report, base: Path | None = None
         return stats
     stats["pose_images"] = len(table)
     stats["pose_rows"] = sum(len(v) for v in table.values())
+    pose_source = tod.get("pose_source")
+    if pose_source:
+        report.note(f"6D 位姿来源：{pose_source}")
+    coverage = tod.get("pose_coverage")
+    if coverage is not None:
+        try:
+            cov = float(coverage)
+        except (TypeError, ValueError):
+            cov = None
+        if cov is not None:
+            report.note(f"6D 位姿覆盖率：{cov:.1%}")
+            if cov < 0.5:
+                report.warn(
+                    f"6D 位姿覆盖率只有 {cov:.1%}：L_rep 实际几乎不生效。"
+                    "请用 tools/mav6d_to_yolo.py --pose-from-pnp --fit-pnp-shape "
+                    "拟合该机型形状，或先用 --no-lrep 跑 2D baseline。"
+                )
+    strict = bool(tod.get("pose_strict", True))
 
-    # ---- 与标签行数逐图对齐（错位是静默错误里最危险的一种）----
     label_dir = resolve_labels_dir(cfg, split, base)
     if label_dir and label_dir.is_dir():
         mismatched = []
@@ -388,13 +342,18 @@ def check_pose6d(cfg: dict, split: str, report: Report, base: Path | None = None
             if have != len(lines):
                 mismatched.append(f"{path.stem}(csv={have} labels={len(lines)})")
         if mismatched:
-            report.error(
-                f"{len(mismatched)} 张图的 6D 位姿行数与标签行数不一致（前 5 个："
-                f"{mismatched[:5]}）。obj_index 必须与标签行序一一对应，"
-                "否则几何监督会配到别的目标上，而训练**不会报错**。"
-            )
+            if strict:
+                report.error(
+                    f"{len(mismatched)} 张图的 6D 位姿行数与标签行数不一致（前 5 个："
+                    f"{mismatched[:5]}）。obj_index 必须与标签行序一一对应，"
+                    "否则几何监督会配到别的目标上，而训练**不会报错**。"
+                )
+            else:
+                report.warn(
+                    f"{len(mismatched)} 张图没有完整 6D 位姿（pose_strict=false，"
+                    f"L_rep 会跳过它们；前 5 个：{mismatched[:5]}）。"
+                )
 
-    # ---- 相机内参 ----
     K = tod.get("camera_matrix")
     if not K:
         report.error("缺少 tod.camera_matrix（3×3 相机内参），L_rep 无法计算。")
@@ -413,7 +372,6 @@ def check_pose6d(cfg: dict, split: str, report: Report, base: Path | None = None
         except ImportError:  # pragma: no cover
             pass
 
-    # ---- 机体 3D 关键点 ----
     obj = tod.get("object_points")
     n_kpt = int((cfg.get("kpt_shape") or [0])[0] or 0)
     if not obj:
@@ -478,9 +436,6 @@ def check_image_pairing(cfg: dict, split: str, report: Report,
         report.note(f"图像/标签配对完整（{len(stems)} 张）。")
 
 
-# ------------------------------------------------------------------ 入口
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="YOLO-pose 数据集开训前校验")
     ap.add_argument("--data", type=Path, required=True, help="数据集 YAML")
@@ -497,7 +452,7 @@ def main() -> int:
     report = Report()
 
     kpt_shape, flip_idx, _names = check_config(cfg, report)
-    base = args.data.parent                      # 相对 path 以 YAML 所在目录为基准
+    base = args.data.parent
     stats: dict = {}
     if kpt_shape[0] > 0:
         stats = check_labels(cfg, kpt_shape, flip_idx, args.split, args.sample, report, base)

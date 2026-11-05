@@ -1,18 +1,4 @@
-"""把配方（Python 代码）物化成变体产物：variant.yaml + model.yaml + card.md。
-
-架构约定（PLAN.md §4.2）：变体由**代码**定义，不由人手写 YAML 维护。
-配方文件里只需暴露一个名为 ``variant`` 的 ``tod.compose.Variant`` 对象::
-
-    # variants/SPAE-YOLOv8n/recipe.py
-    from tod.compose import Variant
-
-    variant = Variant("SPAE-YOLOv8n", base="yolov8n").data(...)...
-
-用法::
-
-    python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
-    python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py --no-model
-"""
+"""把配方（Python 代码）物化成变体产物：variant.yaml + model.yaml + card.md。"""
 
 from __future__ import annotations
 
@@ -24,7 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -59,8 +44,6 @@ def main() -> int:
     out = args.out or args.recipe.parent
     out.mkdir(parents=True, exist_ok=True)
 
-    # 先导入所有注册库，让卡片能自动带出论文来源与许可证（EP4/EP6/EP7/EP9 都在内）。
-    # 这一步依赖 torch，环境未就绪时降级为警告，不阻塞 spec 生成。
     try:
         import tod
 

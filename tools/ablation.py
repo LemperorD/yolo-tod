@@ -1,37 +1,4 @@
-"""消融流水线：一个变体的 leave-one-out / 逐项开关批量跑「训练 + 尺度分层评测」。
-
-**为什么必须自动化**（PLAN §2.3、§4.2）：变体的价值不在"涨了几个点"，而在
-"这个点是谁贡献的、代价多少"。手工改配置跑消融一定会让配置与代码漂移；
-本工具直接从配方（``recipe.py``）派生消融配置，并调用与
-``tools/train.py`` / ``tools/val.py`` **完全相同**的路径，保证可比。
-
-用法::
-
-    # 1) 只看消融网格（不训练，秒级；用于评审/确认配置正确）
-    python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py --plan
-
-    # 2) 真跑：默认 baseline + 逐项剔除（leave-one-out）
-    python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py \
-        --data configs/_base_/datasets/visdrone2019-det.yaml \
-        --epochs 100 --imgsz 1024 --batch 4 --device 0
-
-    # 3) 自检（合成数据、1 epoch、CPU 也能跑通整条流水线）
-    python3 tools/ablation.py --recipe variants/SDD-YOLO26n/recipe.py \
-        --data tests/.tmp/tiny-detect/dataset.yaml --epochs 1 --imgsz 320 --batch 2 \
-        --device cpu --set workers=0 --max-images 8
-
-产物（全部在 ``--out`` 下，默认 results/ablations/<变体名>/）：
-
-    specs/<配置名>.yaml    派生的变体 spec（可追溯：由哪个 recipe + 去掉什么得到）
-    runs/<配置名>/         训练输出（权重、results.csv、args.yaml）
-    summary.csv            每次配置的 整体/各尺度层 AP50、AP50:95、参数量、耗时
-    summary.md             人读的汇总表（可直接贴进变体卡片）
-
-消融项怎么指定：
-    * ``--drop`` 给出"要剔掉的项"，每项单独生成一个配置（leave-one-out）；
-    * ``--keep-only`` 反向：只保留列出的项，其余全部剔掉；
-    * 不指定时 **自动** 扫描配方 spec 里所有可剥离的键（EP 覆盖值 + model 段开关）。
-"""
+"""消融流水线：一个变体的 leave-one-out / 逐项开关批量跑「训练 + 尺度分层评测」。"""
 
 from __future__ import annotations
 
@@ -46,7 +13,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -54,17 +20,11 @@ try:
 except Exception:
     pass
 
-#: 这些键是"结构性开关"，参与自动消融扫描（其余如 nc/imgsz 属于固定设定）
 ABLATABLE_MODEL_KEYS = ("add_p2", "p2_pre", "p2_fuse_block")
-#: 这些键只是"从框架继承"的标记位或超参，其**值**不作为消融目标
 NEVER_DROP = ("prefer_native", "prog_loss", "kd_levels")
 
-#: 这些取值是"模式开关"而不是组件（剔掉它们没有意义）
 NEVER_TARGETS = {"native", "input", "framework", "auto", "none", "None", ""}
 
-#: 组件的"关掉"动作：**不能一律用 without** —— 由框架继承来的能力（STAL / MuSGD）
-#: 删掉键只会退回框架默认（8.4 的默认 TAL 本身就带小目标先验），
-#: 必须显式切到经典替代物，否则消融会得出"该组件没用"的假结论。
 ABLATION_ACTIONS: dict[str, "callable"] = {
     "DualAttention": lambda v: v.without("DualAttention"),
     "STAL": lambda v: v.assigner("TAL", small_target_aware=False),
@@ -105,7 +65,6 @@ def discover_ablations(variant) -> list[str]:
     for key in ABLATABLE_MODEL_KEYS:
         if spec.get("model", {}).get(key):
             items.append(key)
-    # 去重并保序
     seen: set[str] = set()
     return [x for x in items if not (x in seen or seen.add(x))]
 
@@ -126,7 +85,6 @@ def diff_spec(base: dict, other: dict) -> list[str]:
     return out
 
 
-#: 这些字段的差异不代表"配置变了"（只是名字/来源清单）
 IGNORABLE_DIFF_KEYS = {"id", "modules", "notes", "tags"}
 
 
@@ -165,9 +123,6 @@ def make_variants(variant, drop: list[str], keep_only: list[str], auto: bool):
         v.name = f"without-{item}"
         out.append((v.name, v))
     return out
-
-
-# --------------------------------------------------------------------- 执行
 
 
 def train_one(variant, data: Path, out_dir: Path, args) -> Path:
@@ -209,7 +164,7 @@ def eval_one(variant, weights: Path, data: Path, args) -> dict:
     result = evaluate(data, weights=weights, split=args.split, imgsz=args.imgsz,
                       conf=args.conf, device=args.device, max_images=args.max_images,
                       verbose=False)
-    return result["bins"]          # 只取分层指标；"all" 也在里面，便于统一列表头
+    return result["bins"]
 
 
 def _coerce(text: str):
@@ -300,7 +255,7 @@ def main() -> int:
 
     (out_root / "specs").mkdir(parents=True, exist_ok=True)
     for name, v in variants:
-        v.dump(out_root / "specs" / f"{name}.yaml")     # 与变体 spec 同格式，可追溯
+        v.dump(out_root / "specs" / f"{name}.yaml")
     if args.plan:
         print(f"[ablation] --plan：已写出 {len(variants)} 份配置到 {out_root / 'specs'}")
         return 0
@@ -322,7 +277,7 @@ def main() -> int:
 
             params = sum(p.numel() for p in torch.load(weights, map_location="cpu",
                                                        weights_only=False)["model"].parameters())
-        except Exception:  # noqa: BLE001 - 参数量只是附注信息
+        except Exception:  # noqa: BLE001
             pass
         rows.append({"config": name, "metrics": metrics, "params": params,
                      "minutes": (time.time() - started) / 60, "data": str(data),

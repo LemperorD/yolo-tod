@@ -1,28 +1,10 @@
-"""注册表：所有魔改进入本库的唯一入口。
-
-一个魔改 = 一个 ``@register`` 装饰的类/函数 + 一份元数据。
-元数据不是可选项：没有来源、许可证、扩展点归属的模块不允许入库（见 PLAN.md §2）。
-
-用法::
-
-    from tod.registry import register
-
-    @register(ep="EP3",
-              paper="DySample: Learning to Upsample by Learning to Sample (ICCV 2023)",
-              url="https://arxiv.org/abs/2308.15085",
-              year=2023, license="Apache-2.0",
-              cost="参数量几乎不变；P2 特征图上有轻微显存增量",
-              notes="替代最近邻上采样；小目标对 P2 上采样质量敏感")
-    class DySample(nn.Module):
-        ...
-"""
+"""注册表：所有魔改进入本库的唯一入口。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-# 合法扩展点（PLAN.md §4.3）。新增 EP 需先改文档，再改这里。
 EXTENSION_POINTS: dict[str, str] = {
     "EP0": "数据 / 输入",
     "EP1": "Backbone",
@@ -36,7 +18,6 @@ EXTENSION_POINTS: dict[str, str] = {
     "EP9": "训练策略",
 }
 
-# 变体状态机（PLAN.md §10.2）
 STATUSES = ("planned", "reproducing", "reproduced", "promoted", "dropped", "failed")
 
 
@@ -48,17 +29,17 @@ class RegistryError(RuntimeError):
 class ModuleSpec:
     """一个可复用魔改模块的完整身份信息。"""
 
-    name: str                       # YAML / 配置中引用的名字，如 "DySample"
-    obj: Any                        # 实际类或函数
-    ep: str                         # 扩展点，EP0..EP9
-    paper: str = ""                 # 论文标题
-    url: str = ""                   # 论文 / 官方仓库链接
+    name: str
+    obj: Any
+    ep: str
+    paper: str = ""
+    url: str = ""
     year: int = 0
     license: str = ""
-    cost: str = ""                  # 参数量 / FLOPs / 显存 / 延迟的定性或定量提示
+    cost: str = ""
     notes: str = ""
     aliases: tuple[str, ...] = field(default_factory=tuple)
-    source_file: str = ""           # 自动填充，便于回溯
+    source_file: str = ""
 
     @property
     def ep_name(self) -> str:
@@ -81,7 +62,8 @@ class ModuleSpec:
 
 
 _REGISTRY: dict[str, ModuleSpec] = {}
-_CANONICAL: list[str] = []          # 保持注册顺序，保证文档/表格输出稳定
+# 保留规范名的注册顺序，使清单与生成文档稳定。
+_CANONICAL: list[str] = []
 
 
 def register(
@@ -97,13 +79,7 @@ def register(
     aliases: Iterable[str] = (),
     override: bool = False,
 ) -> Callable[[Any], Any]:
-    """把一个模块登记进注册表。
-
-    Args:
-        name: 注册名；缺省用类/函数名。
-        ep: 扩展点，必须是 ``EXTENSION_POINTS`` 的键。
-        override: 同名模块默认报错（防止无意覆盖）；显式覆盖时置 True。
-    """
+    """把一个模块登记进注册表。"""
     if ep not in EXTENSION_POINTS:
         raise RegistryError(
             f"非法扩展点 {ep!r}；可选：{sorted(EXTENSION_POINTS)}。"
@@ -165,13 +141,7 @@ def list_specs(ep: str | None = None) -> list[ModuleSpec]:
 
 
 def install() -> None:
-    """把注册的模块注入框架的模型解析命名空间，使其可在 YAML 中按名引用。
-
-    这是本库**唯一**需要触碰框架内部的动作，全部实现收敛在 ``tod.compat``。
-    别名（aliases）也一并注入：变体配置与论文里常用别名（如 ``Efficient_UAVDet``），
-    只注入规范名会让这些名字在模型图里解析不到。注意注册表只能挡住**本库内部**
-    的重名；与框架自带同名符号的冲突用 ``compat.framework_has()`` 自查。
-    """
+    """把注册的模块注入框架的模型解析命名空间，使其可在 YAML 中按名引用。"""
     from tod import compat
 
     ns = compat.model_globals()
@@ -182,10 +152,7 @@ def install() -> None:
 
 
 def catalog() -> str:
-    """生成 ``docs/VARIANTS.md`` 的模块总表（按 EP 分组）。
-
-    文档一律由代码生成，禁止手工维护（PLAN.md §9.10）。
-    """
+    """生成 ``docs/VARIANTS.md`` 的模块总表（按 EP 分组）。"""
     lines: list[str] = ["# 模块总表（自动生成，请勿手工编辑）", "",
                         "运行 `python3 tools/catalog.py --write` 重新生成。", ""]
     for ep, ep_name in EXTENSION_POINTS.items():
@@ -209,5 +176,5 @@ def catalog() -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":  # pragma: no cover - 文档生成入口
+if __name__ == "__main__":  # pragma: no cover
     print(catalog())

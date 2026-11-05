@@ -60,6 +60,8 @@ datasets:
   # dataset.yaml（内含 kpt_shape / flip_idx / tod.camera_matrix / tod.object_points）。
   # 换盘后重新转换即可，转换脚本会把**转换时**的绝对 path 写进产物：
   #   python3 tools/mav6d_to_yolo.py --mav6d <原数据> --model phantom4 --out E:/datasets/mav6d
+  # 图/标签已经在盘上、只缺 dataset.yaml 时（不删任何东西，标定取仓库预置 JSON）：
+  #   python3 tools/mav6d_to_yolo.py --model phantom4 --out E:/datasets/mav6d --yaml-only
   mav6d-phantom4:
     root: mav6d/phantom4
     aliases: [phantom4]

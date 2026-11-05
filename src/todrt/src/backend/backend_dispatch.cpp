@@ -1,11 +1,3 @@
-// backend_dispatch.cpp —— 工厂 → 后端的路由（唯一需要"知道所有后端"的地方）
-//
-// 设计上这是**唯一**一处按名字分派到具体后端的地方：
-//   Detector::Create() → CreateDeviceDetector() → （本文件）→ CreateXxxDetector()
-//
-// 每个后端自己的工厂函数都在各自的 .cpp 里（受对应宏保护），所以：
-//   * 只编了 TensorRT 的机器上，选 ort 会得到"该后端未编译进来"的明确提示；
-//   * 新增后端只需要在本文件加一个分支 + 一个 .cpp 文件。
 #include <string>
 
 #include "todrt/factory.hpp"
@@ -26,7 +18,6 @@
 namespace todrt {
 namespace {
 
-/// 归一化 builder 名，便于 "yolov8-trt" / "trt" / "rknn_npu" 这类写法都能对上。
 std::string canon(const std::string& s) {
   std::string k;
   k.reserve(s.size());
@@ -40,7 +31,6 @@ std::string canon(const std::string& s) {
   return k;
 }
 
-/// 该后端在当前构建里是否存在。用于给出"没编进来"而不是"不认识"的准确提示。
 struct BackendAvailability {
   const char* name;
   bool compiled;
@@ -63,7 +53,7 @@ BackendAvailability LookupBackend(const std::string& b) {
   return {"(未知)", false, nullptr};
 }
 
-}  // namespace
+}
 
 std::unique_ptr<Detector> CreateDeviceDetector(const std::string& model_name,
                                                const DetectorOptions& opts,
@@ -119,7 +109,6 @@ std::unique_ptr<Detector> CreateDeviceDetector(const std::string& model_name,
   }
 #endif
 
-  // 理论上到不了这里（上面已经逐个判断过）
   throw TritError("内部错误：后端 " + std::string(avail.name) + " 已声明编译但无分派分支。");
 }
 
@@ -144,4 +133,4 @@ bool backend_available(std::string* reason) {
   return !list.empty();
 }
 
-}  // namespace todrt
+}

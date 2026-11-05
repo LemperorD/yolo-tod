@@ -1,34 +1,4 @@
-"""评测入口：在指定数据集划分上做**尺度分层**评测，输出整体 AP 与 AP_small/AP_tiny。
-
-为什么不用 `yolo val`：ultralytics 的 validator 不给按目标面积分层的指标，
-而小目标变体的收益几乎全在 `AP_small` 上（PLAN §7.2）。本入口固定同时报告：
-
-    * 整体 AP50 / AP50:95
-    * 按**目标边长**分层（默认 <8 / 8–16 / 16–32 / 32–96 / ≥96 px，
-      可用数据集配置里的 ``tod.size_bins_px`` 覆盖）
-
-数据集位置与训练脚本同源：``--data`` 可以写**注册表里的名字**（``configs/datasets.yaml``）、
-数据集目录或数据集 YAML —— 换盘只改注册表，不改命令行。
-
-用法::
-
-    # 单变体评测（并把结果写成 machine-readable 的 results.json）
-    python3 tools/val.py --variant variants/SDD-YOLO26n/variant.yaml \
-        --weights results/SDD-YOLO26n/weights/best.pt \
-        --data visdrone2019-det \
-        --imgsz 1024 --split val --json variants/SDD-YOLO26n/results.json
-
-    # 临时换盘：命令行覆盖数据根目录
-    python3 tools/val.py --weights results/x/weights/best.pt \
-        --data visdrone2019-det --data-root /mnt/hdd/datasets
-
-    # 只跑前 20 张做冒烟（合成数据集自检用）
-    python3 tools/val.py --weights runs/x/weights/best.pt \
-        --data tests/.tmp/tiny-detect/dataset.yaml --max-images 20 --device cpu
-
-results.json 里带 git commit / 权重 mtime 等复现信息（PLAN §2.7 要求记录 commit hash），
-也记录了数据集注册表解析出来的**绝对**根目录（换盘后仍能追溯这次评测读的是哪块盘）。
-"""
+"""评测入口：在指定数据集划分上做**尺度分层**评测，输出整体 AP 与 AP_small/AP_tiny。"""
 
 from __future__ import annotations
 
@@ -42,7 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -56,7 +25,7 @@ def _git_commit() -> str:
         out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                              capture_output=True, text=True, timeout=10)
         return out.stdout.strip() if out.returncode == 0 else "unknown"
-    except Exception:  # noqa: BLE001 - 复现信息缺失不应中断评测
+    except Exception:  # noqa: BLE001
         return "unknown"
 
 

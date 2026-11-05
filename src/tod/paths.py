@@ -1,54 +1,4 @@
-"""数据集路径解析：训练/评测脚本「训练集在哪」由一份注册表 YAML 决定。
-
-## 为什么需要这个模块
-
-两条硬事实决定了路径不能写死在代码或数据集 YAML 里：
-
-1. **框架的解析口径与直觉不同**。ultralytics 对数据集 YAML 里的**相对** ``path``
-   是按它自己的 ``datasets_dir`` 解析的，而不是按 YAML 所在目录
-   （``ultralytics/data/utils.py::check_det_dataset``）::
-
-       path = Path(extract_dir or data.get("path") or Path(data.get("yaml_file", "")).parent)
-       if not path.exists() and not path.is_absolute():
-           path = (DATASETS_DIR / path).resolve()     # ← 相对 DATASETS_DIR
-
-   所以仓库里 ``configs/_base_/datasets/*.yaml`` 写的 ``path: ./data/xxx`` 换台机器就会
-   被解析成 ``<datasets_dir>/data/xxx``，与仓库根无关 —— 训练会报"数据集找不到"或者更糟：
-   悄悄读到别的目录里的同名数据。
-2. **数据集会挪到新挂的机械硬盘上**。把 ``E:/datasets/...`` 这类绝对路径写进
-   ``configs/_base_/datasets/*.yaml`` 会污染版本库，而且与其它机器/队友的布局冲突。
-
-## 做法
-
-``configs/datasets.yaml`` 是**唯一事实来源**（``data_root`` + 每个数据集一项）；
-机器相关的字段写进 ``configs/datasets.local.yaml``（已 gitignore）即可**覆盖**它，
-所以"这台服务器的新硬盘"不需要改任何代码或入库配置。
-
-本模块把「注册表里的名字 / 一个目录 / 一个数据集 YAML」统一解析成
-:class:`DatasetPaths`：**绝对**根目录 + 一份 ``path`` 已换成绝对路径的数据集 YAML
-（副本落在 ``.cache/tod/datasets/``，已 gitignore）。把这份副本交给框架，
-框架就没有机会再按 ``DATASETS_DIR`` 去猜目录。
-
-## 解析优先级（高 → 低）
-
-=============================================  ====================================
-``--data`` 直接给的目录 / ``*.yaml``            老用法，照旧，原样尊重
-``--data-root <dir>``                          命令行覆盖所有数据集的根目录
-``$TOD_DATA_ROOT``                             同上（命令行优先）
-注册表 ``datasets.<名>.root``                    相对 ``data_root``，也可写绝对路径
-注册表 ``data_root`` / ``<名>``                  公共根目录 + 数据集目录名
-数据集 YAML 自带的 ``path``                      兜底（相对路径按仓库根解析）
-=============================================  ====================================
-
-用法::
-
-    from tod.paths import DatasetPathError, load_registry, resolve
-
-    paths = resolve("visdrone2019-det", require_train=True)
-    for line in paths.report():
-        print(line)
-    model.train(data=str(paths.yaml), ...)      # 交给框架的是绝对路径副本
-"""
+"""数据集路径解析：训练/评测脚本「训练集在哪」由一份注册表 YAML 决定。"""
 
 from __future__ import annotations
 
@@ -60,28 +10,20 @@ from typing import Any, Iterable, Mapping
 
 from tod.compat import REPO_ROOT, dump_yaml, load_yaml
 
-#: 注册表（入库）与机器相关覆盖文件（**已 gitignore**）。
 REGISTRY_REL = Path("configs") / "datasets.yaml"
 LOCAL_REL = Path("configs") / "datasets.local.yaml"
-#: 全局数据根目录的环境变量（服务器换盘时最省事的写法：export 一下就行）。
 ENV_DATA_ROOT = "TOD_DATA_ROOT"
-#: 解析后的数据集 YAML 落盘目录（已 gitignore；每次运行覆盖写）。
+# 交给框架的是绝对路径 YAML 副本，避免其按全局 datasets_dir 重新定位。
 CACHE_REL = Path(".cache") / "tod" / "datasets"
-#: 数据集 YAML 模板目录（类别 / 关键点 / ``tod.*`` 字段的口径来源）。
 TEMPLATE_DIR_REL = Path("configs") / "_base_" / "datasets"
 
-#: 算"这个分划有多少张图"时认的图片扩展名。
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff",
                             ".dng", ".mpo", ".cr2", ".gif"})
-#: 目录扫描上限：机械硬盘上递归几十万文件的目录很慢，到上限就停（报告里写 "≥"）。
 SCAN_LIMIT = 100_000
 
 
 class DatasetPathError(RuntimeError):
     """数据集定位失败。消息里必须给出**可操作**的下一步（改哪个文件/加哪个参数）。"""
-
-
-# ----------------------------------------------------------------- 工具函数
 
 
 def _merge(dst: dict, src: Mapping[str, Any]) -> dict:
@@ -105,7 +47,7 @@ def _norm(path: Path) -> Path:
     """规范化（不要求存在）：去掉 ``..``/``.``，统一成绝对路径。"""
     try:
         return path.resolve()
-    except OSError:                                  # 断掉网络盘/无权限时的兜底
+    except OSError:
         return Path(os.path.normpath(str(path)))
 
 
@@ -129,17 +71,7 @@ def registry_path(path: str | Path | None = None, *, repo_root: Path | None = No
 
 def load_registry(path: str | Path | None = None, *, repo_root: Path | None = None,
                   required: bool = False) -> dict:
-    """读注册表，并用 ``configs/datasets.local.yaml``（若存在）覆盖。
-
-    Args:
-        path: 注册表路径；``None`` 时按 :func:`registry_path` 推断。
-        repo_root: 仓库根（相对路径的锚点），默认 ``tod.compat.REPO_ROOT``。
-        required: 注册表不存在时是报错（``True``）还是返回空表（``False``）。
-
-    Returns:
-        形如 ``{"data_root": Path(...), "datasets": {名: {...}}}`` 的 dict
-        （``data_root`` 已转成 Path，未展开的项保持原样）。
-    """
+    """读注册表，并用 ``configs/datasets.local.yaml``（若存在）覆盖。"""
     root = Path(repo_root or REPO_ROOT)
     file = registry_path(path, repo_root=root)
     registry: dict = {}
@@ -200,9 +132,6 @@ def _template_for(name: str, entry: Mapping[str, Any], repo_root: Path) -> Path 
     return candidate if candidate.is_file() else None
 
 
-# ------------------------------------------------------------------ 统计/校验
-
-
 def _count_images(directory: Path, limit: int = SCAN_LIMIT) -> int:
     """数目录下的图片（递归，到上限就停）。目录不存在返回 0。"""
     if not directory.is_dir():
@@ -221,7 +150,7 @@ def _count_images(directory: Path, limit: int = SCAN_LIMIT) -> int:
                             n += 1
                             if n >= limit:
                                 break
-                    except OSError:                  # 断链/无权限的条目跳过即可
+                    except OSError:
                         continue
         except OSError:
             continue
@@ -259,7 +188,6 @@ class DatasetPaths:
     name: str | None
     root: Path
     yaml: Path
-    #: 根目录是从哪来的（排查"怎么指到别处去了"时最关键的一行）。
     source: str
     splits: Mapping[str, Path] = field(default_factory=dict)
     counts: Mapping[str, int] = field(default_factory=dict)
@@ -285,9 +213,6 @@ class DatasetPaths:
         return lines
 
 
-# ------------------------------------------------------------------- 解析主函数
-
-
 def resolve(spec: str | Path | None, *, registry: dict | None = None,
             registry_path_hint: str | Path | None = None,
             data_root: str | Path | None = None,
@@ -295,28 +220,7 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
             cache_dir: str | Path | None = None,
             splits: Iterable[str] = ("train", "val"),
             require_train: bool = False) -> DatasetPaths | None:
-    """把「注册表名 / 目录 / 数据集 YAML」解析成 :class:`DatasetPaths`。
-
-    Args:
-        spec: 数据集标识。三种写法都行：
-            ``"visdrone2019-det"``（注册表名字或别名）、
-            ``"E:/datasets/visdrone2019-det"``（目录）、
-            ``"configs/_base_/datasets/visdrone2019-det.yaml"``（YAML 路径）。
-            ``None`` 时返回 ``None``（调用方自行决定要不要报错）。
-        registry: 已加载的注册表（不给就按 :func:`load_registry` 读）。
-        registry_path_hint: 注册表路径（命令行 ``--datasets``）。
-        data_root: 覆盖所有数据集的根目录（命令行 ``--data-root``）。
-        repo_root: 仓库根（相对路径锚点）。
-        cache_dir: 解析副本的落盘目录（默认 ``.cache/tod/datasets``）。
-        splits: 需要统计/校验的分划。
-        require_train: ``True`` 时训练集缺失 / 为空直接抛 :class:`DatasetPathError`。
-
-    Returns:
-        :class:`DatasetPaths`；``spec`` 为空时返回 ``None``。
-
-    Raises:
-        DatasetPathError: 路径无法定位，或 ``require_train=True`` 而训练集不可用。
-    """
+    """把「注册表名 / 目录 / 数据集 YAML」解析成 :class:`DatasetPaths`。"""
     if spec is None or (isinstance(spec, str) and not spec.strip()):
         return None
 
@@ -355,8 +259,6 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
             yaml_path = _norm(given)
             data_peek = load_yaml(yaml_path) or {}
             name = str(data_peek.get("name") or yaml_path.stem)
-            # 若这个 YAML 就是注册表里某个数据集的模板，优先用注册表登记的根目录：
-            # 这样 `--data configs/_base_/datasets/visdrone2019-det.yaml` 也能指到新硬盘。
             hit = _entry_by_yaml(registry, yaml_path, root_repo)
             if hit is not None:
                 name, entry = hit
@@ -385,9 +287,6 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
         source = f"注册表 {REGISTRY_REL.as_posix()} 的 datasets.{name}"
         yaml_path = _template_for(name, entry, root_repo)
 
-    # ---- 根目录：命令行/环境变量 > 注册表 > 数据集 YAML 自带的 path ----
-    # ``explicit_root`` = 根目录是"有人明确指定的"。这种情况下**不再**回落到数据集
-    # YAML 自带的 path：注册表写错时宁可报错，也不能悄悄训练到仓库里那份旧的同名数据。
     override = data_root if data_root is not None else os.environ.get(ENV_DATA_ROOT)
     explicit_root = root_hint is not None
     if root_hint is None:
@@ -408,23 +307,18 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
             root_hint = _norm(base / str(name))
             source = f"注册表 data_root + 数据集名 {name!r}"
     elif override:
-        # 直接给了目录时，--data-root / $TOD_DATA_ROOT 仍然有决定权（便于临时换盘）
         base = _as_path(override, root_repo)
         root_hint = _norm(base / root_hint.name)
         explicit_root = True
 
-    # 数据集 YAML：模板优先（configs/_base_/datasets/），没有模板时才用根目录里自带的
     data = load_yaml(yaml_path) if yaml_path is not None and yaml_path.is_file() else None
 
-    # ---- 根目录兜底 + 存在性检查 ----
-    # 顺序很关键：**先**诊断根目录，再抱怨"找不到 dataset.yaml"。
-    # 换盘后最常见的情况就是根目录整块不存在，那时说"缺 dataset.yaml"会把人带偏。
     if not explicit_root and (root_hint is None or not root_hint.is_dir()):
         own = (data or {}).get("path")
         if own:
             candidate = _as_path(own, root_repo)
             if not candidate.is_dir() and yaml_path is not None:
-                candidate = _as_path(own, yaml_path.parent)   # YAML 旁边的相对路径
+                candidate = _as_path(own, yaml_path.parent)
             root_hint = _norm(candidate)
             if candidate.is_dir() and yaml_path is not None:
                 source = f"数据集 YAML {_inside_repo(yaml_path, root_repo)} 自带的 path"
@@ -442,7 +336,6 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
         )
 
     if data is None:
-        # 没有模板：要求数据集自带 dataset.yaml（如 MAV6D 转换产物）
         candidate = root / "dataset.yaml"
         if candidate.is_file():
             yaml_path = candidate
@@ -453,11 +346,16 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
             raise DatasetPathError(
                 f"数据集 {name!r} 找不到描述文件（dataset.yaml）。\n"
                 f"  根目录：{root}\n"
-                "请在 configs/datasets.yaml 里给它补一个 yaml: 模板"
-                "（类别/关键点口径），或确认该目录里有 dataset.yaml。"
+                "请在 configs/datasets.yaml 里给它补一个 yaml: 模板（类别/关键点口径），"
+                "或确认该目录里有 dataset.yaml。\n"
+                "若是 MAV6D 的转换产物（它里面的内参/3D 关键点是标定产物，不能手写）：\n"
+                "  # 图/标签已在盘上、只缺 dataset.yaml（不删除任何数据）\n"
+                f"  python3 tools/mav6d_to_yolo.py --model {root.name} --out {root.parent} --yaml-only\n"
+                "  # 还没转换过（需要原始 MAV6D）\n"
+                f"  python3 tools/mav6d_to_yolo.py --mav6d <原始数据> --model {root.name} "
+                f"--out {root.parent}"
             )
 
-    # ---- 写一份 path 已换成绝对路径的副本，交给框架 ----
     resolved = dict(data)
     resolved["path"] = str(root)
     resolved.setdefault("train", "images/train")
@@ -468,7 +366,6 @@ def resolve(spec: str | Path | None, *, registry: dict | None = None,
     out_yaml = cache / f"{key}-{digest}.yaml"
     dump_yaml(resolved, out_yaml)
 
-    # ---- 分划统计与校验 ----
     split_dirs = _split_dirs(resolved, root, splits)
     counts, label_counts, problems, warnings = {}, {}, [], []
     for split, directory in split_dirs.items():
@@ -514,7 +411,6 @@ def _entry_by_yaml(registry: Mapping[str, Any], yaml_path: Path,
         template = _template_for(str(key), entry, repo_root)
         if template is not None and _norm(template) == target:
             return str(key), entry
-    # 名字对得上也算（模板被复制到别处时仍然能识别）
     return _entry(registry, yaml_path.stem)
 
 

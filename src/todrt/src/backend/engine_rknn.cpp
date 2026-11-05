@@ -1,22 +1,3 @@
-// engine_rknn.cpp —— Rockchip RKNN 后端（RK3588 / RK3588S 的 NPU）
-//
-// 目标平台：**Linux + librknnrt.so**（rknn_api.h 由 rknpu2 提供）。
-// RK3588 有 3 个 NPU core，每个约 2 TOPS（INT8），合计 6 TOPS。
-//
-// 与 TensorRT 的关键差异（决定了本文件的结构）：
-//   1. **模型格式是 .rknn**，由 rknn-toolkit2 在 x86 主机上离线转换（板上不做转换）；
-//      C API 没有"从 ONNX 构建引擎"的等价物，所以 Init() 只做加载 + 校验。
-//   2. **量化模型的输入是 uint8（通常 NHWC）**，归一化已烧进模型。前处理必须走
-//      uint8 路径（preprocess.cpp 的 kUint8Raw），否则双重归一化 → 框全错。
-//   3. **输出走 want_float=1 让 SDK 反量化**（内部按 scale/zp 还原），对外统一 float32 ——
-//      与 RunnerDetector 的契约一致。
-//   4. **多核要显式 dup context**：rknn_dup_context 复制出独立上下文，各占一个 core。
-//      单 context 只会用一个 core —— "买了 6 TOPS 只跑出 2 TOPS" 的常见原因。
-//   5. **NPU 有原生计时**：rknn_query(RKNN_QUERY_PERF_RUN) 给的是 NPU 侧耗时，
-//      比 wall-clock 干净。
-//
-// rknn_api.h 在各版本间有漂移（尤其 init 的 extend 结构与 mem API），
-// 所有版本相关调用都收敛在本文件的 rknn 命名空间内。
 #include "todrt/backend/rknn_factory.hpp"
 
 #if TODRT_HAVE_RKNN
@@ -39,7 +20,6 @@
 namespace todrt {
 namespace {
 
-/// 把 RKNN 的错误码转成可读信息。
 std::string rknn_err(int ret) {
   std::ostringstream oss;
   oss << "RKNN 错误码 " << ret;
@@ -71,7 +51,6 @@ std::string rknn_shape_to_string(const rknn_tensor_attr& a) {
   oss << "[";
   for (uint32_t i = 0; i < a.n_dims; ++i) {
     if (i) oss << ",";
-    // RKNN 的 dims 是反序存放的（idx 0 = 最后一维），按 n_dims 反着打印更直观
     oss << a.dims[a.n_dims - 1 - i];
   }
   oss << "]";
@@ -98,15 +77,12 @@ const char* rknn_format_name(rknn_tensor_format f) {
   }
 }
 
-/// 一个 RKNN 上下文 = 一个 NPU core 上的一份模型实例。
 struct RknnContext {
   rknn_context ctx = 0;
   int core = 0;
   std::vector<rknn_tensor_attr> in_attrs;
   std::vector<rknn_tensor_attr> out_attrs;
-  /// 主机侧输入缓冲（uint8 是常态；float 模型也走这里）
   std::vector<uint8_t> host_input;
-  /// 主机侧输出缓冲（SDK want_float=1 后的 float32 结果）
   std::vector<std::vector<float>> host_outputs;
 
   ~RknnContext() { release(); }
@@ -121,7 +97,6 @@ struct RknnContext {
   RknnContext() = default;
 };
 
-/// RKNN 引擎：管理 1..N 个 context（多核轮转），对外统一 float32 输出。
 class RknnRunner : public IEngineRunner {
  public:
   ~RknnRunner() override { Release(); }
@@ -162,7 +137,6 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
 
   start_core_ = std::max(0, cfg.accelerator_core);
 
-  // ---- 找模型文件：.rknn 优先 ----
   std::string model_path = cfg.rknn_model_path;
   if (model_path.empty()) model_path = cfg.engine_path;
   if (model_path.empty()) {
@@ -185,7 +159,6 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
   log_info("加载 RKNN 模型：" + model_path + "（" +
            std::to_string(static_cast<double>(size) / (1024.0 * 1024.0)) + " MB）");
 
-  // ---- SDK 版本：排查"toolkit 与 runtime 版本不匹配"的第一手信息 ----
   {
     rknn_sdk_version sdk{};
     if (rknn_query(0, RKNN_QUERY_SDK_VERSION, &sdk) == RKNN_SUCC) {
@@ -193,11 +166,9 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
     }
   }
 
-  // ---- 建第一个 context ----
   auto make_ctx = [&](int core_index) -> std::unique_ptr<RknnContext> {
     rknn_init_extend ext{};
     rknn_context c = 0;
-    // core_mask：0 = 让 SDK 自行分配；否则用 (1 << core) 指定（RKNN 的约定）
     ext.core_mask = static_cast<int32_t>(1U << core_index);
     int ret = rknn_init(&c, blob.data(), static_cast<uint32_t>(blob.size()), 0, &ext);
     if (ret != RKNN_SUCC) {
@@ -219,7 +190,6 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
   rknn_context first_handle = first->ctx;
   contexts_.push_back(std::move(first));
 
-  // ---- 多核：dup 出独立 context ----
   const int want_cores = std::max(1, cfg.rknn_core_num);
   for (int i = 1; i < want_cores; ++i) {
     rknn_context dup = 0;
@@ -236,7 +206,6 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
     contexts_.push_back(std::move(p));
   }
 
-  // ---- 查询输入属性 → 确定前处理契约 ----
   RknnContext& c0 = *contexts_.front();
   rknn_input_output_num io{};
   check_rknn(rknn_query(c0.ctx, RKNN_QUERY_IN_OUT_NUM, &io), "查询输入输出数量");
@@ -261,16 +230,14 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
     default: input_dtype_ = DataType::kF32; break;
   }
 
-  // 契约：把 RKNN 的要求翻译成"前处理该怎么产出数据"
   spec_.output =
       (input_dtype_ == DataType::kU8) ? PreprocOutput::kUint8Raw : PreprocOutput::kFloat32;
   spec_.layout = (ia.fmt == RKNN_TENSOR_NHWC) ? TensorLayout::kNhwc : TensorLayout::kNchw;
-  // RKNN 的 dims 反序：NHWC 时 dims[2]=W、dims[1]=H；NCHW 时 dims[1]=H、dims[0]=W
   if (ia.n_dims >= 3) {
     spec_.width = static_cast<int>(ia.dims[2]);
     spec_.height = static_cast<int>(ia.dims[1]);
   }
-  spec_.dynamic_shape = false;  // .rknn 的输入尺寸编译期固定
+  spec_.dynamic_shape = false;
   log_info("RKNN 输入契约：dtype=" + to_string(spec_.output_dtype()) +
            " layout=" + to_string(spec_.layout) + " " + std::to_string(spec_.width) + "×" +
            std::to_string(spec_.height));
@@ -281,7 +248,6 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
              "请确认 rknn-toolkit2 转换时的 mean/std 设置。");
   }
 
-  // ---- 查询输出属性 ----
   c0.out_attrs.resize(io.n_output);
   out_shapes_.clear();
   out_types_.clear();
@@ -295,12 +261,11 @@ void RknnRunner::Init(const BuildConfig& cfg, std::string* err) {
       shape.push_back(static_cast<int64_t>(oa.dims[oa.n_dims - 1 - d]));
     }
     out_shapes_.push_back(shape);
-    out_types_.push_back(DataType::kF32);  // Run 内按 want_float=1 取 float32
+    out_types_.push_back(DataType::kF32);
     log_info("RKNN 输出 " + std::to_string(i) + ": " + rknn_shape_to_string(oa) + " " +
              rknn_type_name(oa.type) + " n_elems=" + std::to_string(oa.n_elems));
   }
 
-  // ---- 每个 context 各自准备缓冲区（互不共享，多线程安全）----
   for (auto& cp : contexts_) {
     RknnContext& cc = *cp;
     cc.in_attrs = c0.in_attrs;
@@ -345,7 +310,7 @@ void RknnRunner::Run(const void* input, size_t input_bytes, int batch,
   inputs[0].fmt = c.in_attrs[0].fmt;
   inputs[0].size = static_cast<uint32_t>(input_bytes);
   inputs[0].buf = c.host_input.data();
-  inputs[0].pass_through = 0;  // 让 SDK 处理类型/布局转换，最稳
+  inputs[0].pass_through = 0;
   check_rknn(rknn_inputs_set(c.ctx, 1, inputs), "设置输入");
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -354,16 +319,16 @@ void RknnRunner::Run(const void* input, size_t input_bytes, int batch,
 
   rknn_perf_run perf{};
   if (rknn_query(c.ctx, RKNN_QUERY_PERF_RUN, &perf) == RKNN_SUCC) {
-    last_ms_ = static_cast<double>(perf.run_duration) / 1000.0;  // 微秒 → 毫秒
+    last_ms_ = static_cast<double>(perf.run_duration) / 1000.0;
   } else {
     last_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
   }
 
-  // want_float=1：让 SDK 按 scale/zp 反量化为 float32（省掉手写反量化，也少一类错）
   std::vector<rknn_output> outs(outputs.size());
   std::memset(outs.data(), 0, sizeof(rknn_output) * outs.size());
   for (size_t i = 0; i < outs.size(); ++i) {
     outs[i].index = static_cast<uint32_t>(i);
+    // 由 SDK 按 scale/zero-point 反量化，公共后处理始终读取 float32。
     outs[i].want_float = 1;
     outs[i].is_prealloc = 0;
   }
@@ -405,8 +370,6 @@ void RknnRunner::Release() {
   contexts_.clear();
 }
 
-// ------------------------------------------------------------------ 装配
-
 std::unique_ptr<Detector> BuildRknnDetector(const std::string& model_name, DetectorOptions o,
                                             const std::string& preproc_name,
                                             const std::string& postproc_name) {
@@ -416,11 +379,9 @@ std::unique_ptr<Detector> BuildRknnDetector(const std::string& model_name, Detec
   auto runner = std::unique_ptr<RknnRunner>(new RknnRunner());
   runner->Init(bc, nullptr);
 
-  // 前处理必须按**引擎声明**的契约来（RKNN 上就是 uint8 NHWC）
   const EngineInputSpec spec = runner->input_spec();
   PreprocessOptions po = resolve_preprocess_options(o, spec);
   PostprocessOptions pp = resolve_postprocess_options(o);
-  // 解码用的输入尺寸来自引擎，而不是配置里的猜测
   pp.decode.input_width = spec.width;
   pp.decode.input_height = spec.height;
 
@@ -434,7 +395,6 @@ std::unique_ptr<Detector> BuildRknnDetector(const std::string& model_name, Detec
       new RunnerDetector(model_name, o, std::move(runner), std::move(pre), std::move(post)));
 }
 
-/// IModelBuilder 适配：让工厂清单 / dry-run 也能报告 RKNN 的可用性。
 class RknnModelBuilder : public IModelBuilder {
  public:
   const std::string& name() const override { return name_; }
@@ -512,7 +472,7 @@ std::unique_ptr<IModelBuilder> MakeRknnBuilder() {
   return std::unique_ptr<IModelBuilder>(new RknnModelBuilder());
 }
 
-}  // namespace
+}
 
 TOD_RT_REGISTER_BUILDER(rknn, MakeRknnBuilder)
 TOD_RT_REGISTER_BUILDER(rknn_npu, MakeRknnBuilder)
@@ -532,10 +492,10 @@ std::unique_ptr<Detector> CreateRknnDetector(const std::string& model_name,
     }
     o.device = Device::kNpu;
   }
-  o.precision = Precision::kINT8;  // RKNN 量化模型即 INT8
+  o.precision = Precision::kINT8;
   return BuildRknnDetector(model_name, o, preproc_name, postproc_name);
 }
 
-}  // namespace todrt
+}
 
-#endif  // TODRT_HAVE_RKNN
+#endif

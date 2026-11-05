@@ -1,4 +1,3 @@
-// core.cpp —— 日志、枚举解析、自注册表的实现
 #include "todrt/core.hpp"
 
 #include <algorithm>
@@ -7,7 +6,7 @@
 #include <set>
 #include <sstream>
 
-#include "todrt/modules.hpp"  // 枚举 <-> 字符串（DataType / OutputLayout）
+#include "todrt/modules.hpp"
 
 namespace todrt {
 namespace detail {
@@ -63,11 +62,9 @@ RegistryEntry make_entry(std::string name, std::string family, std::string sourc
   return e;
 }
 
-}  // namespace detail
+}
 
 void set_log_sink(detail::LogSink sink) { detail::log_sink() = std::move(sink); }
-
-// ------------------------------------------------------------------ 枚举
 
 const char* to_string(Device d) {
   switch (d) {
@@ -128,10 +125,6 @@ const char* to_string(OutputLayout l) {
 }
 
 namespace {
-/// 归一化枚举文本：只保留 ASCII 字母数字并转小写。
-/// 刻意**不用 std::tolower**：它在 MSVC + /utf-8 + 含非 ASCII 注释的源文件里
-/// 被观测到会漏掉字母（见 config_io.cpp 里同款说明），而配置字段是人手写的，
-/// 一个字母被吃掉就会变成"无法识别的 device"。
 std::string lower(std::string s) {
   std::string out;
   out.reserve(s.size());
@@ -141,11 +134,10 @@ std::string lower(std::string s) {
     } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
       out.push_back(c);
     }
-    // 连字符/下划线/空格等一律丢弃，容忍 "no-gpu-fallback"、"rk3588 npu"
   }
   return out;
 }
-}  // namespace
+}
 
 Device parse_device(const std::string& s) {
   const std::string k = lower(s);
@@ -166,8 +158,6 @@ Precision parse_precision(const std::string& s) {
   throw TritError("无法识别的 precision：" + s + "（可选 fp32/fp16/int8）");
 }
 
-// ------------------------------------------------------------------ 注册表
-
 bool registry_has(const std::string& name) {
   std::lock_guard<std::mutex> lk(detail::registry_mutex());
   return detail::registry().count(name) != 0;
@@ -187,7 +177,7 @@ const RegistryEntry& registry_get(const std::string& name) {
     }
     throw TritError(oss.str());
   }
-  return it->second;  // 注册表生命周期 = 进程，返回引用安全
+  return it->second;
 }
 
 std::vector<std::string> registry_names(const std::string& family) {
@@ -263,4 +253,4 @@ std::string registry_catalog(const std::string& family) {
   return oss.str();
 }
 
-}  // namespace todrt
+}

@@ -1,39 +1,4 @@
-"""MuSGD —— Muon（Newton–Schulz 正交化）+ SGD 的混合优化器（SDD-YOLO §4.6，式 (5)）。
-
-论文：SDD-YOLO §4.6 "YOLO26's MuSGD Hybrid Training Strategy"：
-
-    "MuSGD applies gradient orthogonalization via Newton-Schulz iteration to
-     high-dimensional weight matrices in the backbone. This ensures that the update
-     direction remains orthonormal, effectively preserving the feature expressiveness
-     even under sparse supervision. Formally, for a backbone weight matrix W, the
-     update rule is defined as  G' = NS(G),  W <- W - eta G'   (式 (5))
-     ... To maintain training stability for non-matrix parameters, standard SGD with
-     momentum is retained for one-dimensional tensors (e.g., biases and
-     normalization layers)."
-
-    出处：Muon 由 Moonshot AI 提出（arXiv:2502.16982）；YOLO26 把它做成
-    "分解式更新"（decomposed update）用于实时检测训练。
-
-【本库与框架的分工】ultralytics 8.4 起自带 ``ultralytics.optim.MuSGD``
-（``optim/muon.py``），实现了同一条式 (5)（NS 正交化 + SGD 分量，``muon``/``sgd`` 两个
-系数混合）。因此：
-
-    * **首选**框架原生实现（``resolve()`` 会返回它），训练器只负责把参数分组交过去；
-    * 本文件提供**独立实现**，用于 (a) 框架 < 8.4、(b) 需要与框架做数值对照、
-      (c) 想在 YAML/配置里显式指名优化器。两者更新公式一致，见 tests/test_modules.py 的对照测试。
-
-实现细节（与框架实现逐条对齐，便于对照）：
-    * NS 迭代取 5 步、系数 (3.4445, -4.7750, 2.0315)；行数 > 列数时先转置再算；
-    * ``momentum``（β）同时用作 Muon 分量的 EMA 系数与 SGD 分量的动量；
-      默认 ``nesterov=True``，与框架 ``build_optimizer`` 里对 MuSGD 的取值一致；
-    * 4D 卷积核按 ``(out, in*k*k)`` 展平成 2D 再正交化，随后按
-      ``sqrt(max(1, rows/cols))`` 缩放（RMS 匹配）；
-    * 混合模式只对 SGD 分量施加 weight decay（框架同样如此）。
-
-[!] 与框架原生路径的一处差异（已知，不影响主流程）：框架 ``build_optimizer`` 在
-MuSGD 下会把 YOLO26 辅助头（``proto.semseg`` / ``SegmentationHead`` 等）的参数学习率
-放大 3 倍；本文件的 ``param_groups()`` 不做这件事（本库不训练分割辅助头）。
-"""
+"""MuSGD —— Muon（Newton–Schulz 正交化）+ SGD 的混合优化器（SDD-YOLO §4.6，式 (5)）。"""
 
 from __future__ import annotations
 
@@ -44,7 +9,6 @@ import torch.nn as nn
 
 from tod.registry import register
 
-#: NS 迭代的超参（Muon 原论文的 "quintic" 系数）。
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 NS_STEPS = 5
 
@@ -56,6 +20,7 @@ def zeropower_newton_schulz(g: torch.Tensor, steps: int = NS_STEPS,
         raise ValueError(f"Newton–Schulz 只接受 2D 张量，实际 {tuple(g.shape)}。")
     x = g.to(torch.float32)
     x = x / (x.norm() + eps)
+    # 把迭代放在较小的矩阵维度上，最终恢复原方向。
     transposed = g.size(0) > g.size(1)
     if transposed:
         x = x.T
@@ -70,9 +35,9 @@ def zeropower_newton_schulz(g: torch.Tensor, steps: int = NS_STEPS,
 def muon_update(grad: torch.Tensor, momentum_buffer: torch.Tensor, beta: float = 0.95,
                 nesterov: bool = True) -> torch.Tensor:
     """式 (5) 的 ``G' = NS(G)``：先聚动量，再多步正交化，最后做 RMS 缩放。"""
-    momentum_buffer.lerp_(grad, 1 - beta)                      # buf = β·buf + (1-β)·g
+    momentum_buffer.lerp_(grad, 1 - beta)
     update = grad.lerp(momentum_buffer, beta) if nesterov else momentum_buffer
-    if update.ndim == 4:                                        # 卷积核：展平后正交化
+    if update.ndim == 4:
         update = update.view(len(update), -1)
     update = zeropower_newton_schulz(update)
     update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
@@ -94,13 +59,7 @@ def muon_update(grad: torch.Tensor, momentum_buffer: torch.Tensor, beta: float =
     aliases=("MuSGDFallback", "musgd"),
 )
 class MuSGD(torch.optim.Optimizer):
-    """混合优化器：``use_muon`` 组 = Muon 更新 + SGD 更新，其余组 = 纯 SGD。
-
-    Args:
-        params: 参数或参数组（组内可含 ``use_muon`` 键）。
-        lr, momentum, weight_decay, nesterov: 与框架 ``build_optimizer`` 的语义一致。
-        muon, sgd: 两个分量的步长系数（YOLO26 取 0.2 / 1.0）。
-    """
+    """混合优化器：``use_muon`` 组 = Muon 更新 + SGD 更新，其余组 = 纯 SGD。"""
 
     def __init__(self, params: Iterable, lr: float = 1e-3, momentum: float = 0.9,
                  weight_decay: float = 0.0, nesterov: bool = True,
@@ -112,7 +71,7 @@ class MuSGD(torch.optim.Optimizer):
         self.sgd = float(sgd)
 
     @torch.no_grad()
-    def step(self, closure=None):  # noqa: D102 - 与 torch.optim 接口一致
+    def step(self, closure=None):  # noqa: D102
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -163,7 +122,7 @@ def native_musgd() -> type | None:
     ensure_runtime_env()
     try:
         from ultralytics.optim import MuSGD as _Native
-    except ImportError:  # pragma: no cover - 旧版框架
+    except ImportError:  # pragma: no cover
         return None
     return _Native
 
@@ -178,16 +137,13 @@ def resolve() -> tuple[type, str]:
 
 def param_groups(model: nn.Module, *, lr: float, momentum: float = 0.9,
                  weight_decay: float = 0.0) -> list[dict[str, Any]]:
-    """按 MuSGD 的语义把参数分组：muon（ndim≥2）/ bias（不衰减）/ norm（不衰减）/ weight。
-
-    分组规则与框架 ``BaseTrainer.build_optimizer`` 对齐，便于两条路径互换。
-    """
+    """按 MuSGD 的语义把参数分组：muon（ndim≥2）/ bias（不衰减）/ norm（不衰减）/ weight。"""
     norm_types = tuple(v for k, v in vars(nn).items() if "Norm" in k)
     muon, bias, norm, weight = [], [], [], []
     for name, module in model.named_modules():
         for pname, param in module.named_parameters(recurse=False):
             full = f"{name}.{pname}" if name else pname
-            if param.ndim >= 2:                       # 高维权重矩阵 → Muon 分量
+            if param.ndim >= 2:
                 muon.append(param)
             elif "bias" in full:
                 bias.append(param)
@@ -211,14 +167,7 @@ def param_groups(model: nn.Module, *, lr: float, momentum: float = 0.9,
 def build(model: nn.Module, *, lr: float, momentum: float = 0.9,
           weight_decay: float = 0.0, iterations: float = 0.0,
           prefer_native: bool = True) -> tuple[torch.optim.Optimizer, str]:
-    """构造 MuSGD 优化器。
-
-    与框架训练器的取舍一致：有原生实现就交给框架的优化器类（含 YOLO26 辅助头
-    3× lr 的细节由训练器负责），否则用本库实现的参数分组。
-
-    Returns:
-        ``(optimizer, 来源描述)``。
-    """
+    """构造 MuSGD 优化器。"""
     groups = param_groups(model, lr=lr, momentum=momentum, weight_decay=weight_decay)
     if prefer_native:
         native = native_musgd()

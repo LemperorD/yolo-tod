@@ -1,13 +1,3 @@
-// decode.cpp —— YOLOv8 系列检测头输出的 CPU 解码（DFL / sigmoid / anchor 网格）
-//
-// 这一层的定位是「唯一真相」：GPU 端插件只是加速，语义必须与这里一致；
-// 与 Python 实现对拍、以及本库的单元测试，都以这里的输出为基准。
-//
-// 支持四种导出排布（见 OutputLayout），其中两种是本项目实际会遇到的：
-//   * kAnchorMajorDfl          —— ultralytics 官方 YOLOv8 Detect 导出，[B, 4*reg_max+nc, A]
-//   * kFeatureMajorDfl         —— Efficient_UAVDet 独立实现，[B, Σ(4*reg_max+nc), A]
-//   * kAnchorMajorDflTransposed—— 转置版，[B, A, 4*reg_max+nc]
-//   * kPluginNms               —— EfficientNMS 等插件已完成解码，[N, 6] 或 [N, 7]
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -17,7 +7,6 @@
 namespace todrt {
 namespace {
 
-/// 半精度 → 单精度。
 inline float half_to_float(uint16_t h) {
   const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
   uint32_t exp = (h >> 10) & 0x1Fu;
@@ -26,7 +15,7 @@ inline float half_to_float(uint16_t h) {
   if (exp == 0) {
     if (man == 0) {
       bits = sign;
-    } else {  // 次正规数
+    } else {
       exp = 127 - 15 + 1;
       while ((man & 0x400u) == 0) {
         man <<= 1;
@@ -45,7 +34,6 @@ inline float half_to_float(uint16_t h) {
   return out;
 }
 
-/// 把任意受支持 dtype 的 blob 读成 float。
 class Reader {
  public:
   explicit Reader(const TensorView& v) {
@@ -75,13 +63,13 @@ class Reader {
   const int32_t* i32_ = nullptr;
 };
 
-/// softmax 后求期望（Kahan 无关紧要，分布长度最多 64）。
 inline float expectation(const float* d, int n) {
   float m = d[0];
   for (int i = 1; i < n; ++i) m = std::max(m, d[i]);
   float w = 0.f;
   float t = 0.f;
   for (int i = 0; i < n; ++i) {
+    // 减去最大 logit 后计算 softmax，避免指数溢出。
     const float e = std::exp(d[i] - m);
     t += e;
     w += e * static_cast<float>(i);
@@ -89,7 +77,6 @@ inline float expectation(const float* d, int n) {
   return t > 0.f ? w / t : 0.f;
 }
 
-/// 校验 anchor 数与 strides 推算是否一致——这是最常见的配置错误，必须响亮报错。
 void check_anchors(const TensorView& out, const std::vector<Grid>& grids, int64_t anchors,
                    const char* layout_name) {
   int64_t expected = 0;
@@ -108,7 +95,6 @@ void check_anchors(const TensorView& out, const std::vector<Grid>& grids, int64_
   }
 }
 
-/// anchor-major（含转置形式）：每个 anchor 的 4*reg_max 个 DFL 值与 nc 个分数连续。
 struct AnchorMajorDecoder {
   static void Decode(const TensorView& out, const DecodeOptions& opt,
                      const std::vector<Grid>& grids, std::vector<Detection>& dets) {
@@ -118,8 +104,8 @@ struct AnchorMajorDecoder {
 
     int64_t channels = 0;
     int64_t anchors = 0;
-    int64_t ch_stride = 1;    // 同一 anchor 内相邻通道的步长
-    int64_t anch_stride = 0;  // 相邻 anchor 的步长
+    int64_t ch_stride = 1;
+    int64_t anch_stride = 0;
     const char* layout_name = "anchor-major-dfl";
     if (opt.layout == OutputLayout::kAnchorMajorDflTransposed) {
       if (out.rank() != 3) {
@@ -194,8 +180,6 @@ struct AnchorMajorDecoder {
   }
 };
 
-/// feature-major：[B, Σ(4*reg_max+nc), A]，每层的 DFL 值全在前、分数在后，层间拼接。
-/// SPAE-YOLOv8 的 Efficient_UAVDet 独立实现即此排布。
 struct FeatureMajorDecoder {
   static void Decode(const TensorView& out, const DecodeOptions& opt,
                      const std::vector<Grid>& grids, std::vector<Detection>& dets) {
@@ -231,7 +215,7 @@ struct FeatureMajorDecoder {
     for (size_t li = 0; li < grids.size(); ++li) {
       const Grid& g = grids[li];
       const int ch = level_ch[li];
-      const int cls_off = ch - nc;  // 分类分数在该层通道内的起始偏移
+      const int cls_off = ch - nc;
       for (int y = 0; y < g.h; ++y) {
         for (int x = 0; x < g.w; ++x) {
           const int64_t a = a_base + static_cast<int64_t>(y) * g.w + x;
@@ -273,7 +257,6 @@ struct FeatureMajorDecoder {
   }
 };
 
-/// 插件输出：EfficientNMS_TRT 等已完成解码，这里只做搬运与阈值过滤。
 struct PluginDecoder {
   static void Decode(const TensorView& out, const DecodeOptions& opt,
                      std::vector<Detection>& dets) {
@@ -286,7 +269,7 @@ struct PluginDecoder {
     if (cols != 6 && cols != 7) {
       throw TritError("plugin-nms 输出列数必须是 6 或 7，实际 " + std::to_string(cols));
     }
-    const int base = (cols == 7) ? 1 : 0;  // 7 列时第 0 列是 batch index
+    const int base = (cols == 7) ? 1 : 0;
     const Reader r(out);
     for (int64_t i = 0; i < rows; ++i) {
       Detection d;
@@ -302,9 +285,7 @@ struct PluginDecoder {
   }
 };
 
-}  // namespace
-
-// ------------------------------------------------------------------ 基础算子
+}
 
 float sigmoid(float x) {
   if (x >= 0.f) {
@@ -351,8 +332,6 @@ std::vector<Detection> decode_predictions(const TensorView& output, const Decode
   if (opt.layout == OutputLayout::kPluginNms) {
     PluginDecoder::Decode(output, opt, dets);
   } else {
-    // 只有 batch=1 时 anchor 网格与 dim(2)/dim(1) 的对应关系才唯一。
-    // 多 batch：请按 batch 维切片后逐帧解码（服务里通常也是逐帧后处理）。
     if (output.rank() >= 1 && output.dim(0) != 1) {
       throw TritError("解码要求 batch=1（当前 batch=" + std::to_string(output.dim(0)) +
                       "）；多 batch 请按 batch 维切片后逐帧解码");
@@ -373,4 +352,4 @@ std::vector<Detection> decode_predictions(const TensorView& output, const Decode
   return dets;
 }
 
-}  // namespace todrt
+}

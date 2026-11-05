@@ -1,19 +1,10 @@
-"""MAV6D 工具链测试：解析 / 位姿 / 去畸变 / 划分 / 转换 / 端到端（数据可选）。
-
-依赖：torch + numpy（+ scipy、cv2 用于部分断言；缺失时自动跳过对应项）。
-**默认不需要 `/path/to/MAV6D`**：核心解析与几何断言全部用合成样本；
-只有 ``--mav6d`` 存在时才额外跑真实数据的端到端。
-
-运行::
-
-    python3 tests/test_mav6d.py
-    python3 tests/test_mav6d.py --mav6d /path/to/MAV6D --model phantom4 --max-frames 60
-"""
+"""MAV6D 工具链测试：解析 / 位姿 / 去畸变 / 划分 / 转换 / 端到端（数据可选）。"""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import math
 import shutil
 import sys
@@ -23,7 +14,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -59,19 +49,21 @@ def test_parse_formats() -> None:
     tmp = ROOT / "tests" / ".tmp" / "mav6d-fmt"
     tmp.mkdir(parents=True, exist_ok=True)
 
-    # ---- labels：16 个数；只有相机块（[9:12] 平移 + [12:16] 四元数）可靠 ----
     lab = tmp / "1.txt"
     lab.write_text("1.65e18 -2.077 -2.326 1.689 -0.0098 0.0352 0.3362 0.9411 "
                    "1.65e18 0.7098 -0.9310 1.7468 -0.0067 0.0117 0.9990 0.0431\n")
-    target, cam = calib.read_pose_file(lab)
-    check("labels：相机平移取自 [9:12]",
-          [round(v, 4) for v in cam[:3]] == [0.7098, -0.931, 1.7468], str(cam[:3]))
-    check("labels：相机四元数取自 [12:16]（保留真 w=0.0431）",
-          abs(cam[6] - 0.0431) < 1e-3 or abs(cam[6] / max(abs(cam[3]), 1e-9)) > 0,
-          str(cam[3:7]))
-    check("labels：相机四元数已归一化", abs(float((cam[3:7] ** 2).sum()) - 1.0) < 1e-9)
+    camera_pose, mav_pose = calib.read_pose_file(lab)
+    check("labels：相机平移取自 [1:4]",
+          [round(v, 4) for v in camera_pose[:3]] == [-2.077, -2.326, 1.689],
+          str(camera_pose[:3]))
+    check("labels：机体平移取自 [9:12]",
+          [round(v, 4) for v in mav_pose[:3]] == [0.7098, -0.931, 1.7468], str(mav_pose[:3]))
+    check("labels：机体四元数取自 [12:16]（保留真 w=0.0431）",
+          abs(mav_pose[6] - 0.0431) < 1e-3, str(mav_pose[3:7]))
+    check("labels：相机/机体四元数都已归一化",
+          abs(float((camera_pose[3:7] ** 2).sum()) - 1.0) < 1e-9
+          and abs(float((mav_pose[3:7] ** 2).sum()) - 1.0) < 1e-9)
 
-    # ---- labels_yolo6d：21 列 = cls + 9×(x,y) + (w,h) ----
     yolo = tmp / "1_y.txt"
     vals = [0] + [0.5 + 0.01 * i for i in range(18)] + [0.16, 0.15]
     yolo.write_text(" ".join(str(v) for v in vals) + "\n")
@@ -83,7 +75,6 @@ def test_parse_formats() -> None:
     check("yolo6d：末端 (w,h) 不计入关键点",
           abs(wh[0] - 0.16) < 1e-9 and abs(wh[1] - 0.15) < 1e-9, str(wh))
 
-    # 列数不对必须报错（而不是静默解析错位）
     bad = tmp / "bad.txt"
     bad.write_text("0 0.1 0.2 0.3\n")
     try:
@@ -100,29 +91,26 @@ def test_pose_line_roundtrip() -> None:
     import numpy as np
 
     cam2vicon = np.asarray(calib.UTIL_CAM2VICON, float)
-    # 用**已知的 MAV→VICON** 做真值，断言函数给出的 camera→MAV 等于
-    #   M = (MAV to VICON) * (camera to VICON)
-    # 并做闭环 M·(camera to VICON) == MAV→VICON。
-    # （早期测试把闭环写成 inv(c2v)·cam2mav 再与 cam2mav 比，那是恒等式写错，
-    #   实测差 1.71 m —— 这正是"测试自己错"的典型，别删这段注释。）
-    R_mav2vicon = np.asarray(calib.quat_to_rot(
-        [0.0, 0.0, math.sin(0.2), math.cos(0.2)]), float)      # 绕 z 转 0.4 rad
-    t_mav2vicon = [0.2673, -0.3636, 1.8130]
+    R_cam = np.asarray(calib.quat_to_rot([0.0, 0.0, math.sin(0.1), math.cos(0.1)]), float)
+    t_cam = [-0.38, 1.60, 3.04]
+    R_mav = np.asarray(calib.quat_to_rot(
+        [0.0, 0.0, math.sin(0.2), math.cos(0.2)]), float)
+    t_mav = [0.2673, -0.3636, 1.8130]
     mav2vicon = np.eye(4)
-    mav2vicon[:3, :3] = R_mav2vicon
-    mav2vicon[:3, 3] = t_mav2vicon
-    expected = mav2vicon @ np.linalg.inv(cam2vicon)            # camera→MAV
-    # labels 的目标块布局：[时间戳, x, y, z, qx, qy, qz, qw]
-    q = _quat_from_R(R_mav2vicon)
-    target = [1.6e18, *t_mav2vicon, *q]
+    mav2vicon[:3, :3] = R_mav
+    mav2vicon[:3, 3] = t_mav
+    expected = np.linalg.inv(cam2vicon) @ mav2vicon
+    camera_pose = [*t_cam, *_quat_from_R(R_cam)]
+    mav_pose = [*t_mav, *_quat_from_R(R_mav)]
 
-    line = conv._pose_line(np.asarray(target, dtype=float), None, calib)
+    line = conv._pose_line(np.asarray(camera_pose, dtype=float),
+                           np.asarray(mav_pose, dtype=float), calib)
     check("_pose_line 返回 7 个数", line is not None and len(line.split(",")) == 7,
           str(line))
     if line:
         vals = [float(v) for v in line.split(",")]
         dt = max(abs(a - b) for a, b in zip(vals[:3], expected[:3, 3]))
-        check("_pose_line 平移 = (MAV to VICON)·(camera to VICON) 的平移（<1e-6）",
+        check("_pose_line 平移 = inv(camera→VICON) @ 机体→VICON（<1e-6）",
               dt < 1e-6, f"最大差 {dt:.2e}")
         R_got = np.asarray(calib.quat_to_rot(vals[3:7]), float)
         dR = float(np.abs(R_got - expected[:3, :3]).max())
@@ -130,19 +118,33 @@ def test_pose_line_roundtrip() -> None:
         M = np.eye(4)
         M[:3, :3] = R_got
         M[:3, 3] = vals[:3]
-        back = M @ cam2vicon
-        check("闭环 M·(camera to VICON) 还原 MAV→VICON（<1e-6）",
+        back = cam2vicon @ M
+        check("闭环 (camera→VICON)·cam2mav 还原 机体→VICON（<1e-6）",
               float(np.abs(back - mav2vicon).max()) < 1e-6,
               f"最大差 {float(np.abs(back - mav2vicon).max()):.2e}")
 
-    # 离群距离（时间戳混入 x）时必须拒绝，而不是产出荒谬位姿
+        K = calib.default_intrinsics()
+        obj = calib.box_corners_center(calib.UTIL_PHANTOM4_BOX)
+        pc = (expected[:3, :3] @ obj.T).T + expected[:3, 3]
+        uv = (K[:2, :2] @ (pc[:, :2] / pc[:, 2:3]).T).T + K[:2, 2]
+        ok_line = conv._pose_line(
+            np.asarray(camera_pose, dtype=float), np.asarray(mav_pose, dtype=float), calib,
+            kpts_px=uv, K=K, object_points=obj, max_reproj_px=5.0)
+        check("_pose_line 接受投影一致的帧", ok_line is not None)
+        shifted = uv + np.array([20.0, 0.0])
+        bad_line = conv._pose_line(
+            np.asarray(camera_pose, dtype=float), np.asarray(mav_pose, dtype=float), calib,
+            kpts_px=shifted, K=K, object_points=obj, max_reproj_px=5.0)
+        check("_pose_line 拒绝投影不一致的帧", bad_line is None)
+
     bad = [1.6e18, 1.6e18, -2.0, 2.0, 0.0, 0.0, 0.0, 1.0]
     check("_pose_line 拒绝异常距离的帧",
-          conv._pose_line(np.asarray(bad, float), None, calib) is None)
-    # 四元数全 0 也必须拒绝
-    zero_q = [1.6e18, 0.2673, -0.3636, 1.8130, 0.0, 0.0, 0.0, 0.0]
+          conv._pose_line(np.asarray(camera_pose, float), np.asarray(bad, float),
+                          calib) is None)
+    zero_q = [0.2673, -0.3636, 1.8130, 0.0, 0.0, 0.0, 0.0]
     check("_pose_line 拒绝零四元数",
-          conv._pose_line(np.asarray(zero_q, float), None, calib) is None)
+          conv._pose_line(np.asarray(camera_pose, float), np.asarray(zero_q, float),
+                          calib) is None)
 
 
 def _invert4(m):
@@ -186,14 +188,12 @@ def test_undistort_roundtrip() -> None:
 
     K = np.asarray(calib.default_intrinsics(), float)
     D = np.asarray(calib.UTIL_PHANTOM4_D, float)
-    # 覆盖画面四角与中心
     pts = np.asarray([[0.0, 0.0], [1919.0, 0.0], [0.0, 1079.0], [1919.0, 1079.0],
                       [960.0, 540.0], [300.0, 200.0], [1600.0, 900.0]], dtype=float)
     und = conv.undistort_points(pts, K, D)
     back = _distort(und, K, D)
     err = float(np.abs(back - pts).max())
     check("去畸变往返 < 1e-3 px（覆盖四角）", err < 1e-3, f"最大 {err:.2e} px")
-    # 畸变确实显著（否则说明这项是空操作）
     shift = float(np.abs(und - pts).max())
     check("畸变在画幅边缘确实显著（>5 px，说明必须去畸变）", shift > 5.0,
           f"最大位移 {shift:.1f} px")
@@ -242,23 +242,29 @@ def test_convert_synthetic(tmp_dir: Path) -> None:
 
     K = np.asarray(calib.default_intrinsics(), float)
     D = np.asarray(calib.UTIL_PHANTOM4_D, float)
-    boxes = calib.box_corners_center(calib.UTIL_PHANTOM4_BOX)
-    rng = np.random.default_rng(0)
+    preset = json.loads((ROOT / "configs" / "_base_" / "datasets"
+                         / "_mav6d_phantom4_calib.json").read_text(encoding="utf-8"))
+    boxes = np.asarray(preset["object_points"], float)
+    K = np.asarray(preset["K"], float)
     n = 6
     for i in range(1, n + 1):
         Image.new("RGB", (1920, 1080), (30, 30, 30)).save(
             root / model / "JPEGImages" / "01" / "0101" / f"{i}.jpg")
-        # 合成一个合理的相机位姿（相机在 z=3，看向 -z 附近），目标放画面中央
         cam_t = [0.2 + 0.01 * i, -0.3, 3.0]
         cam_q = [0.0, 0.0, 0.0, 1.0]
-        target = [1.6e18, -0.21 + 0.01 * i, -0.30, 1.90, 0.0, 0.0, 0.0, 1.0]
-        # 16 个数 = 目标 8（[0] 时间戳 + 位姿 7）+ 相机 8（[8] 时间戳 + 位姿 7），
-        # 与真实文件布局一致（真实文件末尾还有一个空格）
+        cam2vicon = np.asarray(calib.UTIL_CAM2VICON, float)
+        mav_t = (cam2vicon[:3, 3] + cam2vicon[:3, 2] * 3.0
+                 + np.array([0.01 * i, 0.0, 0.0]))
+        mav_q = [0.0, 0.0, 0.0, 1.0]
+        mav2vicon = np.eye(4)
+        mav2vicon[:3, 3] = mav_t
+        M = np.linalg.inv(cam2vicon) @ mav2vicon
+        pc = (M[:3, :3] @ boxes.T).T + M[:3, 3]
+        uv = (K @ pc.T).T
+        uv = uv[:, :2] / uv[:, 2:3]
         (root / model / "labels" / "01" / "0101" / f"{i}.txt").write_text(
-            " ".join(f"{v:.6f}" for v in (*target, 1.6e18, *cam_t, *cam_q)) + " \n")
-        # labels_yolo6d：由作者框在**相机系**下投影（简化：直接给一组合理观测）
-        uv = np.stack([900 + 30 * i + rng.normal(0, 2, 9),
-                       500 + 20 * i + rng.normal(0, 2, 9)]).T
+            " ".join(f"{v:.6f}" for v in
+                     (1.6e18, *cam_t, *cam_q, 1.6e18, *mav_t, *mav_q)) + " \n")
         xd = (uv[:, 0] - K[0, 2]) / K[0, 0]
         yd = (uv[:, 1] - K[1, 2]) / K[1, 1]
         r2 = xd * xd + yd * yd
@@ -290,7 +296,7 @@ def test_convert_synthetic(tmp_dir: Path) -> None:
         rc = conv.main()
     except SystemExit as exc:
         rc = exc.code if isinstance(exc.code, int) else 1
-    except Exception as exc:  # noqa: BLE001 - 转换器异常要暴露出来，便于定位
+    except Exception as exc:  # noqa: BLE001
         import traceback
         raise AssertionError(f"[FAIL] 转换器抛异常：{type(exc).__name__}: {exc}\n"
                              f"{traceback.format_exc()}") from exc
@@ -360,7 +366,6 @@ def test_real_data(mav6d: Path, model: str, max_frames: int) -> None:
               abs(res["scale_vs_author_phantom4_box"] - 1.0) < 1e-9,
               str(res["scale_vs_author_phantom4_box"]))
 
-    # 小规模转换（用 --max-frames 限制，避免真跑 1.6 万张）
     out = ROOT / "tests" / ".tmp" / f"mav6d-real-{model}"
     if out.exists():
         shutil.rmtree(out)
@@ -368,7 +373,7 @@ def test_real_data(mav6d: Path, model: str, max_frames: int) -> None:
                 "--out", str(out), "--copy", "--max-frames", str(min(20, max_frames)),
                 "--calib", str(ROOT / "configs" / "_base_" / "datasets" /
                                ("_mav6d_mavic2_calib.json" if model == "mavic2" else "_none"))]
-    if model == "phantom4":          # phantom4 现场标定（作者的框已验证）
+    if model == "phantom4":
         sys.argv = [a for a in sys.argv if a != "_none"]
         sys.argv = sys.argv[:-2] if sys.argv[-2] == "--calib" else sys.argv
     try:
@@ -382,11 +387,7 @@ def test_real_data(mav6d: Path, model: str, max_frames: int) -> None:
 
 
 def _default_mav6d_root() -> Path:
-    """真实数据根目录：环境变量 MAV6D_ROOT > 常见的 D:/MAV6D > data/MAV6D。
-
-    不写死 ``/path/to/MAV6D``：在 Linux 上 ``Path("D:/MAV6D")`` 会被当成当前目录下名叫
-    ``D:`` 的相对路径，默认值永远不可能命中。
-    """
+    """真实数据根目录：环境变量 MAV6D_ROOT > 常见的 D:/MAV6D > data/MAV6D。"""
     import os
 
     env = os.environ.get("MAV6D_ROOT")

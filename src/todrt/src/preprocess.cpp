@@ -1,16 +1,3 @@
-// preprocess.cpp —— 前处理策略：BGR/RGB HWC uint8 → 一个连续张量
-//
-// 支持两条输出路径（由 PreprocessOptions::output / layout 决定）：
-//
-//   kFloat32 + kNchw  —— TensorRT / ONNX Runtime：value = pixel * norm_scale + norm_bias
-//   kUint8Raw + kNhwc —— RKNN 量化模型：直接给 0–255 原始像素，**不归一化**
-//
-// 为什么必须支持后者：RKNN 工具链把归一化"烧"进了量化模型（输入端 scale 就代表
-// 1/255）。宿主机若再归一化一次，就是双重归一化 —— 模型不会报错，只会给出全错的框。
-// 这类错误在部署阶段极难定位，所以这里用**显式的输出契约**把它变成配置项：
-// RKNN 上填 `preprocess.output = "uint8"`，TensorRT 上填 `"float32"`。
-//
-// 几何部分（letterbox 的 scale/pad）两条路径完全共用，保证坐标反变换只有一份实现。
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -29,7 +16,6 @@ inline float pixel_at(const ImageView& img, int x, int y, int c) {
   return static_cast<float>(v);
 }
 
-/// 双线性采样（通道 c），坐标在**原图**像素坐标系内。
 inline float bilinear(const ImageView& img, float sx, float sy, int c, bool clamp_edges) {
   const int x0 = static_cast<int>(std::floor(sx));
   const int y0 = static_cast<int>(std::floor(sy));
@@ -54,7 +40,6 @@ inline float bilinear(const ImageView& img, float sx, float sy, int c, bool clam
   return top + (bot - top) * fy;
 }
 
-/// 单张图的几何规划。
 struct Plan {
   float scale = 1.f;
   int pad_x = 0;
@@ -74,19 +59,17 @@ Plan plan_one(const ImageView& img, const PreprocessOptions& o) {
   float r = std::min(static_cast<float>(o.input_width) / static_cast<float>(img.width),
                      static_cast<float>(o.input_height) / static_cast<float>(img.height));
   if (o.mode == ResizeMode::kIntegerScale) {
-    // 只允许整数倍：避免小目标被非整数倍重采样"抹平"
     r = std::max(1.f, std::floor(r));
   }
   p.scale = r;
   p.new_w = static_cast<int>(std::round(static_cast<float>(img.width) * r));
   p.new_h = static_cast<int>(std::round(static_cast<float>(img.height) * r));
-  // 与 Ultralytics 一致：先算总 padding 再各自整除 2
+  // 记录实际取整后的补边，坐标反变换必须使用同一组几何参数。
   p.pad_x = (o.input_width - p.new_w) / 2;
   p.pad_y = (o.input_height - p.new_h) / 2;
   return p;
 }
 
-/// 检测用前处理器：几何（letterbox / stretch / integer-scale）× 输出（float/uint8 × NCHW/NHWC）。
 class DetectPreprocessor : public IPreprocessor {
  public:
   DetectPreprocessor() : DetectPreprocessor(PreprocessOptions{}) {}
@@ -149,8 +132,6 @@ class DetectPreprocessor : public IPreprocessor {
       uint8_t* base = out.bytes.data() + n * out.sample_bytes();
       float* fbase = reinterpret_cast<float*>(base);
 
-      // 目标缓冲的写入器：把 (y, x, c) 上的一个 float 值落到正确的位置与类型上。
-      // NCHW 索引 = c*H*W + y*W + x；NHWC 索引 = (y*W + x)*3 + c。
       auto store = [&](int y, int x, int c, float v) {
         const size_t idx = nchw ? (static_cast<size_t>(c) * plane +
                                    static_cast<size_t>(y) * out.width + static_cast<size_t>(x))
@@ -166,8 +147,6 @@ class DetectPreprocessor : public IPreprocessor {
         }
       };
 
-      // 1) 按填充策略铺满整幅
-      //    uint8 路径的填充值就是像素值本身（114 灰 / 0 黑），不做归一化。
       const float pad_v = (opt_.pad_value == PadValue::kZero)
                               ? 0.f
                               : (opt_.pad_value == PadValue::kGray114 ? 114.f : 0.f);
@@ -179,7 +158,6 @@ class DetectPreprocessor : public IPreprocessor {
           }
         }
       } else {
-        // 边缘复制：填充区取原图最近边缘像素
         for (int y = 0; y < out.height; ++y) {
           const int sy = std::min(std::max(y - p.pad_y, 0), img.height - 1);
           for (int x = 0; x < out.width; ++x) {
@@ -192,7 +170,6 @@ class DetectPreprocessor : public IPreprocessor {
         }
       }
 
-      // 2) 把缩放后的图像覆盖到 padded 区域
       const bool clamp_edges = p.scale >= 1.f;
       for (int y = 0; y < p.new_h; ++y) {
         const int dy = y + p.pad_y;
@@ -213,10 +190,9 @@ class DetectPreprocessor : public IPreprocessor {
   }
 
  private:
-  /// 目标通道 c（0=R,1=G,2=B）对应的源图通道索引（灰度图复用同一通道）。
   int src_channel(int c, const ImageView& img) const {
     if (img.channels == 1) return 0;
-    if (img.channels == 4) return c;  // BGRA/RGBA：丢弃 alpha
+    if (img.channels == 4) return c;
     if (!opt_.to_rgb) return c;
     return img.bgr ? (2 - c) : c;
   }
@@ -225,9 +201,7 @@ class DetectPreprocessor : public IPreprocessor {
   PreprocessOptions opt_;
 };
 
-}  // namespace
-
-// ------------------------------------------------------------------ 接口默认实现
+}
 
 BBox inv_transform(const BBox& b, float scale, float pad_x, float pad_y) {
   const float s = scale > 0.f ? scale : 1.f;
@@ -261,33 +235,27 @@ std::vector<std::vector<Detection>> IPreprocessor::ToSourceCoords(
   return dets;
 }
 
-// ------------------------------------------------------------------ 注册与构造
-
 namespace {
-/// 工厂默认实现：float NCHW（绝大多数运行时的默认契约）。
 std::unique_ptr<IPreprocessor> FactoryDetectPreproc() {
   return std::unique_ptr<IPreprocessor>(new DetectPreprocessor());
 }
-/// 工厂条目：RKNN 量化输入（uint8 NHWC）。
 std::unique_ptr<IPreprocessor> FactoryDetectPreprocUint8() {
   PreprocessOptions o;
   o.output = PreprocOutput::kUint8Raw;
   o.layout = TensorLayout::kNhwc;
   return std::unique_ptr<IPreprocessor>(new DetectPreprocessor(o));
 }
-}  // namespace
+}
 
 TOD_RT_REGISTER_PREPROC(detect_letterbox, FactoryDetectPreproc)
 TOD_RT_REGISTER_PREPROC(letterbox, FactoryDetectPreproc)
 TOD_RT_REGISTER_PREPROC(detect, FactoryDetectPreproc)
-// RKNN（RK3588）量化模型专用：uint8 + NHWC，不做归一化
 TOD_RT_REGISTER_PREPROC(detect_letterbox_uint8, FactoryDetectPreprocUint8)
 TOD_RT_REGISTER_PREPROC(letterbox_uint8, FactoryDetectPreprocUint8)
 TOD_RT_REGISTER_PREPROC(rknn, FactoryDetectPreprocUint8)
 
-/// 供后端按部署配置构造带参数的前处理器。
 std::unique_ptr<IPreprocessor> make_detect_preprocessor(const PreprocessOptions& o) {
   return std::unique_ptr<IPreprocessor>(new DetectPreprocessor(o));
 }
 
-}  // namespace todrt
+}

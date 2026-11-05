@@ -1,40 +1,4 @@
-"""STAL —— 小目标感知的标签分配（SDD-YOLO §4.6，EP6）。
-
-论文原文（§4.6，全文关于 STAL 只有这两处）：
-
-    摘要："native small-target-aware label assignment (STAL)"
-    正文："This is coupled with STAL (Small-Target-Aware Label Assignment), which
-           assigns adaptive higher weights to micro-target anchors."
-
-    -> **论文没有给出 STAL 的公式、伪代码或超参**，也没有说明"higher weights"加在哪里。
-
-框架侧的事实（ultralytics 8.4，``TaskAlignedAssigner.select_candidates_in_gts``）::
-
-    gt_bboxes_xywh = xyxy2xywh(gt_bboxes)
-    wh_mask = gt_bboxes_xywh[..., 2:] < self.stride[0]      # 比最小 stride 还小的目标
-    gt_bboxes_xywh[..., 2:] = torch.where(
-        (wh_mask * mask_gt).bool(),
-        torch.tensor(self.stride_val, ...),                 # stride[1]（次小 stride）
-        gt_bboxes_xywh[..., 2:])
-    gt_bboxes = xywh2xyxy(gt_bboxes_xywh)
-    ... 之后按"锚点中心是否落在 GT 框内"筛选正样本
-
-    也就是说：**当 GT 的宽或高小于最小 stride（P3 = 8px）时，把中心采样区域从
-    实际 GT 框放宽到次小 stride（16px）**，让小目标也能分到足够的正样本锚点。
-    这就是论文所说的 "small-target-aware"。
-
-【本库的理解与落地（标注为推断）】
-    论文说的 "assigns adaptive higher weights to micro-target anchors"，
-    本库理解为**让极小目标匹配到更多正样本锚点**（先验放宽），而不是额外的权重重标定：
-      * ``small_target_aware=True``（默认）：显式复刻上面这条规则。在 8.4 上与框架
-        原生实现**数值完全一致**（tests/test_modules.py 有逐元素对照），旧版框架没有
-        该规则时则由本类补上；
-      * ``small_target_aware=False``：退回经典 YOLOv8 TAL（不做放宽），
-        从而得到论文 Table 3 里 STAL 那一列的**可消融开关**。
-
-    如果论文作者后来公布了 STAL 的具体形式（例如对 align_metric 做面积相关的重标定），
-    只需替换本文件，不影响其它 EP。
-"""
+"""STAL —— 小目标感知的标签分配（SDD-YOLO §4.6，EP6）。"""
 
 from __future__ import annotations
 
@@ -45,7 +9,6 @@ import torch
 from tod.compat import tal_assigner
 from tod.registry import register
 
-#: 每个开关值只动态建一次子类（框架基类导入较慢）。
 _CLASSES: dict[bool, type] = {}
 
 
@@ -56,10 +19,7 @@ def _xywh2xyxy(x: torch.Tensor) -> torch.Tensor:
 
 
 def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt, eps=1e-9):
-    """锚点中心是否落在 GT 框内；``small_target_aware=True`` 时对极小目标放宽。
-
-    与框架实现同序、同语义（见文件头），返回 ``(b, n_boxes, h*w)`` 的 bool 掩码。
-    """
+    """锚点中心是否落在 GT 框内；``small_target_aware=True`` 时对极小目标放宽。"""
     xywh = torch.stack(
         ((gt_bboxes[..., 0] + gt_bboxes[..., 2]) / 2,
          (gt_bboxes[..., 1] + gt_bboxes[..., 3]) / 2,
@@ -89,14 +49,7 @@ def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt, eps=1e-9):
 
 
 def small_target_assigner_class(small_target_aware: bool = True) -> type:
-    """构造（并缓存）STAL 分配器类：框架 ``TaskAlignedAssigner`` 的子类。
-
-    动态类必须**同时挂到模块全局名**上：准则会被写进 checkpoint（``torch.save``），
-    pickle 需要按限定名 ``tod.assigner.stal.SmallTargetAssigner`` 反查类；
-    只放在 ``_CLASSES`` 字典里会在训练末保存权重时报
-    ``PicklingError: Can't pickle <class ...>: attribute lookup ... failed``
-    ——这是"跑通一次真训练"才发现的问题，单模块测试覆盖不到。
-    """
+    """构造（并缓存）STAL 分配器类：框架 ``TaskAlignedAssigner`` 的子类。"""
     key = bool(small_target_aware)
     if key not in _CLASSES:
         base = tal_assigner()
@@ -107,7 +60,7 @@ def small_target_assigner_class(small_target_aware: bool = True) -> type:
             {"small_target_aware": key, "select_candidates_in_gts": select_candidates_in_gts},
         )
         cls.__module__ = __name__
-        globals()[name] = cls          # 供 pickle 反查（见 docstring）
+        globals()[name] = cls
         _CLASSES[key] = cls
     return _CLASSES[key]
 

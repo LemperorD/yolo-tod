@@ -1,38 +1,4 @@
-"""MAV6D 测试入口：小目标检测 + 9 点关键点的完整评测（含论文全部指标）。
-
-## 报什么（一个脚本给全）
-
-| 指标 | 口径 | 与论文关系 |
-|---|---|---|
-| **AP / AP50**（框） | 按 GT 框边长分层（<8 / 8-16 / 16-32 / 32-96 / ≥96 px） | 论文的 AP（框由关键点外接得到） |
-| **OKS-AP 50:95** | 本库口径（框 IoU 匹配）+ 按目标尺度分层 + 逐关键点诊断 | 论文没有这项（本库新增，对尺度更鲁棒） |
-| **ADD / ADD(0.5d)** | ① **PnP 位姿层面**（论文式 13，同口径）② 关键点层面（用真值深度，补充诊断） | [OK] 与论文可比 |
-| **10°10cm** | 论文式 (14)/(15) + PnP | [OK] 与论文可比 |
-| 关键点像素误差 | 平均误差 / ≤1px 命中率，按尺度分层 | 论文没有（诊断用） |
-
-## 用法
-
-    # 单机型评测（自动找 results/mav6d-<机型>/weights/best.pt）
-    python3 tools/test_mav6d.py --model phantom4 --data data/mav6d/phantom4/dataset.yaml
-
-    # 指定权重 / 划分 / 输出 JSON
-    python3 tools/test_mav6d.py --model phantom4 --weights results/xxx/weights/best.pt `
-        --split val --json results/mav6d-phantom4/test.json
-
-    # 两个机型一起报（论文 Table I/IV 就是分机型报的）
-    python3 tools/test_mav6d.py --model both --data-root data/mav6d
-
-    # 只看前 200 张（冒烟）
-    python3 tools/test_mav6d.py --model phantom4 --max-images 200
-
-## 重要口径说明（写进 JSON 的 meta，引用数字前必读）
-
-* `ADD` 与 `10°10cm` 用 **PnP** 估位姿，与论文**同口径**；PnP 失败的帧**单独计数**、
-  不计入误差（否则会把平均值拉飞）。论文未说明失败帧如何处理，这是本库的明确选择。
-* `OKS-AP` 用**框 IoU 匹配**（不是 COCO 的 OKS 匹配），**不等于** COCO keypoints AP。
-* 关键点标签在转换时**已去畸变**（见 `tools/mav6d_to_yolo.py`），因此相机内参用
-  针孔模型，不要再套作者 `util.py` 的畸变系数。
-"""
+"""MAV6D 测试入口：小目标检测 + 9 点关键点的完整评测（含论文全部指标）。"""
 
 from __future__ import annotations
 
@@ -46,7 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -143,7 +108,6 @@ def evaluate_one(model: str, args) -> dict:
         match_iou=args.match_iou, sigma_strategy=args.sigma_strategy,
         max_images=args.max_images, verbose=True,
     )
-    # ---- 框的尺度分层 AP（与 OKS 用同一套尺度层，便于横向对比）----
     from tod.eval.scales import evaluate as evaluate_boxes, format_table
 
     box_result = evaluate_boxes(
@@ -155,7 +119,6 @@ def evaluate_one(model: str, args) -> dict:
     print(format_table(box_result))
     elapsed = time.time() - started
 
-    # ---- 论文的位姿层面指标（PnP）：需要重新收集一遍匹配对 ----
     pnp = None
     if K and obj_pts:
         collected = _collect_for_pnp(data, weights, args, cfg)
@@ -258,12 +221,11 @@ def main() -> int:
             reports[model] = evaluate_one(model, args)
         except SystemExit as exc:
             failures.append(f"[{model}] {exc}")
-        except Exception as exc:  # noqa: BLE001 - 一个机型失败不应吞掉另一个
+        except Exception as exc:  # noqa: BLE001
             import traceback
             failures.append(f"[{model}] {type(exc).__name__}: {exc}\n"
                             f"{traceback.format_exc()}")
 
-    # ---- 汇总表 ----
     if reports:
         print("\n" + "=" * 78)
         print("汇总（分机型；论文 Table I/IV 也是分机型报的）")

@@ -1,16 +1,3 @@
-// todrt_cli.cpp —— 部署工具的单一入口
-//
-// 设计原则：**先用不需要 GPU 的子命令自检，再去实机跑**。
-//   todrt_cli list                 工厂里有什么（不需要 GPU/TensorRT）
-//   todrt_cli info   <模型>        一个变体的完整链路与预期 anchor 数
-//   todrt_cli dryrun <配置.json>    只装配不建引擎——配置写错在这里就能发现
-//   todrt_cli probe                这台机器到底能不能用 DLA / TensorRT 版本
-//   todrt_cli catalog              自动生成注册表总表（文档用）
-//   todrt_cli bench  <配置.json> <图片> [iters]
-//   todrt_cli run    <配置.json> <图片> [输出.json]
-//
-// 图片只支持 PPM/PGM（P6/P5），避免为了读一张图就引入 OpenCV；实机上一般直接用
-// Detector API 接相机帧。
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -101,7 +88,6 @@ void PrintUsage() {
   )";
 }
 
-/// 解析 `--key=value` / `--key value` / `-k v`。
 Options ParseArgs(int argc, char** argv) {
   Options o;
   if (argc < 2) {
@@ -134,7 +120,6 @@ Options ParseArgs(int argc, char** argv) {
   return o;
 }
 
-/// 把命令行覆盖项应用到 DetectorOptions 上（**只覆盖显式给出的项**）。
 void ApplyOverrides(DetectorOptions* o, const Options& cli) {
   if (cli.has("model")) o->model = cli.get("model");
   if (cli.has("builder")) o->builder = cli.get("builder");
@@ -179,7 +164,6 @@ void ApplyOverrides(DetectorOptions* o, const Options& cli) {
   if (cli.verbose) o->verbose = true;
 }
 
-/// 读 PPM(P6) / PGM(P5)。返回交错 RGB 数据（HWC）。
 bool LoadPnm(const std::string& path, std::vector<uint8_t>* pixels, int* w, int* h, int* channels,
              std::string* err) {
   std::ifstream in(path, std::ios::binary);
@@ -190,7 +174,6 @@ bool LoadPnm(const std::string& path, std::vector<uint8_t>* pixels, int* w, int*
   auto next_token = [&](std::string* tok) -> bool {
     *tok = "";
     char c;
-    // 跳过空白与注释
     while (in.get(c)) {
       if (c == '#') {
         std::string line;
@@ -222,7 +205,7 @@ bool LoadPnm(const std::string& path, std::vector<uint8_t>* pixels, int* w, int*
   *w = std::atoi(sw.c_str());
   *h = std::atoi(sh.c_str());
   *channels = (magic == "P6") ? 3 : 1;
-  in.get();  // 头与数据之间恰好一个空白字符
+  in.get();
   pixels->resize(static_cast<size_t>(*w) * static_cast<size_t>(*h) *
                  static_cast<size_t>(*channels));
   in.read(reinterpret_cast<char*>(pixels->data()),
@@ -251,8 +234,6 @@ std::string DetectionsToJson(const std::vector<std::vector<Detection>>& per_imag
   oss << "  ]\n}\n";
   return oss.str();
 }
-
-// ------------------------------------------------------------------ 子命令
 
 int CmdList(bool as_json) {
   const std::vector<std::string> names = model_names();
@@ -346,7 +327,6 @@ int CmdProbe() {
   const bool avail = backend_available(&reason);
   std::cout << "  已编译后端 : " << reason << "\n";
 
-  // 逐个后端报"能不能用"，而不是只报"编没编进来"——这两件事经常不一致
   std::cout << "\n-- TensorRT（NVIDIA GPU / Jetson DLA）--\n";
 #if TODRT_HAVE_TENSORRT
   {
@@ -500,7 +480,7 @@ int CmdRun(const std::string& cfg_path, const std::string& image_path, const std
   return 0;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
   try {

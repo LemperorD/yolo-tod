@@ -1,13 +1,3 @@
-// engine_stub.cpp —— 没有任何推理后端时的占位实现
-//
-// 存在的意义：**没有 GPU / NPU / 推理 SDK 的机器上，工厂装配自检依然可用**。
-//   * `PlanAssembly()` / `--dry-run` / `--list` / `--catalog` 完全不依赖本文件；
-//   * `Detector::Create()` 会给出「后端没编译进来 + 怎么打开」的明确错误，
-//     而不是链接失败或段错误。
-//
-// 注意：本文件只在**一个后端都没有**时参与编译（见 CMakeLists 的
-// TODRT_BACKEND_REGISTRY_SOURCES / TODRT_BACKEND_SOURCES）。后端分派本身在
-// backend_dispatch.cpp 里，那里会按名字给出准确提示。
 #include <memory>
 #include <string>
 
@@ -62,13 +52,10 @@ std::unique_ptr<IModelBuilder> MakeUnavailableBuilder() {
   return std::unique_ptr<IModelBuilder>(new UnavailableBuilder());
 }
 
-}  // namespace
+}
 
 TOD_RT_REGISTER_BUILDER(unavailable, MakeUnavailableBuilder)
 
-// 分派器（CreateDeviceDetector）与 backend_available 都在 backend_dispatch.cpp 里，
-// 那里会按已编译进来的后端给出准确提示，所以本文件只提供"不可用"这个可选项。
+}
 
-}  // namespace todrt
-
-#endif  // !TODRT_HAVE_ANY_BACKEND
+#endif

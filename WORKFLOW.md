@@ -291,6 +291,19 @@ python3 tools/check_pose_dataset.py --data data/mav6d/mavic2/dataset.yaml
 > 要把数据放到新硬盘上，直接 `--out E:/datasets/mav6d`，再把
 > `configs/datasets.yaml` 的 `data_root` 改成 `E:/datasets`（见 §4.0）。
 > 转换产物里的 `dataset.yaml` 已自带 **绝对** `path`，所以它放哪都能被直接定位。
+>
+> ⚠️ **完整转换会先清空 `<out>/<机型>`**。若图/标签/`labels_6d` 已在盘上、只是
+> `dataset.yaml` 丢了，用"只补描述文件"模式（不删任何东西）：
+>
+> ```text
+> # 只写 dataset.yaml + manifest.json；标定取 --calib > 仓库预置 JSON > 现场标定 > 作者几何
+> python3 tools/mav6d_to_yolo.py --model phantom4 --out data/mav6d --yaml-only
+> ```
+>
+> `dataset.yaml` 里的 `tod.camera_matrix` / `tod.object_points` / `model_diameter`
+> 是**标定产物**、不能手写；仓库预置了
+> `configs/_base_/datasets/_mav6d_{phantom4,mavic2}_calib.json`（由
+> `tools/mav6d_calibrate.py --check-util` 核对过），所以补描述文件**不需要**原始 MAV6D 在场。
 
 产物（实测规模）：
 
@@ -341,36 +354,44 @@ python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml `
 ### 5.1 MAV6D（小目标检测 + 9 点关键点）
 
 ```text
-# 1) 冒烟：2 epoch / 640 / batch 2，只确认数据、损失、显存都没问题
+# 1) 冒烟：2 epoch / 640 / batch 2；--smoke 会把 L_rep warm-up 强制为 0，真正走几何项
 python3 tools/train_mav6d.py --model phantom4 --smoke
 
-# 2) 正式训练
+# 2) 2D baseline（先关 L_rep；几何增强保持开启；推荐先跑这个锚点）
+python3 tools/train_mav6d.py --model phantom4 --no-lrep --epochs 100 --batch 4 --imgsz 1280
+
+# 3) 正式训练（L_rep 开启；labels_6d 已由 PnP 重建）
 python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280
 
-# 3) 另一机型（论文 Table IV 显示跨机型零样本很差，建议分别训）
+# 4) 另一机型（论文 Table IV 显示跨机型零样本很差，建议分别训）
 python3 tools/train_mav6d.py --model mavic2 --epochs 100 --batch 4 --imgsz 1280
 
-# 4) 显存不够时的两个旋钮
+# 5) 显存不够时的两个旋钮
 python3 tools/train_mav6d.py --model phantom4 --batch 2 --imgsz 960
-python3 tools/train_mav6d.py --model phantom4 --set workers=0            # Windows 上更稳
+python3 tools/train_mav6d.py --model phantom4 --set workers=0            # Windows/沙箱上更稳
 
-# 5) 断点续训
+# 6) 断点续训
 python3 tools/train_mav6d.py --model phantom4 --resume results/mav6d-phantom4/weights/last.pt
 ```
 
-默认超参（都可覆盖）：`imgsz=1280 / batch=4 / epochs=100 / mosaic=0 / degrees=10 / scale=0.4 /
-fliplr=0.5 / pose=12 / kobj=1 / amp=True / workers=4 / seed=0`。
+默认超参（都可覆盖）：`imgsz=1280 / batch=4 / epochs=100 / mosaic=0 / pose=12 / kobj=1 /
+amp=True / workers=4 / seed=0`。`degrees=10 / translate=0.1 / scale=0.4 / fliplr=0.5`
+**只在 `--no-lrep` 的 2D baseline 生效**；启用 `L_rep` 时它们会被 `pose_safe_augment_overrides()`
+强制归 0。
 
-为什么 1280 而不是 640：MAV6D 目标只占画面长边 10–17%（1920 下约 190–320 px），
-640 会把 190 px 的目标缩到 63 px，关键点定位精度直接损失。
-
-> ⚠️ **启用 6D 位姿监督（`EP7.reproj`，即 SPAE-pose 的默认）时，脚本会自动关掉会丢目标的
-> 几何增强**：`degrees / scale / translate / shear / perspective / mosaic / copy_paste /
-> mixup = 0`（保留 `fliplr` 与颜色抖动）。原因不是口味问题：
+> ⚠️ **启用 6D 位姿监督（`EP7.reproj`，即 SPAE-pose 的默认）时，脚本会自动关掉会丢目标
+> 或与位姿不同步的几何增强**：`degrees / scale / translate / shear / perspective / mosaic /
+> copy_paste / mixup / fliplr / flipud = 0`（保留颜色抖动）。原因不是口味问题：
 > 框架的 `RandomPerspective` 会把变换后面积占比 <10% 的框**连同类一起丢掉**，
 > 实测 MAV6D 有 **0.68%** 的图被丢成 0 个框；而 `labels_6d` 是**按原图逐目标**给的位姿，
-> 一旦丢框就无法认定"CSV 的哪几行还对应得上"，数据集的一一对应校验会直接报错。
-> 要保留某项就显式 `--set degrees=10` 覆盖它（自担位姿错配风险）。
+> 一旦丢框就无法认定"CSV 的哪几行还对应得上"。`fliplr` 则是位姿 `R,t` 没有同步翻，
+> 会让 GT 点上的 `L_rep` 从 0 变成 1.14–1.28。要保留某项就显式 `--set degrees=10` 覆盖它
+> （自担位姿错配风险；`fliplr` 不建议覆盖）。
+
+> 数据架构、四种文本格式、坐标约定见 [`docs/MAV6D.md`](docs/MAV6D.md)。
+> 原始 `D:/MAV6D` 不在盘上时，`labels_6d` 用
+> `tools/mav6d_to_yolo.py --pose-from-pnp` 重建；Mavic 2 必须加 `--fit-pnp-shape`
+> （机体宽高深比例与 Phantom 4 不同）。
 
 产物：
 
@@ -493,6 +514,7 @@ C++/TensorRT 侧（Linux）见 `docs/DEPLOY.md` 与 `src/todrt/README.md`。
 | 架构自检 | `python3 tests/smoke.py` |
 | 模块/姿态自检 | `python3 tests/test_modules.py` / `python3 tests/test_pose.py` |
 | 数据转换 | `python3 tools/mav6d_to_yolo.py --mav6d /path/to/MAV6D --model phantom4 --out data/mav6d` |
+| 补 dataset.yaml | `python3 tools/mav6d_to_yolo.py --model phantom4 --out data/mav6d --yaml-only` |
 | 数据集注册表 | `python3 tools/train.py --list-datasets`（换盘只改 `configs/datasets.yaml` 的 `data_root`） |
 | 数据校验 | `python3 tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml` |
 | 训练 | `python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280` |

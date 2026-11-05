@@ -1,19 +1,4 @@
 #!/usr/bin/env bash
-# ===========================================================================
-# 为 yolo-tod 建 venv 环境（Linux / macOS 版；Windows 用 tools/setup_venv.ps1）
-#
-# 步骤：建 .venv -> 引导 pip -> 从 PyTorch 索引装 torch/torchvision
-#       -> 装 requirement.txt -> 可编辑安装本仓库 -> 自检
-#
-# 为什么 torch 单独一步：PyPI 上的 torch/torchvision 是 CPU-only 构建，
-# GPU 版只在 https://download.pytorch.org/whl/cuXXX 上。
-#
-# 用法::
-#     bash tools/setup_venv.sh
-#     bash tools/setup_venv.sh --torch-index https://download.pytorch.org/whl/cu126
-#     bash tools/setup_venv.sh --python python3.12
-#     bash tools/setup_venv.sh --skip-checks
-# ===========================================================================
 set -euo pipefail
 
 PYTHON_BIN="python3"
@@ -26,7 +11,12 @@ while [[ $# -gt 0 ]]; do
         --torch-index) TORCH_INDEX="$2"; shift 2 ;;
         --skip-checks) SKIP_CHECKS=1; shift ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            printf '%s\n' \
+                '用法: bash tools/setup_venv.sh [选项]' \
+                '  --python BIN        指定 Python 解释器（默认 python3）' \
+                '  --torch-index URL   指定 PyTorch 轮子索引（默认 cu128）' \
+                '  --skip-checks       跳过安装后的自检' \
+                '  -h, --help          显示帮助'
             exit 0 ;;
         *) echo "[FAIL] 未知参数：$1" >&2; exit 2 ;;
     esac
@@ -35,8 +25,6 @@ done
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/.venv"
 
-# 正常 POSIX 布局是 bin/python；但在 Git Bash / Cygwin 下用 Windows 版 python 建 venv
-# 会得到 Scripts/python.exe，这里两种都认，脚本就不会在那种环境下白报错。
 if [[ -x "$VENV/bin/python" ]]; then
     VENV_PY="$VENV/bin/python"
 elif [[ -x "$VENV/Scripts/python.exe" ]]; then
@@ -52,13 +40,11 @@ ok()   { printf '  [OK] %s\n' "$1"; }
 warn() { printf '  [WARN] %s\n' "$1" >&2; }
 die()  { printf '  [FAIL] %s\n' "$1" >&2; exit 1; }
 
-# pip 的缓存/临时目录固定到工作区内，避免污染 HOME
 export PIP_CACHE_DIR="$ROOT/.cache/pip"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PIP_NO_INPUT=1
 mkdir -p "$PIP_CACHE_DIR"
 
-# ------------------------------------------------------- 1) 选解释器并建 venv
 step "1/6 选择解释器并创建 $VENV"
 
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || \
@@ -87,7 +73,6 @@ else
     ok "已创建 $VENV"
 fi
 
-# ------------------------------------------------------- 2) 引导 pip
 step "2/6 引导 pip"
 if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
     warn "venv 里没有 pip；用基础解释器装"
@@ -97,7 +82,6 @@ fi
 "$VENV_PY" -m pip install --upgrade pip >/dev/null 2>&1 || warn "pip 自升级失败（继续）"
 ok "$("$VENV_PY" -m pip --version)"
 
-# ------------------------------------------------------- 3) torch 栈
 step "3/6 安装 torch 栈（索引 $TORCH_INDEX）"
 TORCH_REQ="$ROOT/requirement-torch.txt"
 if [[ -f "$TORCH_REQ" ]]; then
@@ -111,19 +95,16 @@ else
 fi
 ok "torch 栈安装完成"
 
-# ------------------------------------------------------- 4) 其余依赖
 step "4/6 安装其余依赖（requirement.txt）"
 MAIN_REQ="$ROOT/requirement.txt"
 [[ -f "$MAIN_REQ" ]] || die "缺少 $MAIN_REQ"
 "$VENV_PY" -m pip install -r "$MAIN_REQ" || die "requirement.txt 安装失败"
 ok "依赖安装完成"
 
-# ------------------------------------------------------- 5) 本仓库
 step "5/6 可编辑安装本仓库（--no-deps）"
 ( cd "$ROOT" && "$VENV_PY" -m pip install -e . --no-deps ) || die "可编辑安装失败"
 ok "tod 已可编辑安装"
 
-# ------------------------------------------------------- 6) 自检
 if [[ "$SKIP_CHECKS" -eq 1 ]]; then
     printf '\n已跳过自检。启用环境： source .venv/bin/activate\n'
     exit 0

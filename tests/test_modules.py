@@ -1,12 +1,4 @@
-"""模块级测试：形状 / 数值 / 端到端建图。
-
-需要 torch + ultralytics（跑 ``python3 tests/smoke.py`` 的那套无依赖检查在另一个文件）。
-
-运行::
-
-    python3 tests/test_modules.py            # 全部
-    python3 tests/test_modules.py --fast     # 跳过端到端建图
-"""
+"""模块级测试：形状 / 数值 / 端到端建图。"""
 
 from __future__ import annotations
 
@@ -18,7 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -50,9 +41,6 @@ def _need_torch():
     return torch
 
 
-# --------------------------------------------------------------------- ADown
-
-
 def test_adown() -> None:
     torch = _need_torch()
     if torch is None:
@@ -66,8 +54,6 @@ def test_adown() -> None:
         y = m(torch.randn(2, 64, 40, 40))
     check("ADown 输出形状", tuple(y.shape) == (2, 128, 20, 20), f"实际 {tuple(y.shape)}")
 
-    # 非方形输入：输出尺寸是**下取整**的一半（33x41 -> 16x20），
-    # 与 ultralytics 自带 ADown 逐形状一致（下面做等价性对照）
     with torch.no_grad():
         y = m(torch.randn(1, 64, 33, 41))
     check("ADown 非方形输入", tuple(y.shape) == (1, 128, 16, 20), f"实际 {tuple(y.shape)}")
@@ -88,18 +74,13 @@ def test_adown() -> None:
                 check(f"ADown 形状与框架一致 {shape}", tuple(ours) == tuple(theirs),
                       f"{tuple(ours)} vs {tuple(theirs)}")
 
-    # 奇数输入通道必须报错（要沿通道一分为二）
     try:
         ADown(63, 128)
         raise AssertionError("[FAIL] 奇数输入通道未报错")
     except ValueError:
         PASSED.append("ADown 拒绝奇数输入通道")
 
-    # 两个分支各占一半通道
     check("ADown 分支通道", ADown(64, 128).c == 64)
-
-
-# ---------------------------------------------------------------------- SIoU
 
 
 def test_siou() -> None:
@@ -109,32 +90,27 @@ def test_siou() -> None:
 
     from tod.loss.box import siou
 
-    # 1) 完全重合 → ≈ 1
-    box = torch.tensor([[10.0, 10.0, 20.0, 20.0]])          # xywh
+    box = torch.tensor([[10.0, 10.0, 20.0, 20.0]])
     v = siou(box, box.clone(), xywh=True)
     check("SIoU 完全重合≈1", bool((v - 1).abs().max() < 1e-4), f"实际 {v.item():.6f}")
 
-    # 2) SIoU ≤ IoU（距离/形状代价非负）
     a = torch.tensor([[10.0, 10.0, 20.0, 20.0]])
     b = torch.tensor([[12.0, 11.0, 18.0, 22.0]])
     s = siou(a, b, xywh=True)
     iou = _plain_iou(a, b)
     check("SIoU ≤ IoU", bool((s <= iou + 1e-6).all()), f"siou={s.item():.4f} iou={iou.item():.4f}")
 
-    # 3) 对称性
     s_ab = siou(a, b, xywh=True)
     s_ba = siou(b, a, xywh=True)
     check("SIoU 对称", bool((s_ab - s_ba).abs().max() < 1e-5),
           f"{s_ab.item():.6f} vs {s_ba.item():.6f}")
 
-    # 4) xywh 与 xyxy 两种输入应给出相同结果
     a_xyxy = _xywh2xyxy(a)
     b_xyxy = _xywh2xyxy(b)
     s_xyxy = siou(a_xyxy, b_xyxy, xywh=False)
     check("SIoU xywh/xyxy 一致", bool((s_ab - s_xyxy).abs().max() < 1e-5),
           f"{s_ab.item():.6f} vs {s_xyxy.item():.6f}")
 
-    # 5) 小目标敏感度：1 像素偏移对 SIoU 的伤害应小于对 IoU 的伤害
     tiny = torch.tensor([[50.0, 50.0, 8.0, 8.0]])
     tiny_shift = torch.tensor([[51.0, 50.0, 8.0, 8.0]])
     s_tiny = siou(tiny, tiny_shift, xywh=True)
@@ -156,9 +132,6 @@ def _plain_iou(a, b):
     return inter / union
 
 
-# ------------------------------------------------------------------ DualAttention
-
-
 def test_dual_attention() -> None:
     torch = _need_torch()
     if torch is None:
@@ -173,7 +146,6 @@ def test_dual_attention() -> None:
         y = m(x)
     check("DualAttention 形状/通道不变", tuple(y.shape) == tuple(x.shape), f"实际 {tuple(y.shape)}")
     check("DualAttention 不是直通", not torch.allclose(y, x))
-    # σ(·)·σ(·) ∈ (0,1) ⇒ 逐元素放大系数 < 1
     check("DualAttention 输出幅度被抑制", bool((y.abs() <= x.abs() + 1e-6).all()))
 
     try:
@@ -188,9 +160,6 @@ def test_dual_attention() -> None:
 
     n = sum(p.numel() for p in DualAttention(64).parameters())
     check("DualAttention 参数极少（<1k）", n < 1000, f"实际 {n}")
-
-
-# ---------------------------------------------------------------------- WIoU
 
 
 def test_wise_iou() -> None:
@@ -212,7 +181,6 @@ def test_wise_iou() -> None:
     sim = v3(a, b, xywh=True)
     check("WIoU v3 数值有限", bool(torch.isfinite(sim).all()), f"实际 {float(sim)}")
 
-    # v1 是无状态的，用它做 xywh/xyxy 一致性检查（v2/v3 会改 iou_mean，跨调用不可比）
     v1 = WiseIoU(variant=1)
     a_xyxy = _xywh2xyxy(a)
     b_xyxy = _xywh2xyxy(b)
@@ -232,9 +200,6 @@ def test_wise_iou() -> None:
     check("box_loss('siou') 返回无状态函数", not isinstance(box_loss("siou"), WiseIoU))
 
 
-# ---------------------------------------------------------------------- STAL
-
-
 def test_stal() -> None:
     torch = _need_torch()
     if torch is None:
@@ -250,8 +215,8 @@ def test_stal() -> None:
     strides = [8, 16, 32]
     grid = torch.stack(torch.meshgrid(torch.arange(20) + 0.5, torch.arange(20) + 0.5,
                                       indexing="ij"), -1).view(-1, 2) * 8
-    tiny = torch.tensor([[[80.0, 80.0, 84.0, 84.0]]])        # 4x4 < stride[0]=8
-    normal = torch.tensor([[[70.0, 70.0, 130.0, 130.0]]])     # 60x60
+    tiny = torch.tensor([[[80.0, 80.0, 84.0, 84.0]]])
+    normal = torch.tensor([[[70.0, 70.0, 130.0, 130.0]]])
     gt = torch.cat((tiny, normal), dim=1)
     mask_gt = torch.ones(1, 2, 1)
 
@@ -274,9 +239,6 @@ def test_stal() -> None:
 
     built = get("STAL").obj(topk=10, num_classes=2, alpha=0.5, beta=6.0, stride=strides)
     check("注册表工厂可构造 STAL", getattr(built, "small_target_aware", False) is True)
-
-
-# --------------------------------------------------------------------- MuSGD
 
 
 def test_musgd() -> None:
@@ -345,9 +307,6 @@ def test_musgd() -> None:
     check("兜底实现能更新参数", not torch.equal(before, mine.conv.weight))
 
 
-# ---------------------------------------------------------------- 命名空间注入
-
-
 def test_namespace_injection() -> None:
     try:
         import tod
@@ -373,9 +332,6 @@ def test_namespace_injection() -> None:
         check(f"命名空间含 {name}", name in ns)
 
 
-# --------------------------------------------------- Efficient_UAVDet 换头手术
-
-
 def test_efficient_uavdet_surgery() -> None:
     torch = _need_torch()
     if torch is None:
@@ -389,7 +345,7 @@ def test_efficient_uavdet_surgery() -> None:
 
     from tod.modules.head.efficient_uavdet import describe, swap_detect_head
 
-    ch = (32, 64, 128, 256)          # 论文 Table 3 的 x
+    ch = (32, 64, 128, 256)
     head = Detect(nc=10, ch=ch)
     n_before = sum(p.numel() for p in head.parameters())
     out_ch_before = head.cv2[0][-1].bias.numel()
@@ -411,8 +367,6 @@ def test_efficient_uavdet_surgery() -> None:
     head.train()
     x = [torch.randn(1, c, s, s) for c, s in zip(ch, (160, 80, 40, 20))]
     out = head(x)
-    # 框架 8.4 起检测头训练模式的返回是 dict（end2end 时再套一层 one2many/one2one），
-    # 不再是老版本的 4 元素 list；这里按新契约取逐层 logits。
     logits = out[1] if isinstance(out, tuple) else out
     if isinstance(logits, dict) and "one2many" in logits:
         logits = logits["one2many"]
@@ -423,14 +377,11 @@ def test_efficient_uavdet_surgery() -> None:
           f"实际 boxes={logits['boxes'].shape[1]} scores={logits['scores'].shape[1]}")
     print("       -> " + describe(head).replace("\n", "\n         "))
 
-    # 另一种通道策略（in=out=x）也必须可用
     head2 = Detect(nc=10, ch=ch)
     swap_detect_head(head2, per_group=16, channels="input")
     check("input 策略：stem 内 in=out=x",
           head2.cv2[1][0].cv1.conv.in_channels == head2.cv2[1][0].cv2.conv.out_channels == 64)
 
-
-# --------------------------------------------------------- 知识蒸馏（EP9 §4.7）
 
 _SDD_CACHE: dict = {}
 
@@ -493,7 +444,6 @@ def test_kd() -> None:
     from tod.engine.distill import FeatureAlignKD, build_kd, head_strides, level_logits
     from tod.loss.criterion import build_detection_loss
 
-    # ---- 单元：相同 logits 时 KL 必须为 0；combine 就是式 (6) ----
     logits = {2: torch.randn(2, 64, 10), 3: torch.randn(2, 16, 10)}
     kd = FeatureAlignKD(lambda_=0.5, temperature=3.0)
     same = kd(logits, {k: v.clone() for k, v in logits.items()})
@@ -509,7 +459,7 @@ def test_kd() -> None:
     model = _sdd_model()
     if model is None:
         return skip("FeatureAlignKD 端到端", "未安装 torch/ultralytics")
-    teacher = copy.deepcopy(model).eval()          # 必须在注册 hook 前深拷贝
+    teacher = copy.deepcopy(model).eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
 
@@ -519,7 +469,7 @@ def test_kd() -> None:
 
     rec: dict = {}
 
-    class _Spy:                                     # 记录 combine 的入参，复核式 (6)
+    class _Spy:
         def __init__(self, inner):
             self.inner = inner
             self.lambda_ = inner.lambda_
@@ -557,9 +507,6 @@ def test_kd() -> None:
     check("KD：梯度到达注意力层",
           model.model[head_idx].channel[2].weight.grad is not None)
     check("KD：梯度不流向教师", all(p.grad is None for p in teacher.parameters()))
-
-
-# ---------------------------------------------------------------------- 端到端
 
 
 def test_end_to_end_build(fast: bool = False) -> None:
@@ -620,9 +567,6 @@ def test_end_to_end_build(fast: bool = False) -> None:
           f"，换头减少 {n_yaml - n_final:,}，头输入尺寸 {getattr(head, 'f', None)}")
 
 
-# ---------------------------------------------------------- 尺度分层评测
-
-
 def _dummy_dataset(n_train: int = 6, n_val: int = 3) -> Path:
     """生成（或复用）合成数据集，返回 dataset.yaml。"""
     import importlib.util
@@ -650,7 +594,6 @@ def test_scale_eval() -> None:
     from tod.eval.scales import (average_precision, bins_from_edges, evaluate, load_labels,
                                  match_image)
 
-    # ---- 单元：分层边界 ----
     bins = bins_from_edges([8, 16, 32, 96])
     check("分层数为 5（<8 / 8-16 / 16-32 / 32-96 / >=96）", len(bins) == 5,
           f"实际 {[b.name for b in bins]}")
@@ -659,13 +602,11 @@ def test_scale_eval() -> None:
     check("lt8 只含边长 <8", bins[0].contains(7.9) and not bins[0].contains(8.0))
     check("ge96 无上界", bins[-1].contains(1e6) and not bins[-1].contains(95.0))
 
-    # ---- 单元：AP 数学 ----
     check("AP：全对 → 1", abs(average_precision([True] * 5, [False] * 5, 5) - 1.0) < 1e-9)
     check("AP：全错 → 0", abs(average_precision([False] * 5, [True] * 5, 5)) < 1e-9)
     check("AP：部分命中介于 0/1 之间",
           0 < average_precision([True, False], [False, True], 2) < 1)
 
-    # ---- 单元：匹配 ----
     gts = [(0, (0, 0, 10, 10)), (0, (20, 20, 30, 30))]
     preds = [(0, 0.9, (0, 0, 10, 10)), (0, 0.8, (21, 21, 31, 31)), (1, 0.7, (0, 0, 10, 10))]
     matched = match_image(preds, gts, 0.5)
@@ -675,7 +616,6 @@ def test_scale_eval() -> None:
     dup = match_image([(0, 0.9, (0, 0, 10, 10)), (0, 0.8, (0, 0, 10, 10))], gts[:1], 0.5)
     check("匹配：同一 GT 不会被匹配两次", dup[1][2] == -1)
 
-    # ---- 端到端：注入"完美预测器"，检验分层是否真的区分尺度 ----
     data_yaml = _dummy_dataset()
     from PIL import Image
 
@@ -718,9 +658,6 @@ def test_scale_eval() -> None:
     check("结果带 meta（划分/图数/尺度边界）",
           empty["meta"]["images"] == 3 and empty["meta"]["size_bins_px"] == [8, 16, 32, 96],
           f"实际 {empty['meta']}")
-
-
-# ------------------------------------------------------- SDD-YOLO26n 端到端
 
 
 def test_sdd_end_to_end(fast: bool = False) -> None:
@@ -780,7 +717,6 @@ def test_sdd_end_to_end(fast: bool = False) -> None:
     check("SDD：stride 含 4（P2 层生效）", 4 in [int(s) for s in head.stride],
           f"实际 {[int(s) for s in head.stride]}")
 
-    # 准则：与 tools/train.py --dry-run 同一条路径
     args = get_cfg()
     for key, value in (spec.get("train") or {}).items():
         if hasattr(args, key):

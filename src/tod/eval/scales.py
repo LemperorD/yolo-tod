@@ -1,31 +1,4 @@
-"""尺度分层评测（PLAN §7.2）：固定同时报告整体 AP 与 `AP_small` / `AP_tiny`。
-
-**为什么不能只看 AP50 / 整体 mAP**（PLAN §1.1）：小目标变体的收益几乎全部体现在
-`AP_small` 上；只报整体 mAP 会让"小目标涨点、大目标掉点"和"什么都没发生"看起来一样。
-本模块按**目标边长（sqrt(area)，px）**分层，口径来自数据集配置里的
-``tod.size_bins_px``（默认 ``[8, 16, 32, 96]``，与 configs/_base_/datasets/*.yaml 一致）：
-
-    ============  ==========================  =========================
-    层            COCO 口径                   本库口径（边长）
-    ============  ==========================  =========================
-    tiny          —                           边长 < 16px
-    small         area < 32²                   边长 < 32px
-    medium        32² ≤ area < 96²             32 ≤ 边长 < 96
-    large         area ≥ 96²                   边长 ≥ 96
-    ============  ==========================  =========================
-
-实现要点（与 COCO 一致，便于横向对比）：
-    * AP 用 101 点插值；`AP50:95` 对 IoU 0.50:0.05:0.95 求平均；
-    * 每层只按**目标边长**过滤 GT；预测框**不**按尺寸过滤，但命中"本层之外 GT"的预测按
-      COCO 的 **ignore 语义**忽略（既不算 TP 也不算 FP）—— 否则一个"大小目标都会检"的
-      检测器会因为大目标预测在小目标层里变成 FP，被莫名压低 AP_small；
-    * **有 GT 但一个预测都没有的类别计 0 分**（不能悄悄跳过，否则漏检整类反而"好看"）；
-    * 每个类别先算 AP 再对类别取平均（得到该层的 mAP），因此类内分层、类间可比；
-    * 低置信阈值（默认 0.001）+ 每图最多 300 框，保证召回不被后处理截断。
-
-本模块**不依赖** ultralytics 的 validator 内部结构：预测可以来自 YOLO 模型，也可以来自
-任何 ``(image_path) -> [(cls, conf, xyxy), ...]`` 的可调用对象（测试里用它注入"完美预测"）。
-"""
+"""尺度分层评测（PLAN §7.2）：固定同时报告整体 AP 与 `AP_small` / `AP_tiny`。"""
 
 from __future__ import annotations
 
@@ -34,9 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-#: 图像后缀（与 ultralytics 一致）
 IMG_SUFFIXES = (".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp")
-#: 默认边长分层（px）；数据集里可用 tod.size_bins_px 覆盖
 DEFAULT_BINS = (8, 16, 32, 96)
 IOU_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))
 
@@ -69,14 +40,8 @@ def dataset_bins(data_cfg: dict) -> list[Bin]:
     return bins_from_edges(edges)
 
 
-# ------------------------------------------------------------------ 数据读取
-
-
 def resolve_split(data_cfg: dict, split: str, yaml_path: Path) -> tuple[Path, list[Path]]:
-    """解析数据集 YAML 里的 split 路径，返回 ``(数据根目录, 图像列表)``。
-
-    支持两种写法：目录（递归找图像）与 ``.txt`` 列表文件（每行一个路径）。
-    """
+    """解析数据集 YAML 里的 split 路径，返回 ``(数据根目录, 图像列表)``。"""
     root = Path(str(data_cfg.get("path") or yaml_path.parent))
     if not root.is_absolute():
         root = (yaml_path.parent / root).resolve()
@@ -85,7 +50,7 @@ def resolve_split(data_cfg: dict, split: str, yaml_path: Path) -> tuple[Path, li
         raise KeyError(f"数据集配置里没有 {split} 划分（现有键：{sorted(data_cfg)}）")
     target = Path(str(value))
     target = target if target.is_absolute() else root / target
-    if target.suffix == ".txt" and target.is_file():      # 列表文件形式
+    if target.suffix == ".txt" and target.is_file():
         images = [Path(line.strip()) for line in target.read_text(encoding="utf-8").splitlines()
                   if line.strip()]
         return root, images
@@ -124,9 +89,6 @@ def load_labels(image: Path, img_w: int, img_h: int) -> tuple[list[float], list[
     return boxes, classes
 
 
-# ------------------------------------------------------------------ 匹配 / AP
-
-
 def iou_xyxy(a: Sequence[float], b: Sequence[float]) -> float:
     """两个 xyxy 框的 IoU。"""
     ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
@@ -151,7 +113,6 @@ def average_precision(tp: list[bool], fp: list[bool], n_gt: int) -> float:
         fp_cum += int(f)
         recalls.append(tp_cum / n_gt)
         precisions.append(tp_cum / max(tp_cum + fp_cum, 1e-9))
-    # 精度包络：从右往左取累计最大
     for i in range(len(precisions) - 2, -1, -1):
         precisions[i] = max(precisions[i], precisions[i + 1])
     ap = 0.0
@@ -169,17 +130,7 @@ def average_precision(tp: list[bool], fp: list[bool], n_gt: int) -> float:
 def match_image(preds: list[tuple[int, float, Sequence[float]]],
                 gts: list[tuple[int, Sequence[float]]],
                 iou_thr: float) -> list[tuple[int, float, int]]:
-    """按类别做贪心匹配（单图）。
-
-    Args:
-        preds: ``[(cls, conf, xyxy), ...]``（任意顺序）。
-        gts: ``[(cls, xyxy), ...]``（本层保留的 GT）。
-        iou_thr: IoU 阈值。
-
-    Returns:
-        ``[(cls, conf, matched_gt_index), ...]``，按置信度降序；``matched_gt_index`` 为
-        ``-1`` 表示未匹配（FP）。
-    """
+    """按类别做贪心匹配（单图）。"""
     order = sorted(range(len(preds)), key=lambda i: -preds[i][1])
     used: set[int] = set()
     out: list[tuple[int, float, int]] = []
@@ -196,9 +147,6 @@ def match_image(preds: list[tuple[int, float, Sequence[float]]],
             used.add(best)
         out.append((pcls, conf, best))
     return out
-
-
-# ------------------------------------------------------------------ 主流程
 
 
 def _default_predictor(weights: str | Path, imgsz: int, conf: float, iou: float,
@@ -239,16 +187,7 @@ def evaluate(
     max_images: int | None = None,
     verbose: bool = True,
 ) -> dict:
-    """在 ``data_yaml`` 的 ``split`` 上做尺度分层评测。
-
-    Args:
-        weights: YOLO 权重路径（与 ``predictor`` 二选一）。
-        predictor: 自定义预测器（测试注入用），签名 ``(image_path) -> [(cls, conf, xyxy)]``。
-        max_images: 只评测前 N 张（自检/冒烟用）。
-
-    Returns:
-        ``{bins: {层名: {ap50, ap50_95, n_gt, n_pred, n_classes}}, overall: {...}, meta: {...}}``
-    """
+    """在 ``data_yaml`` 的 ``split`` 上做尺度分层评测。"""
     from PIL import Image
 
     from tod.compat import load_yaml
@@ -269,7 +208,6 @@ def evaluate(
             raise ValueError("需要 weights 或 predictor 之一")
         predictor, _ = _default_predictor(weights, imgsz, conf, iou, device, max_det, 1)
 
-    # 逐图收集：预测与 GT（GT 记住边长，供分层过滤）
     collected: list[dict[str, Any]] = []
     for image in images:
         with Image.open(image) as im:
@@ -289,7 +227,6 @@ def evaluate(
 
     for bin_spec in [Bin("all", 0.0, None), *bins]:
         n_gt_per_class: dict[int, int] = {}
-        #: (cls, iou_thr) → [(是否 TP, 置信度), ...]
         records: dict[tuple[int, float], list[tuple[bool, float]]] = {}
         n_pred = 0
         for item in collected:
@@ -304,12 +241,9 @@ def evaluate(
                     if thr == IOU_THRESHOLDS[0]:
                         n_pred += 1
                     if gt_index != -1 and gt_index not in in_bin:
-                        # 命中**本层之外**的 GT → 忽略该预测（COCO 的 area-range ignore 语义：
-                        # 既不算 TP 也不算 FP，否则"检测器同时会检大目标"会莫名拉低 AP_small）
                         continue
                     records.setdefault((cls, thr), []).append((gt_index != -1, conf_v))
 
-        # 逐类别逐阈值算 AP；**有 GT 但一个预测都没有的类别必须计 0 分**（不能悄悄跳过）
         ap_by_class: dict[int, list[float]] = {}
         for cls, n_gt in sorted(n_gt_per_class.items()):
             if n_gt == 0:

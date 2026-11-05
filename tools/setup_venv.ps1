@@ -1,42 +1,3 @@
-<#
-.SYNOPSIS
-    Create a venv-based (NOT conda) training environment for yolo-tod.
-
-.DESCRIPTION
-    Steps: create .venv -> bootstrap pip -> install torch/torchvision from a PyTorch
-    index -> install requirement.txt -> editable install of this repo -> self-check.
-
-    Why torch is a separate step: the torch/torchvision wheels on PyPI are CPU-only
-    builds. GPU builds live only on https://download.pytorch.org/whl/cuXXX, so
-    installing them from their own index avoids pip mixing same-named packages
-    across indexes and silently landing on the CPU build.
-
-    Pick the index for your own CUDA via -TorchIndex (cu118/cu126/cu128/cu129/cu130
-    or .../whl/cpu). Default cu128 works for Blackwell cards such as the RTX 5060.
-
-    A local requirement-torch.txt is used to pin exact versions when present; it is
-    optional, and this repo does not ship one.
-
-.NOTES
-    This file is deliberately ASCII-only. Windows PowerShell 5.1 decodes BOM-less
-    scripts with the ANSI code page (936/GBK on this machine), which corrupts
-    non-ASCII comments and breaks parsing. Keep it ASCII.
-
-.PARAMETER PythonVersion
-    Interpreter used for the venv. Either a py-launcher version such as "3.12"/"3.14",
-    or a full path to python.exe. Defaults to "python" from PATH.
-
-.PARAMETER TorchIndex
-    PyTorch wheel index. Defaults to https://download.pytorch.org/whl/cu128
-
-.PARAMETER SkipChecks
-    Skip the final self-check step.
-
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1
-    powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1 -PythonVersion 3.12
-    powershell -ExecutionPolicy Bypass -File tools\setup_venv.ps1 -TorchIndex https://download.pytorch.org/whl/cu129
-#>
 [CmdletBinding()]
 param(
     [string]$PythonVersion = "",
@@ -44,16 +5,12 @@ param(
     [switch]$SkipChecks
 )
 
-# "Continue" on purpose: python/pip write normal progress to stderr, and Windows
-# PowerShell 5.1 turns a native command's stderr into a terminating error under
-# "Stop". Failures are detected explicitly via $LASTEXITCODE instead, so pip's
-# progress output stays visible.
+# PowerShell 5.1 treats native stderr as errors under Stop; use exit codes instead.
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $venv = Join-Path $root ".venv"
 $venvPy = Join-Path $venv "Scripts\python.exe"
 
-# Keep pip cache/temp inside the workspace instead of C:\Users\<user>\AppData\Local\Temp
 $env:PIP_CACHE_DIR = Join-Path $root ".cache\pip"
 $env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
 $env:PIP_NO_INPUT = "1"
@@ -66,7 +23,6 @@ function Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
 function Die($msg)  { Write-Host "  [FAIL] $msg" -ForegroundColor Red; exit 1 }
 
-# ------------------------------------------------------- 1) pick interpreter
 Step "1/6 select interpreter and create $venv"
 
 if (-not $PythonVersion) { $PythonVersion = "python" }
@@ -132,7 +88,7 @@ if (Test-Path $venvPy) {
     }
 } else {
     if (-not (New-Venv)) {
-        # ensurepip can fail on locked-down machines; bootstrap pip in step 2 instead
+
         Warn "python -m venv failed (ensurepip); retrying with --without-pip"
         Invoke-Base @("-m", "venv", "--without-pip", $venv) | Out-Null
         if (-not (Test-Path $venvPy)) { Die "venv creation failed; no python.exe at $venvPy" }
@@ -140,7 +96,6 @@ if (Test-Path $venvPy) {
     Ok "created $venv"
 }
 
-# ------------------------------------------------------- 2) bootstrap pip
 Step "2/6 bootstrap pip in the venv"
 if (-not (Test-Pip $venvPy)) {
     Warn "venv has no pip; installing it with the base interpreter"
@@ -154,10 +109,8 @@ $null = & $venvPy -m pip install --upgrade pip 2>$null
 if ($LASTEXITCODE -ne 0) { Warn "pip self-upgrade failed (continuing with the bundled pip)" }
 Ok ((& $venvPy -m pip --version 2>$null | Out-String).Trim())
 
-# ------------------------------------------------------- 3) torch stack
 Step "3/6 install torch stack from $TorchIndex"
-# torch/torchvision come from their own index (PyPI ships CPU-only builds). A local
-# requirement-torch.txt, if present, pins the versions; otherwise let pip resolve them.
+
 $torchReq = Join-Path $root "requirement-torch.txt"
 if (Test-Path $torchReq) {
     Ok "using $torchReq"
@@ -171,7 +124,6 @@ if ($LASTEXITCODE -ne 0) {
 }
 Ok "torch stack installed"
 
-# ------------------------------------------------------- 4) other deps
 Step "4/6 install remaining dependencies (requirement.txt)"
 $mainReq = Join-Path $root "requirement.txt"
 if (-not (Test-Path $mainReq)) { Die "missing $mainReq" }
@@ -179,7 +131,6 @@ if (-not (Test-Path $mainReq)) { Die "missing $mainReq" }
 if ($LASTEXITCODE -ne 0) { Die "requirement.txt install failed" }
 Ok "dependencies installed"
 
-# ------------------------------------------------------- 5) this repo
 Step "5/6 editable install of this repo (--no-deps; deps are already in place)"
 Push-Location $root
 try {
@@ -190,7 +141,6 @@ try {
 }
 Ok "tod installed in editable mode"
 
-# ------------------------------------------------------- 6) self-check
 if ($SkipChecks) {
     Write-Host ""
     Write-Host "Self-check skipped. Activate with: .\.venv\Scripts\Activate.ps1" -ForegroundColor Yellow

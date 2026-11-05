@@ -1,27 +1,4 @@
-"""训练入口：读变体 spec → 注入魔改模块 → 生成模型图 → 交给 ultralytics 训练。
-
-训练集位置由**注册表 YAML**（默认 ``configs/datasets.yaml``）决定，脚本本身不含任何
-绝对路径 —— 服务器换盘 / 换机器只改注册表，不改代码：
-
-用法::
-
-    # 0) 先物化变体（生成 variant.yaml / model.yaml / card.md）
-    python3 tools/make_variant.py variants/SPAE-YOLOv8n/recipe.py
-
-    # 1) 看注册表里有哪些数据集、根目录指向哪里、各分划有多少张图
-    python3 tools/train.py --list-datasets
-
-    # 2) 只做结构自检：建模型 + 一次前向，不训练（不需要数据集）
-    python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml --dry-run
-
-    # 3) 真训练：--data 可以直接写注册表里的名字
-    python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml \
-        --data visdrone2019-det --epochs 150 --batch 4
-
-    # 4) 临时换盘/换布局：命令行覆盖根目录（优先级最高）
-    python3 tools/train.py --variant variants/SPAE-YOLOv8n/variant.yaml \
-        --data visdrone2019-det --data-root /mnt/hdd/datasets
-"""
+"""训练入口：读变体 spec → 注入魔改模块 → 生成模型图 → 交给 ultralytics 训练。"""
 
 from __future__ import annotations
 
@@ -32,7 +9,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -62,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--set", action="append", default=[], metavar="K=V",
                     help="覆盖任意训练参数（可重复），如 --set workers=0 --set plots=False")
     ap.add_argument("--dry-run", action="store_true", help="只建模型并前向一次，不训练")
+    ap.add_argument("--no-lrep", action="store_true",
+                    help="关闭 EP7.reproj（2D baseline；几何增强保持开启）")
     ap.add_argument("--allow-threaded-cache", action="store_true",
                     help="保留框架默认的并行标签缓存（受限沙箱下会 WinError 5）")
     return ap
@@ -93,7 +71,6 @@ def main() -> int:
     from tod.compose import Variant
     from tod.paths import describe
 
-    # ---- 0) 只看注册表：换盘之后先跑这一条，确认根目录指向新硬盘、分划里有图 ----
     if args.list_datasets:
         for line in describe(registry_path_hint=args.datasets):
             print(line)
@@ -106,9 +83,11 @@ def main() -> int:
     if not args.variant.is_file():
         raise SystemExit(f"变体文件不存在：{args.variant}")
     spec = load_yaml(args.variant)
+    if args.no_lrep:
+        spec.setdefault("eps", {}).setdefault("EP7", {})["reproj"] = False
+        print("[train] --no-lrep：EP7.reproj=False（2D baseline）")
     variant = Variant.from_spec(spec)
 
-    # 现场重新生成模型图：保证 model.yaml 与变体配置永不脱节
     out_dir = args.variant.parent
     model_path = out_dir / "model.yaml"
     cfg = variant.model_yaml(model_path, write=True)
@@ -117,14 +96,12 @@ def main() -> int:
           f"下采样替换：{cfg.get('_downsample_replaced') or '无'}；"
           f"节点类型替换：{cfg.get('_type_map_applied') or '无'}")
 
-    # ---- 训练集位置：由注册表 YAML 决定，脚本里没有任何绝对路径 ----
-    # --data（名字/目录/YAML）> 变体里的 data.dataset > 注册表 data_root/<名>
     resolved = _resolve_data(args.data or variant.dataset, args,
                              task=str(spec.get("task") or "detect"),
                              require=not args.dry_run)
 
     try:
-        tod.bootstrap()          # 导入模块库并把魔改注入框架命名空间
+        tod.bootstrap()
     except ImportError as exc:
         raise SystemExit(
             f"载入魔改模块失败：{exc}\n"
@@ -133,20 +110,16 @@ def main() -> int:
 
     runtime.set_active(spec)
 
-    # L_rep（论文式 6/8）需要数据集侧的相机内参 / 机体 3D 关键点。这里把数据集 YAML
-    # 的内容快照塞进 spec，训练器与 --dry-run 都能从 spec 读到，不必各自再解析路径。
     def _attach_dataset_cfg(data_path) -> None:
         if not data_path:
             return
         try:
             spec["dataset_cfg"] = load_yaml(data_path)
-        except Exception as exc:  # noqa: BLE001 - 不影响其它 EP
+        except Exception as exc:  # noqa: BLE001
             print(f"[warn ] 未能读取数据集配置（L_rep 将不可用）：{exc}")
 
     _attach_dataset_cfg(resolved.yaml if resolved is not None else None)
 
-    # 受限沙箱（Windows 命名管道被禁）下必须把标签缓存换成顺序实现，
-    # 否则 dataloader 一建就 PermissionError [WinError 5]（见 tod/compat.py 的说明）。
     if not args.allow_threaded_cache:
         from tod.compat import allow_threadless_label_cache
 
@@ -162,8 +135,6 @@ def main() -> int:
 
     from ultralytics import YOLO
 
-    # task 必须显式传给 YOLO：本库生成的模型图叫 model.yaml，而框架的
-    # ``guess_model_task`` **靠文件名**判任务（只认 *-pose 之类），不看网络结构。
     model = YOLO(str(model_path), task=task)
 
     if args.dry_run:
@@ -183,10 +154,9 @@ def main() -> int:
                 print(f"       {line}")
         n_after = sum(p.numel() for p in model.model.parameters())
 
-        # ---- EP6/EP7/EP9：准则与优化器接线自检（同样不需要数据集）----
         eps = spec.get("eps") or {}
         ep6, ep7, ep9 = (eps.get("EP6") or {}), (eps.get("EP7") or {}), (eps.get("EP9") or {})
-        model.model.args = _dry_run_args(spec, get_cfg)      # 准则会读 model.args 当 hyp
+        model.model.args = _dry_run_args(spec, get_cfg)
 
         from tod.engine.trainer import stal_flag
 
@@ -231,13 +201,12 @@ def main() -> int:
         return 0
 
     train_args = dict(spec.get("train") or {})
-    for item in args.set:                      # --set k=v 覆盖（消融/自检常用）
+    for item in args.set:
         if "=" not in item:
             raise SystemExit(f"--set 需要 K=V 形式，收到 {item!r}")
         key, value = item.split("=", 1)
         train_args[key.strip()] = _coerce(value.strip())
 
-    # 训练集 YAML 已在 main 开头由注册表解析好（绝对路径副本），这里只做交接。
     if resolved is not None:
         train_args["data"] = str(resolved.yaml)
     elif "data" not in train_args:
@@ -246,12 +215,6 @@ def main() -> int:
             "数据集 YAML，或在变体配置里写 data.dataset。"
         )
 
-    # ---- L_rep 与"会丢目标的几何增强"互斥（与 tools/train_mav6d.py 同一口径）----
-    # 启用 6D 位姿监督时，框与 labels_6d 的位姿必须**一一对应**；而框架的
-    # RandomPerspective 会把变换后面积占比 <10% 的框连同类一起丢掉（mosaic 更会
-    # 把多张图拼在一起），之后就无法认定"CSV 的哪几行还对应得上"，训练会直接报
-    # "labels_6d 里有 N 个目标的位姿，但标签文件里有 M 个 GT 框"。命令行 --set 显式
-    # 给出的键优先级更高（自担位姿错配风险）。
     if task == "pose" and _reproj_enabled(spec):
         from tod.data.pose6d import pose_safe_augment_overrides
 
@@ -263,8 +226,6 @@ def main() -> int:
               + ", ".join(f"{k}={v}" for k, v in forced.items())
               + "（要保留某项就显式 --set 覆盖它）")
 
-    # 实验输出目录：变体里写的可能是相对路径（如 "results"），必须锚到仓库根，
-    # 否则 ultralytics 会把它解析成 runs/detect/results/...（散落在仓库里）
     project = train_args.get("project")
     if not project or not Path(str(project)).is_absolute():
         train_args["project"] = str(ROOT / (str(project) if project else "results"))
@@ -295,11 +256,7 @@ def _task_trainers() -> dict:
 
 
 def _dry_run_args(spec: dict, get_cfg):
-    """给 ``--dry-run`` 造一份训练超参命名空间。
-
-    准则（``v8DetectionLoss``/``E2ELoss``）会把 ``model.args`` 当超参读，
-    直接建图得到的 ``model.args`` 是 dict，会报 ``'dict' object has no attribute 'box'``。
-    """
+    """给 ``--dry-run`` 造一份训练超参命名空间。"""
     args = get_cfg()
     for key, value in (spec.get("train") or {}).items():
         if hasattr(args, key):
@@ -308,22 +265,7 @@ def _dry_run_args(spec: dict, get_cfg):
 
 
 def _resolve_data(spec, args, *, task: str = "detect", require: bool):
-    """按**注册表**把 ``--data`` / 变体里的 ``dataset`` 解析成数据集路径。
-
-    这是"训练集在哪"的唯一决定点：解析出来的是**绝对**根目录 + 一份 ``path`` 已被
-    改写成绝对路径的数据集 YAML（``tod.paths`` 生成的副本），所以框架不会再拿它自己的
-    ``datasets_dir`` 去猜目录 —— 训练集在新挂的机械硬盘上时尤其重要。
-
-    Args:
-        spec: ``--data``（名字 / 目录 / YAML）或变体里写的 ``data.dataset``。
-        args: 命令行命名空间（提供 ``--datasets`` / ``--data-root``）。
-        task: 任务类型；姿态任务的 ``*-det`` 名字会顺带试一次 ``*-pose``。
-        require: ``True`` = 训练集不可用就是致命错误；``False`` = ``--dry-run``
-            用，缺数据集只警告（结构自检本来就不需要数据）。
-
-    Returns:
-        :class:`tod.paths.DatasetPaths`，或 ``None``（``--dry-run`` 且数据集缺失）。
-    """
+    """按**注册表**把 ``--data`` / 变体里的 ``dataset`` 解析成数据集路径。"""
     from tod.paths import DatasetPathError, resolve
 
     if not spec:
@@ -338,7 +280,6 @@ def _resolve_data(spec, args, *, task: str = "detect", require: bool):
 
     candidates = [spec]
     if task == "pose" and isinstance(spec, str) and "2019-det" in spec:
-        # 检测数据集与姿态数据集不是同一份配置（后者多 kpt_shape），沿用老口径
         candidates.append(spec.replace("2019-det", "2019-pose"))
 
     last: Exception | None = None
@@ -356,9 +297,6 @@ def _resolve_data(spec, args, *, task: str = "detect", require: bool):
 
     if require:
         raise SystemExit(f"[错误] {last}")
-    # --dry-run 只读数据集 YAML 里的**字段**（kpt_shape / 内参 / 3D 点），不需要图片。
-    # 数据还没拷到新盘上时退回到模板 YAML，保证结构自检不会被"数据不在场"卡住
-    # （老版本就是这么做的；这里只是把它显式化，并说明读的是哪份模板）。
     fallback = _template_only(spec)
     if fallback is not None:
         print(f"[数据] 数据集={fallback.name} | 根目录未就位（--dry-run 模式，不读图片）")
@@ -386,11 +324,9 @@ def _template_only(spec):
 
 
 if __name__ == "__main__":
-    # CompatError 在 main() 内部才被导入（那时 sys.path 才加好），
-    # 所以这里也要延迟导入：早年写成模块级 except 会抛 NameError 掩盖真实退出码。
     from tod.compat import CompatError as _CompatError
 
     try:
         raise SystemExit(main())
-    except _CompatError as exc:  # 环境/版本问题给出可读提示
+    except _CompatError as exc:
         raise SystemExit(f"[环境错误] {exc}") from exc

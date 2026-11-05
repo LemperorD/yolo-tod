@@ -1,8 +1,3 @@
-// config_io.cpp —— 部署配置（JSON）<-> 结构体
-//
-// 配置的权威生成端是 Python：`tools/export_onnx.py --deploy-config xxx.json`。
-// 目的很直接：**网络结构信息只写一次**。C++ 侧不再手抄 nc / reg_max / strides，
-// 抄错一个数字就是「框全乱但程序不报错」这类最难查的 bug。
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -15,25 +10,17 @@ namespace todrt {
 
 namespace {
 
-/// 归一化配置里的枚举写法：只保留 ASCII 字母数字并转小写。
-/// 这样 "anchor-major-dfl" / "anchor_major_dfl" / "AnchorMajorDfl" 都能对上，
-/// 而配置是人手写的，容忍这些差异比强迫用户记住某一种写法更有价值。
-///
-/// 实现上刻意**只用整数比较**，不写 char 字面量，也不用 std::isalnum/std::tolower：
-/// 这两者在 MSVC + /utf-8 + 含非 ASCII 注释的源文件里都被观测到会漏掉字母
-/// （"anchor-major-dfl" 被归一化成 "anchormajordfl"），是极难排查的坑。
 std::string lower_compact(const std::string& s) {
   std::string k;
   k.reserve(s.size());
   for (char c : s) {
     const int v = static_cast<unsigned char>(c);
     if (v >= 65 && v <= 90) {
-      k.push_back(static_cast<char>(v + 32));  // A-Z -> a-z
-    } else if ((v >= 97 && v <= 122) ||  // a-z
-               (v >= 48 && v <= 57)) {   // 0-9
+      k.push_back(static_cast<char>(v + 32));
+    } else if ((v >= 97 && v <= 122) ||
+               (v >= 48 && v <= 57)) {
       k.push_back(static_cast<char>(v));
     }
-    // 其余字符（连字符、下划线、空格、斜杠等）一律丢弃
   }
   return k;
 }
@@ -54,7 +41,6 @@ std::vector<std::string> strings_of(const json::Value& v) {
   return out;
 }
 
-/// 形状：接受 [w,h]、{"w":..,"h":..} 或 {"width":..,"height":..}
 void parse_shape(const json::Value& v, std::array<int, 2>* wh) {
   if (v.is_array() && v.size() >= 2) {
     (*wh)[0] = v.at(0).as_int((*wh)[0]);
@@ -83,11 +69,6 @@ void parse_flags(const json::Value& v, BuildConfig* cfg) {
   }
 }
 
-/// 解析输出布局。归一化后（去掉 - _ 空格并转小写）的合法取值：
-///   anchormajordfl / anchormajor / dfl / v8 / yolov8 / ultralytics
-///   anchormajordfltransposed / transposed
-///   featuremajordfl / featuremajor
-///   pluginnms / efficientnms / nms
 OutputLayout parse_layout(const std::string& s, OutputLayout def) {
   const std::string k = lower_compact(s);
   if (k.empty()) return def;
@@ -107,9 +88,7 @@ OutputLayout parse_layout(const std::string& s, OutputLayout def) {
                   "feature-major-dfl / plugin-nms）");
 }
 
-}  // namespace
-
-// ------------------------------------------------------------------ BuilderFlag
+}
 
 bool BuildConfig::set_flag(const std::string& name, bool on) {
   const std::string k = lower_compact(name);
@@ -148,12 +127,9 @@ bool BuildConfig::set_flag(const std::string& name, bool on) {
   return true;
 }
 
-// ------------------------------------------------------------------ BuildConfig
-
 void from_json(const json::Value& v, BuildConfig& cfg) {
   if (!v.is_object()) throw TritError("BuildConfig: 期望 JSON 对象");
 
-  // 引擎来源既可在顶层，也可嵌在 engine 段
   const json::Value& e = v.contains("engine") ? v["engine"] : v;
   if (e.is_string()) {
     cfg.engine_path = e.as_string();
@@ -169,12 +145,10 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   if (v.contains("onnx")) cfg.onnx_path = v["onnx"].as_string(cfg.onnx_path);
   if (v.contains("onnx_path")) cfg.onnx_path = v["onnx_path"].as_string(cfg.onnx_path);
 
-  // 硬件
   const json::Value& hw = v["hardware"];
   if (hw.is_object()) {
     if (hw.contains("device")) cfg.device = parse_device(hw["device"].as_string());
     if (hw.contains("precision")) cfg.precision = parse_precision(hw["precision"].as_string());
-    // 加速器核心：一个字段覆盖 DLA core（Orin）与 NPU core（RK3588）
     if (hw.contains("accelerator_core")) {
       cfg.accelerator_core = hw["accelerator_core"].as_int(cfg.accelerator_core);
       cfg.dla_core = cfg.accelerator_core;
@@ -197,7 +171,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   if (v.contains("precision")) cfg.precision = parse_precision(v["precision"].as_string());
   if (v.contains("device")) cfg.device = parse_device(v["device"].as_string());
 
-  // ---- RKNN（Rockchip NPU）----
   const json::Value& rk = v["rknn"];
   if (rk.is_object()) {
     if (rk.contains("model")) cfg.rknn_model_path = rk["model"].as_string();
@@ -209,7 +182,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   }
   if (v.contains("rknn_model")) cfg.rknn_model_path = v["rknn_model"].as_string();
 
-  // ---- ONNX Runtime ----
   const json::Value& ort = v["onnxruntime"];
   if (ort.is_object()) {
     if (ort.contains("provider")) cfg.ort_provider = ort["provider"].as_string(cfg.ort_provider);
@@ -225,7 +197,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   }
   if (v.contains("ort_provider")) cfg.ort_provider = v["ort_provider"].as_string(cfg.ort_provider);
 
-  // ---- OpenVINO ----
   const json::Value& ov = v["openvino"];
   if (ov.is_object()) {
     if (ov.contains("device")) cfg.ov_device = ov["device"].as_string(cfg.ov_device);
@@ -238,7 +209,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
   }
   if (v.contains("ov_device")) cfg.ov_device = v["ov_device"].as_string(cfg.ov_device);
 
-  // 资源
   const json::Value& r = v["resources"];
   if (r.is_object()) {
     if (r.contains("workspace_mb")) {
@@ -255,7 +225,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
     }
   }
 
-  // shape
   const json::Value& sh = v["shape"];
   if (sh.is_object()) {
     if (sh.contains("dynamic")) cfg.dynamic_shape = sh["dynamic"].as_bool(cfg.dynamic_shape);
@@ -265,14 +234,13 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
     if (sh.contains("min")) parse_shape(sh["min"], &cfg.shape_min);
     if (sh.contains("opt")) parse_shape(sh["opt"], &cfg.shape_opt);
     if (sh.contains("max")) parse_shape(sh["max"], &cfg.shape_max);
-    if (sh.contains("input")) {  // 固定尺寸简写
+    if (sh.contains("input")) {
       parse_shape(sh["input"], &cfg.shape_opt);
       cfg.shape_min = cfg.shape_opt;
       cfg.shape_max = cfg.shape_opt;
     }
   }
 
-  // 量化
   const json::Value& q = v["quantization"];
   if (q.is_object()) {
     if (q.contains("calib_cache")) cfg.int8_calib_cache = q["calib_cache"].as_string();
@@ -281,7 +249,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
     if (q.contains("calib_batches")) cfg.int8_calib_batches = q["calib_batches"].as_int(10);
   }
 
-  // 调试
   if (v.contains("verbose")) cfg.verbose = v["verbose"].as_bool(cfg.verbose);
   if (v.contains("dump_tactics")) cfg.dump_tactics = v["dump_tactics"].as_bool();
   if (v.contains("flags")) parse_flags(v["flags"], &cfg);
@@ -293,8 +260,6 @@ void from_json(const json::Value& v, BuildConfig& cfg) {
     cfg.precision = Precision::kFP16;
   }
 }
-
-// ------------------------------------------------------------------ 子选项
 
 void from_json(const json::Value& v, PreprocessOptions& o) {
   if (!v.is_object()) return;
@@ -329,7 +294,6 @@ void from_json(const json::Value& v, PreprocessOptions& o) {
     o.pad_value = PadValue::kGray114;
   }
 
-  // 输出契约：float32（TensorRT/ORT/OpenVINO）或 uint8（RKNN 量化模型）
   const std::string out = lower_compact(v["output"].as_string());
   if (!out.empty()) {
     if (out == "uint8" || out == "u8" || out == "raw" || out == "rawuint8") {
@@ -341,7 +305,6 @@ void from_json(const json::Value& v, PreprocessOptions& o) {
                       "（可选 float32 / uint8）");
     }
   }
-  // 布局：nchw（TRT/ORT/OV）或 nhwc（RKNN 量化模型常见）
   const std::string lay = lower_compact(v["layout"].as_string());
   if (!lay.empty()) {
     if (lay == "nhwc") {
@@ -389,13 +352,10 @@ void from_json(const json::Value& v, PostprocessOptions& o) {
   }
 }
 
-// ------------------------------------------------------------------ DeployConfig
-
 DeployConfig DeployConfig::FromJson(const json::Value& v) {
   if (!v.is_object()) throw TritError("部署配置顶层必须是 JSON 对象");
   DeployConfig d;
 
-  // 允许 {"deploy": {...}} 包裹
   const json::Value& root = v.contains("deploy") ? v["deploy"] : v;
 
   if (root.contains("schema")) d.schema = root["schema"].as_string(d.schema);
@@ -408,7 +368,6 @@ DeployConfig DeployConfig::FromJson(const json::Value& v) {
   if (root.contains("source")) d.source = root["source"].as_string();
   if (root.contains("class_names")) d.class_names = strings_of(root["class_names"]);
 
-  // 网络结构：既支持扁平写法，也支持 network 段
   const json::Value& net = root.contains("network") ? root["network"] : root;
   if (net.contains("nc")) d.num_classes = net["nc"].as_int(d.num_classes);
   if (net.contains("num_classes")) d.num_classes = net["num_classes"].as_int(d.num_classes);
@@ -420,7 +379,6 @@ DeployConfig DeployConfig::FromJson(const json::Value& v) {
   if (net.contains("input")) parse_shape(net["input"], &d.input);
   if (net.contains("pad_multiple")) d.pad_multiple = net["pad_multiple"].as_int(d.pad_multiple);
   if (net.contains("levels")) {
-    // levels=[2,3,4,5] → strides=[4,8,16,32]（仅在 strides 未显式给出时）
     const std::vector<int> lv = ints_of(net["levels"], {});
     if (!lv.empty() && !net.contains("strides")) {
       std::vector<int> s;
@@ -474,26 +432,20 @@ void DeployConfig::Validate() const {
   if (input[0] <= 0 || input[1] <= 0) throw TritError("input 尺寸非法");
 }
 
-// ------------------------------------------------------------------ DetectorOptions
-
 DetectorOptions DetectorOptions::FromJson(const json::Value& v) {
   if (!v.is_object()) throw TritError("DetectorOptions: 顶层必须是 JSON 对象");
   DetectorOptions o;
 
-  // 1) 部署配置首先生效（结构信息以它为准）
   o.deploy = DeployConfig::FromJson(v);
   const json::Value& root = v.contains("deploy") ? v["deploy"] : v;
 
-  // 2) 工厂选择：`model` 是注册名（工厂查找键），优先级最高；
-  //    `model_id` 是训练侧变体 id，只在没有 model 时作为兜底。
   std::string chosen;
   if (root.contains("model")) chosen = root["model"].as_string();
   if (chosen.empty() && root.contains("model_id")) chosen = root["model_id"].as_string();
-  if (chosen.empty()) chosen = o.deploy.model;  // DeployConfig 里已做过同样的兜底
+  if (chosen.empty()) chosen = o.deploy.model;
   o.model = chosen;
   if (o.model.empty()) o.model = "SPAE-YOLOv8n";
 
-  // 3) 硬件：先套 build 段，再套 preset，最后由 runtime 段覆盖
   if (root.contains("build")) from_json(root["build"], o.deploy.build);
   o.precision = o.deploy.build.precision;
   o.device = o.deploy.build.device;
@@ -511,7 +463,6 @@ DetectorOptions DetectorOptions::FromJson(const json::Value& v) {
 
   if (root.contains("preset")) o.ApplyPreset(root["preset"].as_string());
 
-  // 4) 运行期覆盖段
   const json::Value& rt = root.contains("runtime") ? root["runtime"] : json::Value();
   if (rt.is_object()) {
     if (rt.contains("device")) o.device = parse_device(rt["device"].as_string());
@@ -542,7 +493,6 @@ DetectorOptions DetectorOptions::FromJson(const json::Value& v) {
   }
   if (root.contains("verbose")) o.verbose = root["verbose"].as_bool(o.verbose);
 
-  // 5) 前后处理：默认由结构信息推导，再被显式段覆盖
   o.preproc_opts.input_width = o.deploy.input[0];
   o.preproc_opts.input_height = o.deploy.input[1];
   o.preproc_opts.pad_multiple = o.deploy.pad_multiple;
@@ -556,7 +506,6 @@ DetectorOptions DetectorOptions::FromJson(const json::Value& v) {
   if (root.contains("preprocess")) from_json(root["preprocess"], o.preproc_opts);
   if (root.contains("postprocess")) {
     from_json(root["postprocess"], o.postproc_opts);
-    // 结构相关字段永远以 deploy 为准（防止配置里写偏）
     o.postproc_opts.decode.num_classes = o.deploy.num_classes;
     o.postproc_opts.decode.reg_max = o.deploy.reg_max;
     if (o.postproc_opts.decode.layout == OutputLayout::kAnchorMajorDfl) {
@@ -600,8 +549,6 @@ BuildConfig DetectorOptions::ToBuildConfig() const {
 }
 
 json::Value DetectorOptions::ToJson() const {
-  // 该快照用于"本次运行实际生效的配置"存档：字段名与输入配置保持一致，
-  // 便于和原配置直接 diff。
   json::Object engine;
   engine["onnx"] = deploy.build.onnx_path;
   engine["engine_path"] = deploy.build.engine_path;
@@ -633,7 +580,6 @@ json::Value DetectorOptions::ToJson() const {
   rt["verbose"] = verbose;
   rt["workspace_mb"] = static_cast<int64_t>(workspace_mb);
 
-  // 各后端的专属设置：把"实际生效值"一并存档，便于复现与排查
   json::Object rk;
   rk["model"] = deploy.build.rknn_model_path;
   rk["core_num"] = deploy.build.rknn_core_num;
@@ -704,13 +650,10 @@ json::Value DetectorOptions::ToJson() const {
   return json::Value(std::move(root));
 }
 
-// ------------------------------------------------------------------ 硬件预设
-
 void DetectorOptions::ApplyPreset(const std::string& preset) {
   const std::string k = lower_compact(preset);
   if (k.empty() || k == "none") return;
   if (k == "orin" || k == "jetson" || k == "dla" || k == "agxorin" || k == "orinnano") {
-    // Orin：DLA + FP16，固定 shape 最稳；要 INT8 再补校准缓存。
     device = Device::kDla;
     precision = Precision::kFP16;
     dynamic_shape = false;
@@ -734,18 +677,14 @@ void DetectorOptions::ApplyPreset(const std::string& preset) {
     device = Device::kGpu;
     precision = Precision::kINT8;
   } else if (k == "rk3588" || k == "rknn" || k == "rockchip" || k == "rk3588s") {
-    // RK3588：NPU（3 个 core）+ INT8 量化模型。
-    // 输入固定尺寸、batch=1（.rknn 的 batch 是转换期固定的）。
     device = Device::kNpu;
     precision = Precision::kINT8;
     dynamic_shape = false;
     dynamic_batch = false;
     max_batch = 1;
     cuda_graphs = false;
-    // 前处理：归一化已烧进量化模型 → 必须给原始 uint8（NHWC）
     preproc_opts.output = PreprocOutput::kUint8Raw;
     preproc_opts.layout = TensorLayout::kNhwc;
-    // 模型来源与多核：由用户填 engine.path（.rknn）或 rknn.model；core 数默认用满 3 个
     deploy.build.rknn_core_num = 3;
     if (deploy.build.rknn_model_path.empty() && deploy.build.engine_path.empty()) {
       log_info(
@@ -754,17 +693,15 @@ void DetectorOptions::ApplyPreset(const std::string& preset) {
     }
   } else if (k == "amd" || k == "amdcpu" || k == "x86cpu" || k == "intel" ||
              k == "intelcpu") {
-    // 通用 CPU 后路（AMD x86 的典型场景）：不依赖 GPU/NPU。
-    // 具体走哪个后端由 builder 决定（openvino / ort），两者都是 CPU 友好的。
     device = Device::kCpu;
-    precision = Precision::kFP32;  // CPU 上 FP16 通常更慢（模拟），保持 FP32
+    precision = Precision::kFP32;
     dynamic_shape = false;
     dynamic_batch = false;
     cuda_graphs = false;
     preproc_opts.output = PreprocOutput::kFloat32;
     preproc_opts.layout = TensorLayout::kNchw;
     if (deploy.build.ov_cache_dir.empty()) {
-      deploy.build.ov_cache_dir = "ov_cache";  // OpenVINO 首次编译很慢，默认开缓存
+      deploy.build.ov_cache_dir = "ov_cache";
     }
   } else {
     throw TritError(
@@ -773,4 +710,4 @@ void DetectorOptions::ApplyPreset(const std::string& preset) {
   }
 }
 
-}  // namespace todrt
+}

@@ -1,10 +1,3 @@
-// factory.cpp —— 工厂注册表、Detector 装配、异步骨架、PlanAssembly 自检
-//
-// 阅读顺序建议：
-//   1. register_*_factory  —— 自注册表怎么被填满
-//   2. Detector::Create    —— 名字怎么变成对象（model × builder × preproc × postproc）
-//   3. AsyncDetectorBase   —— 异步骨架（队列/线程/计时），子类只需实现 RunBatch()
-//   4. PlanAssembly        —— 无 GPU 也能跑的装配自检
 #include "todrt/factory.hpp"
 
 #include <algorithm>
@@ -17,8 +10,6 @@
 #include <thread>
 
 namespace todrt {
-
-// ------------------------------------------------------------------ 自注册表填充
 
 namespace {
 
@@ -41,7 +32,7 @@ std::unordered_map<std::string, PostprocFn>& postproc_factories() {
   return m;
 }
 
-}  // namespace
+}
 
 void register_entry(const RegistryEntry& entry, std::vector<std::string> factories) {
   (void)factories;
@@ -51,7 +42,6 @@ void register_entry(const RegistryEntry& entry, std::vector<std::string> factori
 
   auto it = reg.find(entry.name);
   if (it != reg.end() && it->second.family != entry.family) {
-    // 同名跨族 = 配置写错的前兆，直接报错而不是悄悄覆盖。
     std::ostringstream oss;
     oss << "注册名冲突：" << entry.name << " 已作为 " << it->second.family << " 注册（"
         << it->second.file << ":" << it->second.line << "），现在又作为 " << entry.family
@@ -75,7 +65,6 @@ void register_model_recipe(const std::string& name, ModelRecipeFn fn) {
   if (!fn) throw TritError("register_model_recipe: 空配方函数 " + name);
   std::lock_guard<std::mutex> lk(g_factory_mutex);
   model_factories()[name] = fn;
-  // 元数据：若 models/<x>.cpp 已显式登记过同名条目，则以显式元数据为准
   if (!registry_has(name)) {
     RegistryEntry e;
     e.name = name;
@@ -102,9 +91,6 @@ void register_model_metadata(const std::string& name, const std::vector<std::str
   e.line = line;
   register_entry(e, {"model"});
 
-  // 让别名也能直接当工厂键用（用户可能写 "spae-yolov8"）。
-  // 注意：这里的 recipe 一定已经注册——同一 TU 内静态初始化自上而下，
-  // TOD_RT_DEFINE_RECIPE 在 TOD_RT_META 之前。跨 TU 时按名查找，取不到就跳过。
   ModelRecipeFn fn = nullptr;
   {
     std::lock_guard<std::mutex> lk(g_factory_mutex);
@@ -138,13 +124,10 @@ bool has_model(const std::string& name) {
     std::lock_guard<std::mutex> lk(g_factory_mutex);
     if (model_factories().count(name) != 0) return true;
   }
-  // 退回注册表：TOD_RT_META 里登记的别名（含连字符写法）也应能解析到规范配方
   return registry_has(name) && registry_get(name).family == "model";
 }
 
 namespace {
-/// 把「别名 / 规范名」归一化成配方函数。注册表里的别名条目 Name 仍是别名本身，
-/// 所以这里用 RegistryEntry::aliases 反查一次规范名。
 ModelRecipeFn find_recipe(const std::string& name) {
   std::lock_guard<std::mutex> lk(g_factory_mutex);
   auto& m = model_factories();
@@ -153,10 +136,8 @@ ModelRecipeFn find_recipe(const std::string& name) {
   if (!registry_has(name)) return nullptr;
   const RegistryEntry& e = registry_get(name);
   if (e.family != "model") return nullptr;
-  // 该条目本身就是规范名？
   it = m.find(e.name);
   if (it != m.end()) return it->second;
-  // 反查：谁的 aliases 里含这个名字
   for (const auto& kv : m) {
     if (!registry_has(kv.first)) continue;
     const RegistryEntry& cand = registry_get(kv.first);
@@ -167,11 +148,9 @@ ModelRecipeFn find_recipe(const std::string& name) {
   }
   return nullptr;
 }
-}  // namespace
+}
 
 std::vector<std::string> model_names() {
-  // 只返回"规范名"（canonical）：别名会被注册表标成 canonical=false，
-  // 这样 CLI 列表不会出现一堆同义项，而别名依然能当工厂键使用。
   std::vector<std::string> all;
   {
     std::lock_guard<std::mutex> lk(g_factory_mutex);
@@ -234,11 +213,8 @@ std::unique_ptr<IModelBuilder> make_builder(const std::string& name) {
   return fn();
 }
 
-// ------------------------------------------------------------------ 名字解析
-
 namespace {
 
-/// 把 "auto" 解析成具体实现名：优先变体配方，其次全局默认。
 std::string resolve(const std::string& requested, const std::string& from_recipe,
                     const std::string& fallback) {
   if (!requested.empty() && requested != "auto") return requested;
@@ -252,7 +228,6 @@ std::string join_ints(const std::vector<int>& v) {
   return oss.str();
 }
 
-/// 把变体配方的默认值补进 options（DeployConfig 里的结构信息优先级最高）。
 void merge_recipe_defaults(DetectorOptions& o, const ModelRecipe& r) {
   PostprocessOptions& pp = o.postproc_opts;
 
@@ -265,7 +240,6 @@ void merge_recipe_defaults(DetectorOptions& o, const ModelRecipe& r) {
     pp.decode.layout = r.layout;
   }
 
-  // 纯部署偏好：只有用户没改过默认值时才套用配方
   if (pp.decode.conf_threshold == 0.25f) pp.decode.conf_threshold = r.decode.conf_threshold;
   if (pp.iou_threshold == 0.45f) pp.iou_threshold = r.postproc_opts.iou_threshold;
   if (pp.max_det == 300) pp.max_det = r.postproc_opts.max_det;
@@ -273,7 +247,6 @@ void merge_recipe_defaults(DetectorOptions& o, const ModelRecipe& r) {
   if (r.postproc_opts.class_agnostic) pp.class_agnostic = true;
   if (r.postproc_opts.nms == NmsKind::kSoft) pp.nms = NmsKind::kSoft;
 
-  // 结构字段最终与 deploy 对齐（配置永远压过代码里的默认）
   pp.decode.num_classes = o.deploy.num_classes;
   pp.decode.reg_max = o.deploy.reg_max;
   if (o.deploy.layout != OutputLayout::kAnchorMajorDfl) pp.decode.layout = o.deploy.layout;
@@ -290,16 +263,7 @@ void merge_recipe_defaults(DetectorOptions& o, const ModelRecipe& r) {
   pp.decode.input_height = o.preproc_opts.input_height;
 }
 
-}  // namespace
-
-// ------------------------------------------------------------------ 异步骨架
-//
-// 异步骨架（AsyncDetectorBase）与通用流水线（RunnerDetector）现在都在
-// backend/simple_detector.hpp 里 —— 它必须是公开的，否则只有走工厂的
-// CreateDeviceDetector 路径的后端能拿到它，而自己手写 Detector 子类的后端
-// （历史上是 TensorRT）就会随接口演进腐化。见该文件顶部说明。
-
-// ------------------------------------------------------------------ 装配
+}
 
 std::unique_ptr<Detector> Detector::Create(const std::string& model_name_in,
                                            const DetectorOptions& opts_in) {
@@ -342,8 +306,6 @@ std::unique_ptr<Detector> Detector::CreateFromFile(const std::string& config_pat
   return Create(opts.model, opts);
 }
 
-// ------------------------------------------------------------------ 装配自检
-
 AssemblyReport PlanAssembly(const std::string& model_name, const DetectorOptions& opts_in) {
   AssemblyReport rep;
   rep.model = model_name;
@@ -371,7 +333,6 @@ AssemblyReport PlanAssembly(const std::string& model_name, const DetectorOptions
   rep.layout = to_string(opts.deploy.layout);
   rep.strides = join_ints(opts.deploy.strides);
 
-  // 子工厂存在性检查（不需要 GPU）
   try {
     (void)make_preprocessor(rep.preproc);
   } catch (const std::exception& e) {
@@ -393,7 +354,6 @@ AssemblyReport PlanAssembly(const std::string& model_name, const DetectorOptions
     rep.warnings.push_back(std::string("构建器不可用：") + e.what());
   }
 
-  // 硬件/精度一致性
   if (opts.device == Device::kDla && opts.precision == Precision::kFP32) {
     rep.warnings.push_back("DLA 不支持 FP32，请改用 FP16 或 INT8。");
   }
@@ -406,7 +366,6 @@ AssemblyReport PlanAssembly(const std::string& model_name, const DetectorOptions
         "layout=feature-major-dfl 必须提供 level_channels（部署配置里的 features）。");
   }
 
-  // anchor 数自检：解码器会拿这个数字与引擎输出对拍，先在这里算给用户看
   {
     const std::vector<Grid> grids = make_grids(opts.postproc_opts.decode.strides,
                                                opts.preproc_opts.input_width,
@@ -479,4 +438,4 @@ std::string AssemblyReport::ToJson() const {
   return oss.str();
 }
 
-}  // namespace todrt
+}

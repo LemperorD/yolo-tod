@@ -1,22 +1,4 @@
-"""变体构造 DSL：骨架 + 扩展点覆盖 → 变体配置 / 模型 YAML / 变体卡片。
-
-设计意图（PLAN.md §4.2）：变体不由人手写 YAML 维护，而是由代码生成。
-消融只需 ``v.without("DySample")``，配置永远与代码同步，不会漂移。
-
-用法::
-
-    from tod.compose import Variant
-
-    v = (Variant("YOLOv8n_P2_DySample_NWD", base="yolov8n")
-         .data("visdrone2019-det", imgsz=1280)
-         .upsample("DySample")
-         .head("Detect", levels=[2, 3, 4, 5], box_loss="NWD")
-         .train(epochs=150, optimizer="AdamW", batch=4, amp=True))
-
-    v.dump("configs/variants/visdrone/YOLOv8n_P2_DySample_NWD.yaml")
-    v.model_yaml("variants/YOLOv8n_P2_DySample_NWD/model.yaml")   # 需已安装 ultralytics
-    v.card("variants/YOLOv8n_P2_DySample_NWD/card.md")
-"""
+"""变体构造 DSL：骨架 + 扩展点覆盖 → 变体配置 / 模型 YAML / 变体卡片。"""
 
 from __future__ import annotations
 
@@ -27,11 +9,8 @@ from typing import Any, Sequence
 
 from tod.registry import EXTENSION_POINTS, get, has
 
-#: 本库自有的变体配置 schema 版本，便于将来迁移。
 SPEC_VERSION = 2
-#: 支持的任务类型（与 ultralytics 一致）；目前只有 detect / pose 接了完整回路。
 TASKS = ("detect", "pose", "segment", "obb")
-#: 各任务的内置模型图后缀（``yolo26n`` + ``-pose`` → ``yolo26n-pose``）。
 TASK_MODEL_SUFFIX = {"detect": "", "pose": "-pose", "segment": "-seg", "obb": "-obb"}
 
 
@@ -45,11 +24,7 @@ def _merge(dst: dict, src: dict) -> dict:
 
 
 def _as_list(value: Any) -> list:
-    """把 tuple / list / 逗号字符串统一成 list（``(17,3)`` 与 ``"17,3"`` 都能吃）。
-
-    为什么需要：变体 spec 要 dump 成 YAML 再读回来，tuple 会变成 YAML 的
-    flow-list，而 ``--set kpt_shape=17,3`` 这种命令行覆盖拿到的是字符串。
-    """
+    """把 tuple / list / 逗号字符串统一成 list（``(17,3)`` 与 ``"17,3"`` 都能吃）。"""
     if isinstance(value, str):
         out: list = []
         for chunk in value.replace(";", ",").split(","):
@@ -74,19 +49,11 @@ class Variant:
     base: str = "yolov8n"
     dataset: str = ""
     status: str = "planned"
-    #: 任务类型：``detect`` / ``pose`` / ``segment`` / ``obb``。
-    #: 为什么必须显式记录：ultralytics 靠**文件名**猜任务（``guess_model_task``），
-    #: 而本库生成的模型图叫 ``model.yaml``，猜不出来 —— 姿态变体不写明任务，
-    #: 训练时会静默按 detect 建图/建数据加载器（关键点列被当成"多余的列"丢掉）。
     task: str = "detect"
     eps: dict[str, dict[str, Any]] = field(default_factory=dict)
     data_cfg: dict[str, Any] = field(default_factory=dict)
     train_cfg: dict[str, Any] = field(default_factory=dict)
     model_cfg: dict[str, Any] = field(default_factory=dict)
-    #: 数据集 YAML 的内容快照（由 ``tools/train.py`` 在开训前填入）。
-    #: 为什么让 spec 携带它：EP7 的几何重投影损失 ``L_rep`` 需要
-    #: ``tod.camera_matrix`` / ``tod.object_points`` 这些**数据集侧**的量，
-    #: 训练器只有 spec 一个上下文入口；不填也不影响其它 EP（用到才读）。
     dataset_cfg: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     notes: str = ""
@@ -95,7 +62,6 @@ class Variant:
         if self.task not in TASKS:
             raise ValueError(f"未知任务 {self.task!r}；可选 {sorted(TASKS)}")
 
-    # ---------------------------------------------------------------- 构造
 
     def patch(self, ep: str, **kwargs: Any) -> "Variant":
         """在任意扩展点上打覆盖。EP 必须在 ``EXTENSION_POINTS`` 内。"""
@@ -105,16 +71,7 @@ class Variant:
         return self
 
     def without(self, target: str) -> "Variant":
-        """剥离某个模块名或配置键（消融 / leave-one-out 用）。
-
-        同时匹配"键名"与"值"，并且覆盖 **EP 覆盖、model 段、训练段**：
-        ``v.without("DySample")`` / ``v.without("upsample")`` / ``v.without("add_p2")`` /
-        ``v.without("C3")``（P2 融合块）/ ``v.without("MuSGD")`` 都能生效。
-
-        为什么必须包含 model 段：P2 注入这类结构性改动记在 ``model_cfg`` 里
-        （``add_p2=True``、``p2_fuse_block="C3"``），早期版本只扫 ``eps``，
-        于是 ``v.without("add_p2")`` **静默什么都不做**，消融会得出假结论。
-        """
+        """剥离某个模块名或配置键（消融 / leave-one-out 用）。"""
         for cfg in (*self.eps.values(), self.model_cfg, self.train_cfg):
             for key in [k for k in cfg if k == target]:
                 cfg.pop(key)
@@ -142,31 +99,19 @@ class Variant:
         return self
 
     def as_task(self, task: str) -> "Variant":
-        """设定任务类型（``detect`` / ``pose`` / …）。
-
-        与 ``model()`` 分开是因为任务决定的是**整条流水线**（模型 YAML 后缀、
-        数据集解析方式、Validator、导出头），不只是图里的一个参数：
-        compose 据此把 base 名改写成 ``*-pose`` 形式，并把任务写进 spec。
-        """
+        """设定任务类型（``detect`` / ``pose`` / …）。"""
         if task not in TASKS:
             raise ValueError(f"未知任务 {task!r}；可选 {sorted(TASKS)}")
         self.task = task
         return self
 
     def pose(self, **kwargs: Any) -> "Variant":
-        """姿态任务的快捷方式：``v.pose(kpt_shape=(17, 3))``。
-
-        等价于 ``v.as_task("pose").model(kpt_shape=(17, 3), **kwargs)``。
-        ``kpt_shape`` 写进模型图（``Pose26`` 的构造参数），**同时**要写进数据集
-        YAML —— 框架按数据集的 ``kpt_shape`` 覆盖模型图里的值（见
-        ``PoseModel.__init__``），两处不一致时以数据集为准并被框架打印一条 INFO。
-        """
+        """姿态任务的快捷方式：``v.pose(kpt_shape=(17, 3))``。"""
         self.task = "pose"
         if kwargs:
             _merge(self.model_cfg, kwargs)
         return self
 
-    # 语义化快捷方式（等价于 patch）
     def backbone(self, **kw: Any) -> "Variant":
         return self.patch("EP1", **kw)
 
@@ -194,14 +139,9 @@ class Variant:
     def strategy(self, **kw: Any) -> "Variant":
         return self.patch("EP9", **kw)
 
-    # ---------------------------------------------------------------- 导出
 
     def used_modules(self) -> list[str]:
-        """收集本变体引用到的、已在注册表中登记的模块名。
-
-        同时扫描各 EP 覆盖与 ``model`` 段（P2 预处理、融合块等也常填模块名），
-        用于在变体卡片里自动列出论文来源与许可证。
-        """
+        """收集本变体引用到的、已在注册表中登记的模块名。"""
         found: list[str] = []
 
         def scan(cfg: dict) -> None:
@@ -239,11 +179,7 @@ class Variant:
 
     @classmethod
     def from_spec(cls, data: dict[str, Any]) -> "Variant":
-        """从 ``dump()`` 写出的 spec 还原变体对象。
-
-        这样训练脚本可以直接读变体配置，并**现场重新生成**模型 YAML，
-        保证 model.yaml 与变体配置永不脱节（不需要把生成物手工 commit 后再维护）。
-        """
+        """从 ``dump()`` 写出的 spec 还原变体对象。"""
         v = cls(
             name=str(data.get("id") or data.get("name") or "unnamed"),
             base=str(data.get("base", "yolov8n")),
@@ -259,20 +195,9 @@ class Variant:
         v.model_cfg = dict(data.get("model") or {})
         return v
 
-    # ------------------------------------------------------------ 模型 YAML
 
     def _load_base_cfg(self) -> tuple[dict, str | None]:
-        """读取 base 模型图；支持 ``yolov8`` / ``yolov8n`` / ``yolo26n`` 三种写法。
-
-        官方只提供 ``yolov8.yaml`` + ``scales``，规模由文件名尾字母决定，
-        因此这里把 ``yolov8n`` 拆成 ``yolov8`` + ``scale='n'``。
-
-        **任务后缀的拼装规则**（姿态/分割/OBB 走这里）：
-        ``base="yolo26n"`` + ``task="pose"`` → 先试 ``yolo26n-pose``（官方确实
-        提供了无 scales 的 ``yolo26n-pose.yaml``），失败再退回
-        ``yolo26-pose`` + ``scale='n'``。两条路径都不会把规模猜错：前者文件名自带
-        规模字母，后者的 scales 会被排到首位（见 ``model_yaml`` 的说明）。
-        """
+        """读取 base 模型图；支持 ``yolov8`` / ``yolov8n`` / ``yolo26n`` 三种写法。"""
         from tod import compat
 
         name, scale = self.base, self.model_cfg.get("scale")
@@ -288,7 +213,6 @@ class Variant:
                 path = compat.base_model_yaml(candidate)
             except compat.CompatError as exc:
                 last_error = exc
-                # 尾字母是规模时（yolo26n-pose → yolo26-pose + scale='n'）
                 if len(candidate) > 1 and candidate[-1] in "nsmlx":
                     scale, base_name = candidate[-1], candidate[:-1]
                     try:
@@ -299,44 +223,20 @@ class Variant:
                 else:
                     continue
             cfg = deepcopy(compat.load_yaml(path))
-            cfg.pop("scale", None)      # 避免与 base 名冲突
+            cfg.pop("scale", None)
             return cfg, scale
         raise last_error if last_error else compat.CompatError(f"找不到 {name!r} 的模型图")
 
     def model_yaml(self, path: str | Path | None = None, *, write: bool = True) -> dict:
-        """由 ``base`` 的内置模型 YAML 生成变体模型图。
-
-        改造按"先结构、后改名"的顺序执行，顺序不可颠倒：
-          1. ``downsample`` —— 按节点索引把主干下采样换成 ADown 等模块
-          2. ``add_p2``      —— 注入 P2（stride=4）检测分支
-          3. ``type_map``    —— 节点类型批量改名
-
-        **检测头（EP5）刻意不做 YAML 改名**：ultralytics 的 ``parse_model`` 用
-        精确类成员判断（``m in {Detect, ...}``）来给检测头追加输入通道列表 ``ch``，
-        子类不会被识别，写进 YAML 会因为缺少 ``ch`` 而构造失败。因此 EP5 的改动
-        记录到 ``_head_surgery``，由 ``tod.engine.surgery`` 在模型构建完成后
-        就地替换分支卷积——不改框架源码，也不依赖该判断的实现细节。
-
-        更复杂的颈部重拓扑（BiFPN / AFPN / HS-FPN）属于 M1 工作。
-        """
+        """由 ``base`` 的内置模型 YAML 生成变体模型图。"""
         cfg, scale = self._load_base_cfg()
 
         if self.model_cfg.get("nc") is not None:
             cfg["nc"] = self.model_cfg["nc"]
-        # 姿态的关键点形状：写在模型图里（Pose/Pose26 的构造参数）。
-        # 数据集 YAML 里的 kpt_shape 优先级更高（框架会覆盖并打印 INFO），
-        # 两处不一致时以数据集为准 —— 因此本库两个地方都写，并在卡片上同时列出。
         if self.model_cfg.get("kpt_shape") is not None:
             cfg["kpt_shape"] = _as_list(self.model_cfg["kpt_shape"])
         if scale:
             cfg["scale"] = scale
-            # 为什么要把所选规模排到 scales 的**第一位**：
-            # ultralytics 的 ``yaml_model_load`` 会用**文件名**猜规模
-            # （``guess_model_scale`` 只认 yolo<数字><nsmlx> 这种名字），我们生成的
-            # 文件叫 model.yaml，猜不出来 → ``d["scale"] = ""``，YAML 里写的 scale
-            # 被覆盖；``parse_model`` 于是退化为 ``next(iter(scales.keys()))``。
-            # 对 yolov8n/yolo26n 恰好等于 'n' 所以一直没暴露，换成 s/m/l/x 就会
-            # **静默建错规模的模型**。把所选规模放首位即可彻底消除这个隐患。
             scales = cfg.get("scales")
             if isinstance(scales, dict) and scale in scales:
                 cfg["scales"] = {
@@ -344,7 +244,6 @@ class Variant:
                     **{k: v for k, v in scales.items() if k != scale},
                 }
 
-        # ---- 1) 结构：主干下采样替换 ----
         ds_module = self.model_cfg.get("downsample") or self.eps.get("EP1", {}).get("downsample")
         if ds_module:
             replace_downsample(
@@ -354,10 +253,9 @@ class Variant:
                 or self.eps.get("EP1", {}).get("downsample_indices"),
             )
 
-        # ---- 2) 结构：P2 检测分支 ----
         if self.model_cfg.get("add_p2"):
             p2_pre = self.model_cfg.get("p2_pre")
-            if isinstance(p2_pre, dict):        # {type: Conv, args: [64,1,1]}
+            if isinstance(p2_pre, dict):
                 p2_pre = [p2_pre["type"], p2_pre.get("args", [])]
             inject_p2_head(
                 cfg,
@@ -368,10 +266,7 @@ class Variant:
                 p2_pre=p2_pre,
             )
 
-        # ---- 3) 改名：EP 覆盖 → 节点类型替换 ----
         type_map: dict[str, str] = dict(self.model_cfg.get("type_map", {}))
-        # 只映射语义等价的节点类型；注意力类模块不是 Conv 的等价替换，
-        # 必须显式写在 type_map 或颈部配置里。
         ep_targets = (("EP3", "upsample", "nn.Upsample"),
                       ("EP1", "conv", "Conv"),
                       ("EP1", "block", "C2f"))
@@ -383,7 +278,6 @@ class Variant:
         if type_map:
             apply_type_map(cfg, type_map)
 
-        # ---- 4) 检测头：记录为建模后手术，见上面的说明 ----
         head_name = self.eps.get("EP5", {}).get("head")
         if isinstance(head_name, str) and head_name not in ("", "Detect"):
             cfg["_head_surgery"] = head_name
@@ -396,7 +290,6 @@ class Variant:
             dump_yaml(cfg, path)
         return cfg
 
-    # ---------------------------------------------------------------- 卡片
 
     def card(self, path: str | Path) -> Path:
         """生成变体卡片（PLAN.md §4.4）。"""
@@ -425,8 +318,6 @@ class Variant:
         else:
             lines.append("| - | - | 未做任何魔改（纯基线） |")
 
-        # 模型图级改造（P2 注入 / 下采样替换 / 类型替换）不走 EP 覆盖，单列一节，
-        # 否则卡片上会看不到"加了 P2 头"这种最关键的改动。
         if self.model_cfg:
             lines += ["", "## 模型图改造（model 段）", "", "| 键 | 值 |", "|---|---|"]
             for key, value in self.model_cfg.items():
@@ -504,15 +395,8 @@ class Variant:
         return path
 
 
-# -------------------------------------------------------------------- 图改造
-
-
 def _node_lists(cfg: dict) -> tuple[list, list, int]:
-    """返回 (节点列表, 该列表在全局的起始索引, 是否为 head 段)。
-
-    兼容两种 YAML 形式：``backbone:`` + ``head:``（官方 v8/v11 风格）
-    与单一 ``model:`` 列表。
-    """
+    """返回 (节点列表, 该列表在全局的起始索引, 是否为 head 段)。"""
     if "backbone" in cfg and "head" in cfg:
         return cfg["head"], len(cfg["backbone"]), True
     if "model" in cfg:
@@ -521,13 +405,7 @@ def _node_lists(cfg: dict) -> tuple[list, list, int]:
 
 
 def _find_detect(nodes: Sequence) -> int:
-    """定位检测头节点（Detect / Pose / Pose26 / Segment / OBB 等任意头）。
-
-    搜索顺序有讲究：**先找真正的 Detect 一族，再退回名字里带 head 的节点**。
-    直接匹配 ``"detect"`` 会漏掉 ``Pose26``（姿态头），直接匹配 ``"pose"`` 又会
-    误命中 ``C2PSA`` 这类骨干块的模块名（含 "psa" 不含 pose，但 ``RepPose`` 之类
-    的名字在别的库里出现过）——所以按"精确族名 → 模糊兜底"两段判断。
-    """
+    """定位检测头节点（Detect / Pose / Pose26 / Segment / OBB 等任意头）。"""
     families = ("detect", "pose", "segment", "obb")
     for i in range(len(nodes) - 1, -1, -1):
         name = str(nodes[i][2]).lower()
@@ -546,23 +424,14 @@ def _head_inputs(node: Sequence) -> list:
 
 
 def _rebuild_head_node(node: Sequence, inputs: list) -> list:
-    """把新的输入列表写回节点**而不丢其它参数**。
-
-    关键点：``Pose``/``Pose26`` 节点的 args 是 ``[nc, kpt_shape]``（``parse_model``
-    之后还会追加 reg_max/end2end/ch），而 ``Detect`` 是 ``[nc]``。早期实现只改了
-    ``updated[0]``，对 Detect 恰好正确；一旦换成 Pose 就会把 ``kpt_shape`` 留在原位，
-    参数错位（``Pose(nc, reg_max=17)``）—— 所以这里显式区分两种布局。
-    """
+    """把新的输入列表写回节点**而不丢其它参数**。"""
     updated = list(node)
     updated[0] = list(inputs)
     return updated
 
 
 def apply_type_map(cfg: dict, type_map: dict[str, str]) -> dict:
-    """按 ``{旧类型: 新类型}`` 替换节点类型；就地修改 cfg（节点本身替换为新列表）。
-
-    节点采用"替换而非改写"的方式，避免污染调用方浅拷贝共享的节点对象。
-    """
+    """按 ``{旧类型: 新类型}`` 替换节点类型；就地修改 cfg（节点本身替换为新列表）。"""
     if "backbone" in cfg and "head" in cfg:
         lists = [cfg["backbone"], cfg["head"]]
     else:
@@ -590,27 +459,7 @@ def inject_p2_head(
     repeats: int = 3,
     p2_pre: Sequence | None = None,
 ) -> dict:
-    """把 P2（stride=4）分支接进检测头 —— PLAN.md 中最高 ROI 的改动。
-
-    生成的结构（以 YOLOv8 为例，P3 头节点为 15、P2 源为 2）::
-
-        [2, 1, Conv, [64, 1, 1]]                     # 可选：P2 侧 1x1 降维/校准
-        [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 由 P3 上采样
-        [[-1, 2], 1, Concat, [1]]                    # 与 backbone P2 拼接
-        [-1, 3, C2f, [64]]                           # 融合
-        [[24, 15, 18, 21], 1, Detect, [nc]]          # Detect(P2, P3, P4, P5)
-
-    这是"直连式 P2 头"：只做一次自顶向下融合，不做完整双向重拓扑。
-
-    Args:
-        p2_idx: backbone 中 P2（stride=4）特征源的全局节点索引。
-            YOLOv8 系列为 2；换主干后请对照模型 YAML 注释确认。
-        p2_channels: 融合块输出通道（会被 width 缩放）。
-        upsample: 上采样模块名，可填注册表中的名字（如 ``DySample``）。
-        p2_pre: 可选的 P2 侧预处理节点，形如 ``[类型, [参数...]]``。
-            SPAE-YOLOv8 §3.2 在此处用 1x1 卷积降维并做特征校准，
-            对应 ``["Conv", [64, 1, 1]]``。
-    """
+    """把 P2（stride=4）分支接进检测头 —— PLAN.md 中最高 ROI 的改动。"""
     nodes, base, _ = _node_lists(cfg)
     det_i = _find_detect(nodes)
     src = _head_inputs(nodes[det_i])
@@ -622,10 +471,10 @@ def inject_p2_head(
         raise ValueError(f"预期检测头有 3 个输入（P3,P4,P5），实际 {src}。")
 
     p3_idx, p4_idx, p5_idx = src
-    det_global = base + det_i          # 插入后 Detect 自身将占用的全局索引
+    # 新分支插在原输出头之前，保留 P3–P5 既有特征节点的索引。
+    det_global = base + det_i
     offset = 0
 
-    # 1) 可选的 P2 侧降维/校准
     if p2_pre is not None:
         pre_type, pre_args = p2_pre[0], list(p2_pre[1])
         nodes.insert(det_i + offset, [p2_idx, 1, pre_type, pre_args])
@@ -634,22 +483,16 @@ def inject_p2_head(
     else:
         p2_src = p2_idx
 
-    # 2) P3 上采样
     nodes.insert(det_i + offset, [p3_idx, 1, upsample, [None, 2, "nearest"]])
     offset += 1
 
-    # 3) 与 P2 拼接
     nodes.insert(det_i + offset, [[-1, p2_src], 1, "Concat", [1]])
     offset += 1
 
-    # 4) 融合
     fuse_idx = det_global + offset
     nodes.insert(det_i + offset, [-1, repeats, fuse_block, [p2_channels]])
     offset += 1
 
-    # 5) 检测头输入扩展为 P2-P5
-    #    写回的是**新列表**而非就地修改：调用方可能传入浅拷贝的节点列表
-    #    （例如 {"model": backbone + head}），就地改写会污染其原图。
     nodes[det_i + offset] = _rebuild_head_node(
         nodes[det_i + offset], [fuse_idx, p3_idx, p4_idx, p5_idx]
     )
@@ -659,11 +502,7 @@ def inject_p2_head(
 
 
 def _module_arity(name: str) -> int | None:
-    """模块 ``__init__`` 的**必需**位置参数个数（不含 self）；拿不到返回 None。
-
-    用于把 Conv 节点改型成别的模块时裁剪参数：YAML 里 stride-2 Conv 的
-    ``[c2, k, s]`` 对 ``ADown(c1, c2)`` 来说是超编的（8.4 会直接 TypeError）。
-    """
+    """模块 ``__init__`` 的**必需**位置参数个数（不含 self）；拿不到返回 None。"""
     import inspect
 
     obj = None
@@ -671,7 +510,7 @@ def _module_arity(name: str) -> int | None:
         from tod.compat import model_globals
 
         obj = model_globals().get(name)
-    except Exception:  # noqa: BLE001 - 未安装框架时退回注册表查找
+    except Exception:  # noqa: BLE001
         obj = None
     if obj is None:
         try:
@@ -698,25 +537,7 @@ def replace_downsample(
     segments: Sequence[str] = ("backbone",),
     trim_args: bool = True,
 ) -> dict:
-    """把主干中的 stride-2 下采样卷积换成给定模块（如 ADown）。
-
-    为什么不能直接用 ``apply_type_map``：ADown 只在**下采样位置**语义等价，
-    把全图 Conv 都换掉会破坏 neck 与 head。所以这里按**节点索引**精确替换。
-
-    Args:
-        module: 替换后的模块名。
-        indices: 全局节点索引列表，默认 ``(1, 3, 5, 7)``
-            —— YOLOv8 主干的 P2/P3/P4/P5 下采样点（索引 0 是 stem，
-            输入通道为 3（奇数），ADown 这类需要通道一分为二的模块不能放）。
-        segments: 在哪些段里替换，默认只改 backbone。
-        trim_args: 是否把节点参数裁剪到目标模块的必需参数个数（默认 True）。
-            原节点的参数是 Conv 的 ``[c2, k, s]``，而 ``ADown(c1, c2)`` 只吃两个位置参数
-            （c1 由 ``parse_model`` 自动补），不裁剪会在建图时报
-            ``ADown.__init__() takes 3 positional arguments but 5 were given``。
-
-    Returns:
-        就地修改后的 cfg，并写入 ``_downsample_replaced`` 供核查。
-    """
+    """把主干中的 stride-2 下采样卷积换成给定模块（如 ADown）。"""
     indices = tuple(indices) if indices is not None else (1, 3, 5, 7)
     replaced: dict[int, str] = {}
     arity = _module_arity(module) if trim_args else None
@@ -731,12 +552,12 @@ def replace_downsample(
             if global_i not in indices:
                 continue
             old = str(node[2])
-            if old == module:                     # 幂等
+            if old == module:
                 continue
             new_node = list(node)
             new_node[2] = module
             if arity is not None and len(new_node) > 3 and new_node[3]:
-                keep = max(1, arity - 1)          # parse_model 会补 c1
+                keep = max(1, arity - 1)
                 new_node[3] = list(new_node[3])[:keep]
             seg_nodes[local_i] = new_node
             replaced[global_i] = f"{old} -> {module}"

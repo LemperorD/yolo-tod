@@ -1,10 +1,4 @@
-"""运行时上下文：保存"当前正在跑的变体 spec"。
-
-为什么需要它：ultralytics 会严格校验训练参数（未知键会被拒），
-所以本库的配置不能塞进 ``model.train(**kwargs)`` 里。
-改为由 ``tools/train.py`` 先 ``set_active(spec)``，
-自定义 Trainer / 损失再从 ``tod.runtime`` 读——两边解耦，互不污染。
-"""
+"""运行时上下文：保存"当前正在跑的变体 spec"。"""
 
 from __future__ import annotations
 
@@ -41,5 +35,6 @@ def use(spec: dict[str, Any]) -> Iterator[dict[str, Any]]:
     set_active(spec)
     try:
         yield spec
+    # 离开上下文时恢复先前变体，避免嵌套调用串用配置。
     finally:
         set_active(previous)

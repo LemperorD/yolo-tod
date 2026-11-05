@@ -114,166 +114,59 @@ CMake 里加一行（或直接用 glob），**不需要改任何调用方代码*
 
 ---
 
-## 2. 目录
+## 2. 当前目录与文件职责
 
-```
+```text
 src/todrt/
-├─ CMakeLists.txt                    四后端独立开关 + SDK 探测
-├─ cmake/aarch64-linux-gnu.cmake     交叉编译到 Jetson
+├─ CMakeLists.txt                      目标、SDK 探测、架构选项与安装
+├─ cmake/                             aarch64 工具链、CMake/pkg-config 模板
 ├─ include/todrt/
-│  ├─ core.hpp                       错误 / 日志 / 自注册表（无任何依赖）
-│  ├─ json.hpp                       极简 JSON（容忍注释与尾随逗号）
-│  ├─ modules.hpp                    前处理 / 解码 / 后处理接口 + 配置结构（契约中心）
-│  ├─ detector_options.hpp           「一次部署」的完整声明
-│  ├─ factory.hpp                    ★ 四座工厂 + Detector（调用方唯一要认识的类型）
-│  ├─ backend/factories.hpp          内部构造助手 + EngineInputSpec（后端共享契约）
-│  ├─ backend/simple_detector.hpp    ★ IEngineRunner + RunnerDetector（后端共用外壳）
-│  ├─ backend/engine_trt.hpp         TensorRT 引擎封装（PIMPL，头里无 TRT 类型）
-│  └─ backend/{trt,rknn,ort,openvino}_factory.hpp   四个后端入口（均不含 SDK 头）
+│  ├─ core.hpp / json.hpp             基础类型、日志、注册元数据与 JSON
+│  ├─ modules.hpp                     图像/张量、前后处理与解码契约
+│  ├─ detector_options.hpp            部署与运行参数
+│  ├─ factory.hpp                     Builder、配方、注册宏与 Detector API
+│  └─ backend/                        Runner、异步外壳与各后端入口
 ├─ src/
-│  ├─ core.cpp                       注册表 / 日志 / 枚举解析
-│  ├─ json.cpp                       JSON 解析与序列化
-│  ├─ config_io.cpp                  部署配置 <-> 结构体（读它的解析顺序 = 优先级）
-│  ├─ factory.cpp                    ★ 工厂装配、异步骨架、PlanAssembly 自检
-│  ├─ preprocess.cpp                 letterbox（自实现，无 OpenCV）；float 与 uint8 两条输出
-│  ├─ decode.cpp                     DFL + 四种输出布局解码（CPU 唯一真相）
-│  ├─ nms.cpp                        硬 NMS / soft-NMS / 后处理器
-│  ├─ models/*.cpp                   ★ 变体配方（一个变体一个文件，~70 行）
+│  ├─ core.cpp / json.cpp             基础实现
+│  ├─ config_io.cpp / factory.cpp     配置解析与工厂装配
+│  ├─ preprocess.cpp                  letterbox 与输入类型/布局转换
+│  ├─ decode.cpp / nms.cpp            DFL/输出布局解码与后处理
+│  ├─ models/                         YOLOv8 基线与 SPAE 模型配方
 │  └─ backend/
-│     ├─ backend_dispatch.cpp        ★ 唯一按名字分派到具体后端的地方
-│     ├─ backend_support.cpp         ★ 前后处理选项的合成（引擎契约 > 配置）
-│     ├─ simple_detector.cpp         通用流水线实现
-│     ├─ engine_trt.cpp              TensorRT（DLA / FP16 / INT8 / CUDA Graph）
-│     ├─ engine_rknn.cpp             RK3588 NPU（3 核 / uint8 NHWC / 反量化）
-│     ├─ engine_ort.cpp              ONNX Runtime（通用 CPU，AMD x86）
-│     ├─ engine_openvino.cpp         OpenVINO（x86 CPU / Intel iGPU）
-│     └─ engine_stub.cpp             一个后端都没编时的占位
-├─ apps/todrt_cli.cpp                命令行入口
-└─ tests/cpp_smoke.cpp               架构自检（**不需要任何后端**，148 项）
+│     ├─ backend_dispatch.cpp         后端名称与编译可用性分派
+│     ├─ backend_support.cpp          引擎输入与部署配置合成
+│     ├─ simple_detector.cpp          公共推理与前后处理流水线
+│     ├─ engine_trt.cpp               TensorRT
+│     ├─ engine_rknn.cpp              RKNN
+│     ├─ engine_ort.cpp               ONNX Runtime
+│     ├─ engine_openvino.cpp          OpenVINO
+│     └─ engine_stub.cpp              无 SDK 时的占位实现
+├─ apps/todrt_cli.cpp                 CLI
+└─ tests/cpp_smoke.cpp                公共组件与装配自检
 ```
 
----
+每个头文件、实现、入口和构建模板的职责见 [根 README 文件索引](../../README.md#代码文件索引)。全仓库调用链与 Python 导出边界见 [当前代码架构](../../docs/ARCHITECTURE.md#4-c-推理架构)。此处继续维护 API 与部署用法，不维护会随注释调整而失效的源码行数表。
 
-## 3. 代码依赖与阅读顺序
+## 3. 依赖、阅读顺序与后端契约
 
-### 依赖是严格单向的
+公共接口从 `core.hpp` 开始，逐步引入 `json.hpp` / `modules.hpp`、`detector_options.hpp` 和 `factory.hpp`。SDK 细节留在后端实现；上层通过配置与工厂选择后端。
 
-```
-                         core.hpp            错误 / 日志 / 注册表（无任何依赖）
-                             ▲
-        ┌────────────────────┼────────────────────┐
-        │                    │                    │
-    json.hpp            modules.hpp         detector_options.hpp
-  （只依赖 core）      （只依赖 core）        （依赖 modules）
-        │                    │                    │
-        └────────┬───────────┴────────────────────┘
-                 ▼
-            factory.hpp      ← 四座工厂 + Detector（调用方唯一入口）
-                 ▲
-      ┌──────────┼──────────────┬─────────────────┐
-      │          │              │                 │
-  models/*.cpp  factory.cpp  preprocess.cpp   backend/factories.hpp
-                             nms.cpp         （后端共享助手）
-                             decode.cpp            │
-                                                   ▼
-                                          backend/simple_detector.hpp
-                                          （IEngineRunner + RunnerDetector）
-                                                   ▲
-                        ┌──────────────┬───────────┴────────┬──────────────┐
-                 engine_rknn.cpp  engine_ort.cpp  engine_openvino.cpp  engine_trt.cpp
-                                                                     （唯一例外，见下）
-```
+推荐阅读顺序：
 
-规则：**头文件只向下依赖，实现文件只向上依赖**。
-`core.hpp` 里没有任何 `#include "todrt/..."`；`modules.hpp` / `json.hpp` 只依赖它。
-所以读任何一个文件时，它的前置知识都在图的下方（更靠前）。
+1. `core.hpp`、`modules.hpp`：理解设备、非拥有视图、坐标、dtype 与输出布局。
+2. `detector_options.hpp`、`config_io.cpp`：区分导出模型结构和运行时覆盖。
+3. `factory.hpp`、`factory.cpp`、`models/spae_yolov8n.cpp`：理解配方注册、默认值合并和装配计划。
+4. `backend/factories.hpp`、`backend_dispatch.cpp`、`backend_support.cpp`：理解后端选择和引擎输入契约优先级。
+5. `backend/simple_detector.hpp/.cpp`、`preprocess.cpp`、`decode.cpp`、`nms.cpp`：追踪一张图从输入到源图坐标检测框的路径。
+6. 按目标设备阅读一个 `engine_*.cpp`，再通过 `cpp_smoke.cpp` 查看公共契约的验证样例。
 
-### 推荐阅读顺序（4 段，约 1.5 小时）
+四个后端共用 `IEngineRunner → RunnerDetector` 的数据通路。`AsyncDetectorBase` 在 `include/todrt/backend/simple_detector.hpp` 内管理队列、线程与异步图像副本；`factory.cpp` 只负责装配。新增后端实现 runner、构造入口、集中分派和 CMake 探测即可。
 
-**第 1 段：机制（约 30 分钟）** —— 这几份决定了后面所有代码的写法
+`Run()` 接收主机侧输入缓冲，SDK 后端应在内部完成设备拷贝与半精度/量化输出转换，对公共外壳返回 float32。`EngineInputSpec` 决定输入 dtype、layout 和尺寸；部署配置中的类别数、reg_max、stride 与输出布局决定后处理。
 
-| # | 文件 | 行数 | 读它的目的 |
-|---|---|---|---|
-| 1 | `include/todrt/core.hpp` | 70 | `Device` / `Precision` 的语义；`RegistryEntry` 为什么强制登记来源与许可证 |
-| 2 | `include/todrt/modules.hpp` | 327 | **契约中心**：`ImageView` / `PreprocessResult` / `DecodeOptions` 的形状。第一遍可跳过 NMS 细节 |
-| 3 | `include/todrt/detector_options.hpp` | 58 | 一次部署的完整声明；注意 `DeployConfig`（Python 给的结构信息）与运行期覆盖的分工 |
-| 4 | `include/todrt/factory.hpp` | 233 | ★ 四座工厂 + `Detector`；`TOD_RT_DEFINE_RECIPE` 宏；`RunBatch()` 是子类唯一要实现的方法 |
-| 5 | `src/models/spae_yolov8n.cpp` | 73 | ★ **最短的完整闭环**：一个新变体长什么样。看完就知道工厂怎么用 |
+`ImageView` 不拥有原始数据；`Submit()` 会拷贝像素，调用方可随后复用源缓冲。最终检测框使用源图像素坐标。共享实例的同步与异步执行会使用相同引擎资源，调用方应避免并发访问。
 
-**第 2 段：装配流程（约 25 分钟）** —— 从名字到对象
-
-| # | 文件 | 行数 | 读它的目的 |
-|---|---|---|---|
-| 6 | `src/factory.cpp` | 408 | 注册表填充、`Detector::Create()` 的解析顺序、`merge_recipe_defaults()` 的优先级、异步骨架、`PlanAssembly()` |
-| 7 | `src/config_io.cpp` | 679 | 部署配置 ↔ 结构体。**它的解析顺序就是优先级**：deploy → build → preset → runtime → preprocess |
-| 8 | `src/backend/backend_dispatch.cpp` | 130 | 唯一按名字分派的地方；`LookupBackend()` 同时给出"没编进来"的准确提示 |
-| 9 | `src/backend/backend_support.cpp` | 64 | ★ `resolve_preprocess_options()`：为什么**引擎声明的输入契约优先于配置** |
-
-**第 3 段：数据通路（约 25 分钟）** —— 一张图怎么变成框
-
-| # | 文件 | 行数 | 读它的目的 |
-|---|---|---|---|
-| 10 | `src/preprocess.cpp` | 245 | letterbox 几何（scale/pad 取整）与**两条输出路径**（float NCHW / uint8 NHWC）共用一个核心 |
-| 11 | `src/decode.cpp` | 330 | ★ DFL 解码与四种输出排布；`check_anchors()` 是"配置写错必须响亮报错"的样板 |
-| 12 | `src/nms.cpp` | 169 | 硬 NMS / soft-NMS；解码与 NMS 为什么放在同一个后处理器里 |
-| 13 | `include/todrt/backend/simple_detector.hpp`<br>+ `src/backend/simple_detector.cpp` | 240 + 92 | ★ `IEngineRunner`（跑一次）与 `RunnerDetector`（流水线）——**想加后端从这里开始** |
-
-**第 4 段：后端（按需读一个即可）**
-
-| 后端 | 文件 | 行数 | 特点 |
-|---|---|---|---|
-| RKNN | `src/backend/engine_rknn.cpp` | 457 | `.rknn` 加载、3 核 `rknn_dup_context`、`want_float` 反量化 |
-| ONNX Runtime | `src/backend/engine_ort.cpp` | 412 | 最"标准"的 `IEngineRunner` 实现（EP 选择 + 动态 shape） |
-| OpenVINO | `src/backend/engine_openvino.cpp` | 386 | 编译缓存、CPU/GPU/NPU 设备切换 |
-| TensorRT | `src/backend/engine_trt.cpp` | 1041 | 最长：DLA / FP16 / INT8 / CUDA Graph；结构与上面三个完全一致，只是函数更多 |
-
-**辅助（可当参考手册查）**：`src/core.cpp`（232 行，枚举解析 + 注册表实现）、
-`src/json.cpp`（378 行，极简 JSON）、`apps/todrt_cli.cpp`（490 行，看调用方怎么用）、
-`tests/cpp_smoke.cpp`（602 行，**建议当规格说明读**：148 项断言就是全部对外契约）。
-
-### 四个后端现在是同一个形状
-
-每个后端都只实现一个 `IEngineRunner`（"跑一次"），流水线一律复用 `RunnerDetector`：
-
-```cpp
-class TrtRunner  : public IEngineRunner { /* … */ };
-class RknnRunner : public IEngineRunner { /* … */ };
-class OrtRunner  : public IEngineRunner { /* … */ };
-class OvRunner   : public IEngineRunner { /* … */ };
-
-// 四个后端的 CreateXxxDetector() 结尾都是这几行：
-return std::unique_ptr<Detector>(new RunnerDetector(
-    model_name, o, std::move(runner),      // 流水线共用：前处理 → 引擎 → 解码 → NMS → 反变换
-    std::move(pre), std::move(post)));
-```
-
-每个 `engine_<x>.cpp` 内部都是同样的三段：**引擎类 → runner 类 → builder 类 + 工厂函数**。
-文件内部的函数数量各不相同（TensorRT 那份最长，因为要处理 DLA/INT8/CUDA Graph），
-但**文件架构一致**：一个后端 = 一个 `.cpp` + 一个只导出 `CreateXxxDetector()` 的头。
-
-> **这里曾经漂移过一次，值得记下来。** TensorRT 早期自己写了一个
-> `TrtDetector : Detector`（为了直接暴露 DLA 逐层诊断），另外三个后端走共用外壳。
-> 结果是 `Detector` 接口改成 `protected RunBatch()` + 共用异步骨架后，
-> **只有 TRT 那份腐化了**：它还停在旧契约（`Execute()`），
-> `PreprocessResult::tensor` 改名成 `bytes` 后也没跟着改，整份文件编不过 ——
-> 而另外三个后端因为共用外壳，自动跟上了。
->
-> 现在 `TrtRunner` 也收到共用外壳上，DLA 诊断通过 `TrtRunner::engine_info()` 输出。
-> 教训：**"我有特殊需求，所以自己写一份"是接口漂移的起点**；真正的特殊需求
-> 应该通过扩展现有接口表达（`engine_info()` 就是这么加进去的），而不是复制生命周期代码。
-
-### 加东西时该动哪几个文件
-
-| 我要做什么 | 需要改的文件 | 不需要动 |
-|---|---|---|
-| **加一个变体**（新魔改的训练产物） | `src/models/<name>.cpp`（约 70 行） | 其他全部；CMake 用 glob 自动收 |
-| **加一个后端**（新硬件） | ① `include/todrt/backend/<x>_factory.hpp`<br>② `src/backend/engine_<x>.cpp`（实现 `IEngineRunner` + 注册 builder）<br>③ `backend_dispatch.cpp` 加 2 个分支<br>④ CMake 加 SDK 探测 | `factory.cpp` / `config_io.cpp` / 前处理 / 解码 / 业务代码 |
-| **加一种前处理策略** | `preprocess.cpp` 注册一个 `TOD_RT_REGISTER_PREPROC` | 后端与解码 |
-| **加一种后处理 / NMS** | `nms.cpp` 注册一个 `TOD_RT_REGISTER_POSTPROC` | 后端与前处理 |
-| **加一种输出解码排布** | `modules.hpp` 的 `OutputLayout` + `decode.cpp` 一个 Decoder 结构 + 配置解析 | 后端与前后处理 |
-
-> `decode.cpp` 已有的四种排布（anchor-major / 转置 / feature-major / plugin-nms）之间的
-> 对拍测试在 `cpp_smoke.cpp` 的 4d / 4e —— 新加排布照着写一份即可。
+生产部署和 SDK 验证面向 Linux。Windows 下的本次整理仅做源码与契约的静态核对；构建与设备测试按 [DEPLOY.md](../../docs/DEPLOY.md) 在目标环境执行。
 
 ---
 
@@ -473,8 +366,7 @@ target_link_libraries(your_app PRIVATE todrt::todrt)
 
    ```bash
    # 桩头只需声明 engine_trt.cpp 用到的那些接口（不必能链接）
-   cl /std:c++17 /DTODRT_HAVE_TENSORRT=1 /I include /I <桩头目录> /c engine_trt.cpp
-   # 或 gcc:  g++ -std=c++17 -DTODRT_HAVE_TENSORRT=1 -Iinclude -I<stub> -fsyntax-only engine_trt.cpp
+   g++ -std=c++17 -DTODRT_HAVE_TENSORRT=1 -Iinclude -I<stub> -fsyntax-only src/backend/engine_trt.cpp
    ```
 
    它抓的是**结构性错误**：签名与官方头不符（如 TRT 10 已无 `Dims4`、`setDimensions`

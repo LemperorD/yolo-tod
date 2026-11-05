@@ -1,15 +1,3 @@
-// cpp_smoke.cpp —— 推理端架构自检（**不需要 GPU / TensorRT / OpenCV**）
-//
-// 定位与训练侧的 tests/smoke.py 一致：把"能被纯 CPU 验证的部分"全部验证掉，
-// 剩下的（引擎构建、DLA 归属、真实延迟）留给实机。
-//
-// 覆盖：
-//   1. 工厂自注册：模型/builder/preproc/postproc 按名字可取、别名可用、依赖完整
-//   2. 配置：JSON 解析、DeployConfig 结构字段、schema 校验、硬件预设、JSON 往返
-//   3. 前处理：letterbox 几何（scale/pad）、BGR→RGB、padding 值、灰度、stretch
-//   4. 解码：anchor 网格、DFL 期望、anchor-major / feature-major 对拍、错误配置报错
-//   5. NMS：硬 NMS / soft-NMS / class-agnostic / max_det
-//   6. 端到端接线：前处理 → 后处理 → 坐标反变换（用合成张量，无需引擎）
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -51,7 +39,6 @@ void CheckNear(float got, float want, float tol, const std::string& what) {
   }
 }
 
-/// 期望"这里必须抛错"——静默出错是本项目最想避免的失败模式。
 void CheckThrows(const std::function<void()>& fn, const std::string& what) {
   ++g_checks;
   try {
@@ -66,8 +53,6 @@ void CheckThrows(const std::function<void()>& fn, const std::string& what) {
 }
 
 using namespace todrt;
-
-// ------------------------------------------------------------------ 1. 工厂
 
 void TestFactory() {
   Section("1. 工厂自注册与按名字装配");
@@ -104,8 +89,6 @@ void TestFactory() {
   std::printf("--- PlanAssembly 输出 ---\n%s", rep.ToText().c_str());
   std::printf("--- 元数据（SPAE_YOLOv8n）---\n%s\n", registry_get("SPAE_YOLOv8n").source.c_str());
 }
-
-// ------------------------------------------------------------------ 2. 配置
 
 void TestConfig() {
   Section("2. 部署配置解析与校验");
@@ -167,7 +150,7 @@ void TestConfig() {
   CheckThrows(
       [] {
         DeployConfig d;
-        d.reg_max = 15;  // 非 2 的幂
+        d.reg_max = 15;
         d.Validate();
       },
       "reg_max 非 2 的幂报错");
@@ -183,7 +166,6 @@ void TestConfig() {
 
   Section("2b-2. 多后端预设与配置字段");
   {
-    // RK3588：NPU + INT8 + uint8 NHWC 前处理（归一化烧进量化模型）
     DetectorOptions rk;
     rk.ApplyPreset("rk3588");
     Check(rk.device == Device::kNpu, "preset=rk3588 → device=npu");
@@ -192,14 +174,12 @@ void TestConfig() {
     Check(rk.preproc_opts.layout == TensorLayout::kNhwc, "preset=rk3588 → NHWC");
     Check(rk.max_batch == 1 && !rk.dynamic_shape, "preset=rk3588 → 固定尺寸 batch=1");
 
-    // AMD/通用 CPU：走 CPU 后路（builder 决定是 ORT 还是 OpenVINO）
     DetectorOptions amd;
     amd.ApplyPreset("amd");
     Check(amd.device == Device::kCpu, "preset=amd → device=cpu");
     Check(amd.preproc_opts.output == PreprocOutput::kFloat32, "preset=amd → float32 输入");
     Check(!amd.deploy.build.ov_cache_dir.empty(), "preset=amd → 默认开启 OpenVINO 编译缓存");
 
-    // 多后端字段的 JSON 解析
     const std::string multi = R"({
       "model": "SPAE_YOLOv8n",
       "builder": "rknn",
@@ -223,7 +203,6 @@ void TestConfig() {
     Check(mo.preproc_opts.output == PreprocOutput::kUint8Raw, "preprocess.output=uint8 解析正确");
     Check(mo.preproc_opts.layout == TensorLayout::kNhwc, "preprocess.layout=nhwc 解析正确");
 
-    // 新的 builder flags
     BuildConfig bc;
     Check(bc.set_flag("rknn_multi_core"), "flag rknn_multi_core 可识别");
     Check(bc.set_flag("rknn_packed"), "flag rknn_packed 可识别");
@@ -254,17 +233,15 @@ void TestConfig() {
   Check(back.deploy.layout == o.deploy.layout, "往返后 layout 一致");
 }
 
-// ------------------------------------------------------------------ 3. 前处理
-
 void TestPreprocess() {
   Section("3. 前处理（letterbox 几何 + 像素映射）");
 
   const int W = 1280, H = 720;
   std::vector<uint8_t> px(static_cast<size_t>(W) * H * 3);
   for (size_t i = 0; i < px.size(); i += 3) {
-    px[i] = 200;      // B
-    px[i + 1] = 100;  // G
-    px[i + 2] = 50;   // R
+    px[i] = 200;
+    px[i + 1] = 100;
+    px[i + 2] = 50;
   }
   ImageView img;
   img.data = px.data();
@@ -276,7 +253,6 @@ void TestPreprocess() {
   auto pre = make_detect_preprocessor(PreprocessOptions::ForInput(640, 640));
   const PreprocessResult r = pre->Run({img});
 
-  // Ultralytics 语义：r = min(640/1280, 640/720) = 0.5 → 640×360，pad_y = 140
   CheckNear(r.scale[0], 0.5f, 1e-6f, "scale = min(640/1280, 640/720) = 0.5");
   CheckNear(r.pad_x[0], 0.f, 0.5f, "pad_x = 0（宽已占满）");
   CheckNear(r.pad_y[0], 140.f, 0.5f, "pad_y = (640-360)/2 = 140");
@@ -325,8 +301,6 @@ void TestPreprocess() {
 
   Section("3e. uint8 + NHWC 输出（RKNN 量化模型的输入契约）");
   {
-    // RKNN 把归一化烧进量化模型，所以宿主机必须给原始 uint8 —— 双重归一化不会报错，
-    // 只会给出全错的框。这一段就是把这个契约钉死在测试里。
     PreprocessOptions qo = PreprocessOptions::ForRknnQuantized(640, 640);
     Check(qo.output == PreprocOutput::kUint8Raw && qo.layout == TensorLayout::kNhwc,
           "ForRknnQuantized 给出 uint8 + NHWC");
@@ -337,22 +311,18 @@ void TestPreprocess() {
     Check(q.layout == TensorLayout::kNhwc, "输出布局是 NHWC");
     Check(q.bytes.size() == static_cast<size_t>(640) * 640 * 3, "uint8 输出字节数正确");
     Check(q.sample_bytes() == static_cast<size_t>(640) * 640 * 3, "单图字节数正确");
-    // 几何必须与 float 版本完全一致（否则坐标反变换会错）
     CheckNear(q.scale[0], r.scale[0], 1e-6f, "uint8 与 float 的 letterbox scale 一致");
     CheckNear(q.pad_y[0], r.pad_y[0], 0.5f, "uint8 与 float 的 pad_y 一致");
 
-    // NHWC 索引 = (y*W + x)*3 + c
     auto at = [&](int y, int x, int c) -> size_t {
       return (static_cast<size_t>(y) * 640 + static_cast<size_t>(x)) * 3 +
              static_cast<size_t>(c);
     };
     Check(q.bytes[at(0, 320, 0)] == 114, "padding 值是原始 114（未归一化）");
-    // 中心像素：BGR(200,100,50) → NHWC 顺序应为 R=50, G=100, B=200
     Check(q.bytes[at(320, 320, 0)] == 50, "NHWC[0] = R = 50");
     Check(q.bytes[at(320, 320, 1)] == 100, "NHWC[1] = G = 100");
     Check(q.bytes[at(320, 320, 2)] == 200, "NHWC[2] = B = 200");
 
-    // 少数 RKNN 模型是 NCHW + uint8，也应可用
     PreprocessOptions no = qo;
     no.layout = TensorLayout::kNchw;
     const PreprocessResult n = make_detect_preprocessor(no)->Run({img});
@@ -360,7 +330,6 @@ void TestPreprocess() {
     Check(n.bytes[0 * plane_u8 + 320 * 640 + 320] == 50, "NCHW uint8：R 平面");
     Check(n.bytes[2 * plane_u8 + 320 * 640 + 320] == 200, "NCHW uint8：B 平面");
 
-    // 数值读取保护：uint8 输出不能按 float 读
     CheckThrows([&] { (void)q.float_ptr(); }, "uint8 输出按 float 读取时报错");
   }
 
@@ -374,9 +343,6 @@ void TestPreprocess() {
   }
 }
 
-// ------------------------------------------------------------------ 4. 解码
-
-/// 合成 anchor-major 输出：DFL 用大 logit 近似 one-hot，使距离期望 = bin。
 std::vector<float> MakeAnchorMajorOutput(const DecodeOptions& opt, int W, int H, float conf,
                                          int class_id, int bin) {
   const std::vector<Grid> grids = make_grids(opt.strides, W, H);
@@ -392,7 +358,6 @@ std::vector<float> MakeAnchorMajorOutput(const DecodeOptions& opt, int W, int H,
   for (const auto& g : grids) {
     for (int y = 0; y < g.h; ++y) {
       for (int x = 0; x < g.w; ++x, ++a) {
-        // 只让第一个 anchor（P2 层 (0,0)）高分，便于精确断言
         const bool target = (a == 0);
         const float cls = target ? conf : 0.01f;
         for (int c = 0; c < opt.num_classes; ++c) {
@@ -455,8 +420,6 @@ void TestDecode() {
     if (!dets.empty()) {
       Check(dets[0].class_id == 3, "类别解码正确（3）");
       CheckNear(dets[0].score, 0.9f, 1e-5f, "分数解码正确");
-      // anchor(0,0) 中心 = (0.5*4, 0.5*4) = (2,2)；DFL 距离 5 个**格子** → 5*stride=20 像素
-      // （ultralytics: dfl 输出的是格数，乘 stride 才是像素）
       CheckNear(dets[0].box.x1, 2.f - 5.f * 4.f, 0.05f, "x1 = cx - l*stride");
       CheckNear(dets[0].box.y1, 2.f - 5.f * 4.f, 0.05f, "y1 = cy - t*stride");
       CheckNear(dets[0].box.x2, 2.f + 5.f * 4.f, 0.05f, "x2 = cx + r*stride");
@@ -554,8 +517,6 @@ void TestDecode() {
   }
 }
 
-// ------------------------------------------------------------------ 5. NMS
-
 void TestNms() {
   Section("5. NMS");
 
@@ -581,9 +542,9 @@ void TestNms() {
   CheckNear(iou(a.box, c.box), 0.f, 1e-6f, "无重叠 IoU = 0");
 
   std::vector<int> keep;
-  nms_hard(ds, 0.5f, /*class_agnostic=*/false, keep);
+  nms_hard(ds, 0.5f,  false, keep);
   Check(keep.size() == 3, "按类别抑制：保留 a/c/d（实际 " + std::to_string(keep.size()) + "）");
-  nms_hard(ds, 0.5f, /*class_agnostic=*/true, keep);
+  nms_hard(ds, 0.5f,  true, keep);
   Check(keep.size() == 2, "class-agnostic：d 也被抑制（实际 " + std::to_string(keep.size()) + "）");
 
   std::vector<Detection> soft = ds;
@@ -619,8 +580,6 @@ void TestNms() {
   Check(res.size() == 1, "后处理返回 batch=1 的结果");
   Check(res[0].size() <= 1, "max_det=1 生效（实际 " + std::to_string(res[0].size()) + "）");
 }
-
-// ------------------------------------------------------------------ 6. 端到端
 
 void TestPipeline() {
   Section("6. 端到端接线（合成张量，无需引擎）");
@@ -664,7 +623,7 @@ void TestPipeline() {
   Check(catalog.find("model") != std::string::npos, "catalog 按工厂族分组");
 }
 
-}  // namespace
+}
 
 int main() {
   std::printf("todrt 推理端架构自检（不需要 GPU / TensorRT）\n");

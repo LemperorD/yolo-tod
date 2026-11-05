@@ -1,29 +1,4 @@
-"""训练回路自检（opt-in）：合成数据集 → 真训练 1–2 epoch → 载权重推理 → 查证据。
-
-**为什么单独一个文件**：`tests/smoke.py` / `tests/test_modules.py` 只验证结构与数值，
-不需要数据集；而"训练回路真的能跑完"（Trainer 钩子、准则补丁、MuSGD+AMP、EMA、
-验证、checkpoint 存取、以及**动态类能不能被 pickle**）必须真跑一次才暴露得出来 ——
-本文件就是那次"真跑"，只是用合成数据把它压到 1–2 分钟。
-
-覆盖的断言（都来自实测过的坑）：
-    1. 训练能跑完并落下 `weights/best.pt`、`weights/last.pt`；
-    2. `results.csv` 的 `dfl_loss` 列恒为 0 → 论文 §4.3 的 `dfl=0.0` + 无 DFL 分支真的生效；
-    3. 断点能被**新进程**载入（`YOLO(best.pt)`）：动态创建的 `SmallTargetAssigner`
-       必须能按限定名反查到，否则保存/加载都会炸；
-    4. 载入后的模型能对一张图推理并给出结果对象。
-
-用法::
-
-    python3 tests/train_smoke.py                 # 1 epoch，默认 device=0（有 GPU 用 GPU）
-    python3 tests/train_smoke.py --device cpu --epochs 2
-    python3 tests/train_smoke.py --keep          # 保留实验目录（默认清理）
-
-[!] 环境要求：ultralytics 的标签缓存默认用 ``ThreadPool`` 并行校验图片与标签，
-   而 Windows 上该池会打开**命名管道**，在受限沙箱会话里会 ``PermissionError [WinError 5]``。
-   本脚本默认调用 ``tod.compat.allow_threadless_label_cache()`` 把它换成**顺序**实现
-   （语义一致、只是放弃并行；合成数据本来就只有十几张图），因此**在沙箱里也能跑**。
-   加 ``--allow-threaded-cache`` 可恢复框架默认行为（用于对比/排查）。
-"""
+"""训练回路自检（opt-in）：合成数据集 → 真训练 1–2 epoch → 载权重推理 → 查证据。"""
 
 from __future__ import annotations
 
@@ -37,7 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -89,16 +63,12 @@ def main() -> int:
 
     tod.bootstrap()
 
-    # 受限沙箱（Windows 命名管道被禁）下必须换成顺序标签缓存，否则
-    # ``ThreadPool`` 建队列表就 PermissionError [WinError 5]（见 compat 的说明）。
     if not args.allow_threaded_cache and compat.allow_threadless_label_cache():
         print("[env ] 标签缓存已切换为顺序模式（沙箱兼容；--allow-threaded-cache 可关闭）")
 
-    # ---- 1) 合成数据集 ----
     data_yaml = _load_tool("make_dummy_dataset").build(args.work / "data", 12, 4, seed=0)
     check("合成数据集配置已生成", data_yaml.is_file())
 
-    # ---- 2) 真训练 ----
     spec = load_yaml(args.variant)
     variant = Variant.from_spec(spec)
     model_yaml = args.work / "model.yaml"
@@ -125,7 +95,6 @@ def main() -> int:
     check("训练产出 best.pt", best.is_file())
     check("训练产出 last.pt", last.is_file())
 
-    # ---- 3) 证据：无 DFL 分支真的生效 ----
     with open(run_dir / "results.csv", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     check("results.csv 有训练记录", len(rows) >= args.epochs, f"实际 {len(rows)} 行")
@@ -136,7 +105,6 @@ def main() -> int:
     check("dfl_loss 恒为 0（论文 §4.3 的 dfl=0.0 / 无 DFL 生效）",
           all(abs(v) < 1e-9 for v in dfl_values), f"实际 {dfl_values}")
 
-    # ---- 4) 断点能被新进程载入（动态类 pickle 的回归测试）----
     reloaded = YOLO(str(best))
     check("best.pt 可被重新载入（含动态分配的 STAL 类）", reloaded.model is not None)
     images = sorted((args.work / "data" / "images" / "val").glob("*.jpg"))

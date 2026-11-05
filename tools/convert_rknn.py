@@ -1,37 +1,4 @@
-"""RKNN 转换：ONNX → .rknn（Rockchip RK3588 NPU）。
-
-**必须在 x86 主机上运行**：rknn-toolkit2 只提供 x86_64 的轮子，板子上不做转换
-（板子只跑 librknnrt.so 做推理）。转换产物 .rknn 可以拷到任意同型号设备。
-
-为什么归一化要在这一步"烧进模型"（而不是留到 C++ 侧做）：
-    RKNN 的量化流程需要看到完整的数据流才能把 scale 校准准。若把 (x - mean) / std
-    留在推理端做，量化模型看到的是"未归一化的整数"，校准出来的 scale 会完全错位。
-    所以这里用 std=[255,255,255] 等参数把归一化表达进模型：
-      * 转换期：toolkit 把输入 scale 设为 1/std，等价于"模型内部先 /255"；
-      * 推理期：C++ 侧给 **uint8 原始像素**（todrt 的 preprocess.output = "uint8"）。
-
-这两个设置必须成对出现 —— 只改一边会得到"不报错但框全错"的结果，所以本脚本会把
-结果写回部署配置（--deploy-config），让 C++ 侧不可能配错。
-
-用法::
-
-    # 1) 只转模型（推荐先跑，看量化后精度掉多少）
-    python3 tools/convert_rknn.py \\
-        --onnx exports/SPAE-YOLOv8n.onnx \\
-        --target rk3588 --out exports/spae_yolov8n.rk3588.rknn \\
-        --dataset exports/calib.txt
-
-    # 2) 顺带把 C++ 部署配置改成 RKNN 路径（前处理自动切成 uint8 NHWC）
-    python3 tools/convert_rknn.py --onnx ... --out ... \\
-        --deploy-config configs/deploy/spae-yolov8n.json
-
-    # 3) 若已有 VisDrone 的量化数据集描述（rknn-toolkit2 的 dataset.txt 格式），
-    #    直接用它做混合量化，精度更稳：
-    python3 tools/convert_rknn.py --onnx ... --out ... --quantized-dataset dataset.txt
-
-校准集（--dataset）是每行一个图片路径的文本文件，建议 100–300 张，覆盖真实场景
-（白天/夜间、不同高度、有无小目标）。小目标对量化误差非常敏感，**务必复测 AP_small**。
-"""
+"""RKNN 转换：ONNX → .rknn（Rockchip RK3588 NPU）。"""
 
 from __future__ import annotations
 
@@ -43,7 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -51,7 +17,6 @@ try:
 except Exception:
     pass
 
-# 支持的 SoC：决定 NPU 的算子支持与量化策略
 TARGETS = ("rk3588", "rk3588s", "rk3568", "rk3566", "rk3562", "rk3576")
 
 DEPLOY_SCHEMA = "todrt.deploy/v1"
@@ -126,8 +91,6 @@ def convert(args) -> Path:
         print("[RKNN] 归一化将烧进模型 → C++ 侧前处理必须给 uint8 原始像素"
               "（部署配置 preprocess.output=\"uint8\", layout=\"nhwc\"）")
 
-    # config：mean_values/std_values 会被写进模型输入端，推理时 toolkit 期望你给
-    # "原始像素"（0–255 的 uint8）。这与 todrt 的 preprocess.output=uint8 是一对。
     rknn.config(
         mean_values=[mean],
         std_values=[std],
@@ -166,11 +129,7 @@ def convert(args) -> Path:
 
 
 def patch_deploy_config(args, rknn_path: Path) -> None:
-    """把部署配置改成 RKNN 路径。
-
-    关键点：engine.path 指向 .rknn，preprocess 切成 uint8 + nhwc。
-    这两处必须一起改 —— 只改一边就是"双重归一化"或"dtype 不匹配"。
-    """
+    """把部署配置改成 RKNN 路径。"""
     cfg_path = args.deploy_config
     if not cfg_path.is_file():
         raise SystemExit(f"部署配置不存在：{cfg_path}（先用 tools/export_onnx.py --deploy-config 生成）")
@@ -178,14 +137,13 @@ def patch_deploy_config(args, rknn_path: Path) -> None:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg["schema"] = cfg.get("schema", DEPLOY_SCHEMA)
 
-    # 后端选择：builder 决定走哪个运行时
     cfg["builder"] = "rknn"
     if args.model_name:
         cfg["model"] = args.model_name
 
     engine = cfg.setdefault("engine", {})
-    engine["path"] = str(rknn_path)          # .rknn 作为"引擎产物"
-    engine["serialize_out"] = ""             # .rknn 不需要再序列化
+    engine["path"] = str(rknn_path)
+    engine["serialize_out"] = ""
 
     hardware = cfg.setdefault("hardware", {})
     hardware["device"] = "npu"
@@ -199,7 +157,6 @@ def patch_deploy_config(args, rknn_path: Path) -> None:
     cfg["rknn"]["core_num"] = 1 if args.single_core else max(1, args.core_num)
     cfg["rknn"]["dequantize_output"] = True
 
-    # ★ 与转换参数成对的前处理设置
     pre = cfg.setdefault("preprocess", {})
     if args.no_quantize:
         pre["output"] = "float32"

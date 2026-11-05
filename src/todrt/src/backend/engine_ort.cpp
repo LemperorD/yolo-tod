@@ -1,17 +1,3 @@
-// engine_ort.cpp —— ONNX Runtime 后端
-//
-// 定位：**通用 CPU 后路**。典型场景是 AMD x86 主机（无 NVIDIA GPU、无 NPU），
-// 以及作为 NPU/GPU 的对照基线 —— 同一份部署配置换个 builder（`"builder": "ort"`）
-// 就能跑，便于回答"加速器到底快多少、精度掉多少"。
-//
-// 设计要点：
-//   1. **EP 只是配置**：cpu / cuda / tensorrt / openvino / xnnpack / acl 都走同一份
-//      代码，靠 SessionOptionsAppendExecutionProvider_* 切换。新增 EP 不需要动架构。
-//   2. **EP 不可用要能看见**：默认按"可用则用、不可用则退回 CPU"处理，但每次都打
-//      warn（"你以为在用 GPU，其实在跑 CPU" 是最常见的部署错觉）。配
-//      `ort_disable_cpu_fallback` 可以在 EP 不可用时直接失败。
-//   3. **动态 shape 按输入尺寸重建输入张量**：ORT 的输入形状可以带 -1，Run 时按实际
-//      H/W 构造 Ort::Value；输出形状每次 Run 后重新查询（RunnerDetector 会据此分配）。
 #include "todrt/backend/ort_factory.hpp"
 
 #if TODRT_HAVE_ORT
@@ -35,7 +21,6 @@
 namespace todrt {
 namespace {
 
-/// 环境是进程级的：Ort::Env 允许每进程一个，重复创建会报警。
 Ort::Env& OrtEnv() {
   static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "todrt");
   return env;
@@ -62,14 +47,12 @@ GraphOptimizationLevel parse_opt_level(const std::string& s) {
   return GraphOptimizationLevel::ORT_ENABLE_ALL;
 }
 
-/// 把 C++ API 的例外转成我们的错误（不然只有一句 "Exception occurred"）。
 std::string ort_error(const Ort::Exception& e) {
   std::ostringstream oss;
   oss << "ONNX Runtime 错误：" << e.what() << "（code=" << e.GetOrtErrorCode() << "）";
   return oss.str();
 }
 
-/// ONNX Runtime 引擎。
 class OrtRunner : public IEngineRunner {
  public:
   ~OrtRunner() override = default;
@@ -124,8 +107,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
     fail(ort_error(e));
   }
 
-  // ---- 执行提供者 ----
-  // 顺序：用户指定 > auto（cuda → tensorrt → openvino → cpu）
   const std::string want = lower_compact(cfg.ort_provider);
   std::vector<std::string> order;
   if (want.empty() || want == "auto") {
@@ -144,7 +125,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
         provider_used_ = "CUDA";
         provider_ok = true;
       } else if (p == "tensorrt") {
-        // TRT EP 的参数结构各版本差异较大，用默认值 + 显式 cache 选项
         OrtTensorRTProviderOptions trt{};
         trt.device_id = 0;
         so.AppendExecutionProvider_TensorRT(trt);
@@ -155,18 +135,16 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
         provider_used_ = "OpenVINO";
         provider_ok = true;
       } else if (p == "xnnpack") {
-        // XNNPACK 在 ARM/x86 上都有优化；ORT 1.12+ 提供
         so.AppendExecutionProvider("XNNPACK");
         provider_used_ = "XNNPACK";
         provider_ok = true;
       } else if (p == "acl") {
-        // Arm Compute Library EP（仅 aarch64 构建的 ORT 带）
         so.AppendExecutionProvider("ACL");
         provider_used_ = "ACL";
         provider_ok = true;
       } else if (p == "cpu") {
         provider_used_ = "CPU";
-        provider_ok = true;  // CPU 永远可用
+        provider_ok = true;
       } else {
         fail("未知的 ONNX Runtime 执行提供者：" + cfg.ort_provider +
              "（可选 auto/cpu/cuda/tensorrt/openvino/xnnpack/acl）");
@@ -193,7 +171,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
     log_warn("请求的 EP 是 " + cfg.ort_provider + "，实际在用 CPU —— 延迟数字会明显偏高。");
   }
 
-  // ---- 建会话 ----
   try {
 #if defined(_WIN32)
     std::wstring wpath(cfg.onnx_path.begin(), cfg.onnx_path.end());
@@ -209,7 +186,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
 
   Ort::AllocatorWithDefaultOptions alloc;
 
-  // ---- 输入 ----
   const size_t n_in = session_->GetInputCount();
   if (n_in < 1) fail("ONNX 模型没有输入");
   if (n_in > 1) {
@@ -227,7 +203,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
     const auto info = ti.GetTensorTypeAndShapeInfo();
     input_is_uint8_ = (info.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8);
     const std::vector<int64_t> shape = info.GetShape();
-    // 典型 NCHW: [N, 3, H, W]
     if (shape.size() == 4) {
       spec_.height = shape[2] > 0 ? static_cast<int>(shape[2]) : 640;
       spec_.width = shape[3] > 0 ? static_cast<int>(shape[3]) : 640;
@@ -247,10 +222,9 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
     } else {
       spec_.output = PreprocOutput::kFloat32;
     }
-    spec_.layout = TensorLayout::kNchw;  // ONNX 检测模型默认 NCHW
+    spec_.layout = TensorLayout::kNchw;
   }
 
-  // ---- 输出 ----
   const size_t n_out = session_->GetOutputCount();
   if (n_out < 1) fail("ONNX 模型没有输出");
   for (size_t i = 0; i < n_out; ++i) {
@@ -262,7 +236,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
     const Ort::TypeInfo ti = session_->GetOutputTypeInfo(i);
     const auto info = ti.GetTensorTypeAndShapeInfo();
     const ONNXTensorElementDataType t = info.GetElementType();
-    // 通用外壳只接受 float32；非 float 输出在此声明出来，Run 时会做转换
     out_types_extra_.push_back(t == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ? DataType::kF32
                                                                         : DataType::kF32);
     const std::vector<int64_t> shape = info.GetShape();
@@ -274,7 +247,6 @@ void OrtRunner::Init(const BuildConfig& cfg, std::string* err) {
 
 std::vector<std::vector<int64_t>> OrtRunner::output_shapes() const {
   if (!session_) return {};
-  // 动态 shape：每次重新查询（Run 之后形状才确定）
   std::vector<std::vector<int64_t>> shapes;
   shapes.reserve(output_names_.size());
   for (size_t i = 0; i < output_names_.size(); ++i) {
@@ -291,7 +263,6 @@ void OrtRunner::Run(const void* input, size_t input_bytes, int batch,
 
   const auto t0 = std::chrono::steady_clock::now();
 
-  // 输入张量：按实际尺寸构造（动态 shape 时形状来自本次前处理）
   const size_t elem = input_is_uint8_ ? 1u : sizeof(float);
   const size_t per_sample = input_bytes / static_cast<size_t>(std::max(1, batch));
   const size_t hw = per_sample / (3u * elem);
@@ -358,8 +329,6 @@ std::string OrtRunner::engine_info() const {
   return oss.str();
 }
 
-// ------------------------------------------------------------------ 装配
-
 std::unique_ptr<Detector> BuildOrtDetector(const std::string& model_name, DetectorOptions o,
                                            const std::string& preproc_name,
                                            const std::string& postproc_name) {
@@ -385,7 +354,6 @@ std::unique_ptr<Detector> BuildOrtDetector(const std::string& model_name, Detect
       new RunnerDetector(model_name, o, std::move(runner), std::move(pre), std::move(post)));
 }
 
-/// IModelBuilder 适配（供工厂清单 / dry-run 报告可用性）。
 class OrtModelBuilder : public IModelBuilder {
  public:
   const std::string& name() const override { return name_; }
@@ -446,7 +414,7 @@ std::unique_ptr<IModelBuilder> MakeOrtBuilder() {
   return std::unique_ptr<IModelBuilder>(new OrtModelBuilder());
 }
 
-}  // namespace
+}
 
 TOD_RT_REGISTER_BUILDER(ort, MakeOrtBuilder)
 TOD_RT_REGISTER_BUILDER(onnxruntime, MakeOrtBuilder)
@@ -462,13 +430,12 @@ std::unique_ptr<Detector> CreateOrtDetector(const std::string& model_name,
   if (o.device == Device::kCpu || o.device == Device::kAuto) {
     o.device = Device::kCpu;
   } else {
-    // 允许 gpu（CUDA EP）等：真正决定路径的是 ort_provider
     log_info(std::string("ORT builder + device=") + to_string(o.device) +
              "：实际执行路径由 ort_provider 决定。");
   }
   return BuildOrtDetector(model_name, o, preproc_name, postproc_name);
 }
 
-}  // namespace todrt
+}
 
-#endif  // TODRT_HAVE_ORT
+#endif

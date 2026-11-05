@@ -1,13 +1,4 @@
-"""生成 docs/VARIANTS.md（模块总表）。
-
-用法::
-
-    python3 tools/catalog.py            # 打印到标准输出
-    python3 tools/catalog.py --write    # 写入 docs/VARIANTS.md
-
-为什么不用 ``python -m tod.registry``：包 __init__ 已导入该子模块，
-runpy 会抛 RuntimeWarning，输出不干净。
-"""
+"""生成 docs/VARIANTS.md（模块总表）。"""
 
 from __future__ import annotations
 
@@ -18,7 +9,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -30,10 +20,7 @@ from tod.registry import catalog  # noqa: E402
 
 
 def import_modules() -> None:
-    """导入模块库以触发注册。
-
-    模块文件依赖 torch；环境未就绪时总表会缺条目（这是环境问题，不是 bug）。
-    """
+    """导入模块库以触发注册。"""
     try:
         import tod
 

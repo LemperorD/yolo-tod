@@ -1,4 +1,3 @@
-﻿// json.cpp —— 极简 JSON 解析/序列化（宽容注释与尾随逗号）
 #include "todrt/json.hpp"
 
 #include <cmath>
@@ -12,7 +11,6 @@ namespace todrt::json {
 namespace {
 const Value kNull;
 
-/// 把数字转成最短往返表示（配置文件的键值要能被人读）。
 std::string num_to_string(double v) {
   if (std::isfinite(v) && v == static_cast<double>(static_cast<int64_t>(v)) &&
       std::abs(v) < 1e15) {
@@ -45,9 +43,7 @@ std::string escape(const std::string& s) {
   }
   return o;
 }
-}  // namespace
-
-// ------------------------------------------------------------------ 取值
+}
 
 bool Value::as_bool(bool def) const {
   switch (type_) {
@@ -65,7 +61,6 @@ double Value::as_double(double def) const {
   if (type_ == Type::kNumber) return num_;
   if (type_ == Type::kBool) return bool_ ? 1.0 : 0.0;
   if (type_ == Type::kString) {
-    // 容忍 "0.25" 这种字符串数字
     char* end = nullptr;
     const double v = std::strtod(str_.c_str(), &end);
     if (end && end != str_.c_str() && *end == '\0') return v;
@@ -128,8 +123,6 @@ bool Value::contains(const std::string& key) const {
 
 const Value& Value::null_value() { return kNull; }
 
-// ------------------------------------------------------------------ 序列化
-
 std::string Value::dump(bool pretty, int indent) const {
   const std::string pad(pretty ? static_cast<size_t>(indent) * 2 : 0, ' ');
   const std::string pad_in(pretty ? (static_cast<size_t>(indent) + 1) * 2 : 0, ' ');
@@ -167,8 +160,6 @@ std::string Value::dump(bool pretty, int indent) const {
   }
   return "null";
 }
-
-// ------------------------------------------------------------------ 解析
 
 namespace {
 
@@ -268,7 +259,7 @@ class Parser {
     }
     while (true) {
       SkipWs();
-      if (Peek() == '}') {  // 容忍尾随逗号
+      if (Peek() == '}') {
         ++pos_;
         break;
       }
@@ -302,7 +293,7 @@ class Parser {
     }
     while (true) {
       SkipWs();
-      if (Peek() == ']') {  // 容忍尾随逗号
+      if (Peek() == ']') {
         ++pos_;
         break;
       }
@@ -360,7 +351,6 @@ class Parser {
               Fail("非法十六进制字符");
             }
           }
-          // UTF-8 编码（不处理代理对：配置文件里不会出现）
           if (code < 0x80) {
             out.push_back(static_cast<char>(code));
           } else if (code < 0x800) {
@@ -399,7 +389,7 @@ class Parser {
   }
 };
 
-}  // namespace
+}
 
 Value parse(const std::string& text) { return Parser(text).ParseDocument(); }
 
@@ -415,4 +405,4 @@ Value parse_file(const std::string& path) {
   }
 }
 
-}  // namespace todrt::json
+}

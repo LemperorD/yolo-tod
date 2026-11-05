@@ -1,32 +1,4 @@
-"""姿态关键点评测（EP8 口径）：OKS-AP 50:95 + 按**目标尺度**与**关键点尺度**分层。
-
-**为什么必须单独一个评测模块**（PLAN §7.2 的同一条理由，在关键点上更严重）：
-    目标检测里"小目标退化"表现为 AP_small 掉点；关键点检测里还有第二层掩盖：
-    **OKS 的分母含框面积**，同一个 3 px 的定位误差，在大目标上 OKS≈0.95、
-    在 6 px 小人上 OKS≈0.2。于是"整体 OKS-AP 涨了"完全可能对应"小目标关键点全废"。
-    只报一个总体 OKS-AP，和只看整体 mAP 一样，会把退化看成没发生。
-
-本模块固定同时给出四组数字（全部 101 点插值 AP，口径与 ``tod.eval.scales`` 一致）：
-
-    ==========================  ==========================================================
-    指标                         含义
-    ==========================  ==========================================================
-    OKS-AP / OKS-AP50            COCO sigma 口径（与框架 validator / COCO 可横向对比）
-    OKS-AP@自定义 sigma           本库 EP7 训练时用的 sigma 口径（应与训练目标一致）
-    按**目标边长**分层             <8 / 8-16 / 16-32 / 32-96 / ≥96 px 的目标各自的 OKS-AP
-    按**关键点尺度**分层           逐点统计：每个点落在哪个尺度桶里，各自的 <1e-5 命中率
-    ==========================  ==========================================================
-
-**匹配规则（刻意与 COCO 不同，必须知道）**：COCO keypoints 评测把 OKS 同时当作匹配
-准则；本模块沿用 ``tod.eval.scales`` 的**按框 IoU 匹配**（阈值可调，默认 0.5），
-再对匹配上的预测/GT 对计算 OKS。理由有两条：
-  1. 只有一个匹配口径时，框的 AP 与关键点的 AP 可以直接对比（差多少是"关键点带来的额外
-     损失"）；COCO 的 OKS 匹配会把"框对但点偏"的预测直接判为 FP，与框指标不可比；
-  2. 小目标上 OKS 匹配阈值本身极难标定（见上），用它当匹配准则会让 AP 对 σ 的选择
-     高度敏感 —— 那正是我们要**测量**的量，不该混进匹配里。
-
-因此本模块报出的 OKS-AP **不等于** COCO keypoints AP，变体卡片里必须写清口径。
-"""
+"""姿态关键点评测（EP8 口径）：OKS-AP 50:95 + 按**目标尺度**与**关键点尺度**分层。"""
 
 from __future__ import annotations
 
@@ -44,28 +16,13 @@ from tod.eval.scales import (
 )
 from tod.loss.pose import COCO_SIGMA_17, sigma_tensor
 
-#: 单点定位误差低于该像素数视为命中（关键点尺度的诊断指标）。
 KPX_HIT_PX = 1.0
-
-
-# ------------------------------------------------------------------ 标签 / 预测
 
 
 def load_pose_labels(image: Path, img_w: int, img_h: int,
                      kpt_shape: Sequence[int] = (17, 3)
                      ) -> tuple[list[float], list[int], list[list[list[float]]]]:
-    """读一张 YOLO-pose 标签 → ``(boxes_xyxy, classes, keypoints)`。
-
-    Args:
-        image: 图像路径（标签路径按 ultralytics 约定由 ``/images/`` → ``/labels/`` 推出）。
-        img_w, img_h: 图像尺寸（关键点坐标是归一化的，需要还原到像素）。
-        kpt_shape: ``(n_kpt, n_dim)``；``n_dim=3`` 时第三维是可见性。
-
-    Returns:
-        ``(boxes, classes, kpts)``：``boxes`` 是扁平像素 xyxy，``classes`` 与之等长，
-        ``kpts[i]`` 是第 i 个目标的 ``[[x, y, vis], ...]``（像素坐标）。
-        第三维缺失（``n_dim=2``）时 ``vis`` 记为 1。
-    """
+    """读一张 YOLO-pose 标签 → ``(boxes_xyxy, classes, keypoints)`。"""
     n_kpt, n_dim = int(kpt_shape[0]), int(kpt_shape[1])
     path = label_path_for(image)
     boxes: list[float] = []
@@ -92,7 +49,6 @@ def load_pose_labels(image: Path, img_w: int, img_h: int,
             x = chunk[0] * img_w
             y = chunk[1] * img_h
             if n_dim >= 3 and len(chunk) >= 3:
-                # vis 保持原始值（0=未标注，1/2=可见），与训练侧掩码规则一致
                 row.append([x, y, float(chunk[2])])
             else:
                 row.append([x, y, 1.0])
@@ -102,18 +58,7 @@ def load_pose_labels(image: Path, img_w: int, img_h: int,
 
 def oks(pred_kpts: Sequence[Sequence[float]], gt_kpts: Sequence[Sequence[float]],
         box_xyxy: Sequence[float], sigmas: Sequence[float]) -> float:
-    """Object Keypoint Similarity（COCO 口径，逐点可见性掩码）。
-
-        OKS = Σ_k exp(−d_k² / (2·s²·σ_k²)) · δ(v_k>0) / Σ_k δ(v_k>0)
-
-    其中 ``s²`` 用 GT **框面积**（px²，COCO 为保持稳定取 max(area, 1)），
-    ``d_k`` 是预测点与 GT 点的欧氏距离（px）。返回 ``nan`` 表示该目标没有任何
-    有效关键点（COCO 里这种目标对 AP 无贡献，本模块按 nan 剔除）。
-
-    本函数与 ``tod.loss.pose.TinyPoseLoss`` 的损失式**同源**：损失是
-    ``1 − exp(−e)``（归一化坐标 + 平方距离），本函数是指标形式（像素坐标 + 面积）。
-    一一对应关系见 variants/visdrone-yolo26n-pose-p2-p16/paper-notes.md。
-    """
+    """Object Keypoint Similarity（COCO 口径，逐点可见性掩码）。"""
     area = max(1.0, (box_xyxy[2] - box_xyxy[0]) * (box_xyxy[3] - box_xyxy[1]))
     total = 0.0
     n_valid = 0
@@ -123,7 +68,7 @@ def oks(pred_kpts: Sequence[Sequence[float]], gt_kpts: Sequence[Sequence[float]]
         px, py = float(point[0]), float(point[1])
         gx, gy = gt_kpts[k][0], gt_kpts[k][1]
         vis = gt_kpts[k][2] if len(gt_kpts[k]) > 2 else 1.0
-        if vis <= 0:                       # 未标注的点不参与（与训练侧掩码一致）
+        if vis <= 0:
             continue
         sigma = float(sigmas[k]) if k < len(sigmas) else float(sigmas[-1])
         d2 = (px - gx) ** 2 + (py - gy) ** 2
@@ -134,10 +79,7 @@ def oks(pred_kpts: Sequence[Sequence[float]], gt_kpts: Sequence[Sequence[float]]
 
 def keypoint_predictor(model: Any, imgsz: int, conf: float, iou: float,
                        device: Any = None, max_det: int = 300):
-    """把 ultralytics 姿态模型包成 ``(image_path) -> [(cls, conf, xyxy, kpts)]``。
-
-    ``kpts`` 是**像素坐标**的 ``[[x, y], ...]``（可视化与 OKS 都用它）。
-    """
+    """把 ultralytics 姿态模型包成 ``(image_path) -> [(cls, conf, xyxy, kpts)]``。"""
     def predict(image: Path):
         result = model.predict(str(image), imgsz=imgsz, conf=conf, iou=iou,
                                device=device, max_det=max_det, verbose=False)[0]
@@ -148,22 +90,7 @@ def keypoint_predictor(model: Any, imgsz: int, conf: float, iou: float,
 
 def match_pose_image(preds: list[tuple], gts: list[dict], iou_thr: float
                      ) -> list[tuple[int, float, int, int]]:
-    """姿态用的按类贪心匹配（单图）—— 与 ``scales.match_image`` 同一套规则。
-
-    **为什么不复用 ``scales.match_image``**：它只吃 ``(cls, conf, xyxy)`` 三元组，
-    而姿态预测是四元组（多一个关键点），解包会直接
-    ``ValueError: too many values to unpack``。更重要的是：本函数**直接返回预测的下标**，
-    调用方不必再靠"类别 + 置信度"去反查预测（置信度可能重复，反查是脆的）。
-
-    Args:
-        preds: ``[(cls, conf, xyxy, kpts), ...]``。
-        gts: ``[{"cls":…, "box":…, "side":…, "kpts":…}, ...]``。
-        iou_thr: 匹配用的框 IoU 阈值（**不是** OKS 阈值，见模块 docstring）。
-
-    Returns:
-        ``[(cls, conf, gt_index, pred_index), ...]``（按置信度降序）；
-        ``gt_index == -1`` 表示未匹配（FP）。
-    """
+    """姿态用的按类贪心匹配（单图）—— 与 ``scales.match_image`` 同一套规则。"""
     from tod.eval.scales import iou_xyxy
 
     order = sorted(range(len(preds)), key=lambda i: -preds[i][1])
@@ -185,11 +112,7 @@ def match_pose_image(preds: list[tuple], gts: list[dict], iou_thr: float
 
 
 def extract_pose_preds(result: Any) -> list[tuple[int, float, list[float], list[list[float]]]]:
-    """从 ultralytics 的 ``Results`` 取出 ``[(cls, conf, xyxy, kpts_px)]``。
-
-    关键点是 Results 里的公共契约（``result.keypoints.xy``），比读原始输出张量的
-    形状更稳（Pose / Pose26 / NMS-free 三种后处理路径的张量布局并不相同）。
-    """
+    """从 ultralytics 的 ``Results`` 取出 ``[(cls, conf, xyxy, kpts_px)]``。"""
     boxes = getattr(result, "boxes", None)
     kpts = getattr(result, "keypoints", None)
     if boxes is None or len(boxes) == 0 or kpts is None:
@@ -197,7 +120,7 @@ def extract_pose_preds(result: Any) -> list[tuple[int, float, list[float], list[
     xyxy = boxes.xyxy.cpu().tolist()
     cls = boxes.cls.cpu().tolist()
     scores = boxes.conf.cpu().tolist()
-    points = kpts.xy.cpu().tolist()          # (n, K, 2) 已是原图像素坐标
+    points = kpts.xy.cpu().tolist()
     return [(int(c), float(s), [float(v) for v in b], [[float(x), float(y)] for x, y in k])
             for c, s, b, k in zip(cls, scores, xyxy, points)]
 
@@ -212,9 +135,6 @@ def default_pose_predictor(weights: str | Path, imgsz: int, conf: float, iou: fl
 
     model = YOLO(str(weights), task="pose")
     return keypoint_predictor(model, imgsz, conf, iou, device, max_det), model
-
-
-# ------------------------------------------------------------------ 主流程
 
 
 def evaluate_pose(
@@ -233,18 +153,7 @@ def evaluate_pose(
     max_images: int | None = None,
     verbose: bool = True,
 ) -> dict:
-    """在 ``data_yaml`` 的 ``split`` 上做姿态分层评测。
-
-    Args:
-        match_iou: **匹配**用的框 IoU 阈值（与 OKS 无关，见模块 docstring 的匹配规则）。
-        sigma_strategy: 第二套 sigma 口径（``person``/``auto``/``balanced``），
-            一般填与 EP7 训练时一致的策略，用来衡量"训练目标与评测目标是否对齐"。
-        max_images: 只评测前 N 张（自检/冒烟用）。
-
-    Returns:
-        ``{bins, overall, bins_custom, overall_custom, kpt_scale, meta}``，
-        每项含 ``oks_ap`` / ``oks_ap50`` / ``oks50``（OKS≥0.5 的命中率）/ ``n_gt`` / ``n_pred``。
-    """
+    """在 ``data_yaml`` 的 ``split`` 上做姿态分层评测。"""
     from PIL import Image
 
     from tod.compat import load_yaml
@@ -274,10 +183,9 @@ def evaluate_pose(
     else:
         custom, custom_note = sigma_tensor(kpt_shape, strategy=sigma_strategy)
         custom = [float(v) for v in custom.tolist()]
-        sigmas = list(custom)                 # 非 17 点没有 COCO 标准值，两套口径合一
+        sigmas = list(custom)
         custom_note += "（非 17 点：COCO 口径不可用，两套指标相同）"
 
-    # ---- 论文的 ADD / ADD(0.5d) 所需：6D 位姿 + 相机内参 + 机体 3D 点（有则算）----
     tod = data_cfg.get("tod") or {}
     K = tod.get("camera_matrix")
     obj_pts = tod.get("object_points")
@@ -308,7 +216,6 @@ def evaluate_pose(
         collected.append({"image": image, "gts": gts, "preds": list(predictor(image)),
                           "poses": pose_table.get(image.stem, [])})
 
-    # ---- 主循环：整体 + 各尺度层，两套 sigma 口径 ----
     bins_std: dict[str, dict[str, float]] = {}
     bins_custom: dict[str, dict[str, float]] = {}
     same_sigma = list(custom) == list(sigmas)
@@ -317,7 +224,6 @@ def evaluate_pose(
         bins_custom[bin_spec.name] = (bins_std[bin_spec.name] if same_sigma
                                       else _accumulate(collected, bin_spec, custom, match_iou))
 
-    # ---- 关键点尺度诊断（只统计"匹配上的目标对"的逐点误差）----
     kpt_scale: dict[str, dict[str, float]] = {
         b.name: {"n": 0.0, "hit": 0.0, "err_px_sum": 0.0, "oks_sum": 0.0, "oks_n": 0.0}
         for b in bins
@@ -360,7 +266,6 @@ def evaluate_pose(
             "note": "OKS-AP 用框 IoU 匹配（非 COCO 的 OKS 匹配），与 COCO keypoints AP 不可直接比较",
         },
     }
-    # ---- 论文的 ADD / ADD(0.5d)（有 6D 位姿时才算）----
     add_stats: dict[str, Any] = {"available": False}
     if pose_table and K and obj_pts:
         add_stats = _add_stats(collected, K, obj_pts, diameter)
@@ -375,7 +280,7 @@ def _add_stats(collected: list[dict], K, obj_pts, diameter) -> dict[str, Any]:
     values: list[float] = []
     per_bin: dict[str, list[float]] = {}
     n_skip = 0
-    bins = dataset_bins({"tod": {}})                     # 默认分层（与其它表一致）
+    bins = dataset_bins({"tod": {}})
     for item in collected:
         poses = item.get("poses") or []
         gts = item["gts"]
@@ -420,7 +325,6 @@ def _accumulate(collected: list[dict], bin_spec: Bin, sigmas: Sequence[float],
                 match_iou: float) -> dict[str, float]:
     """在一个尺度层内累计 OKS-AP（按类别算 AP 再取平均，与 scales.py 同规则）。"""
     n_gt_per_class: dict[int, int] = {}
-    #: cls → [(oks_value, conf), ...]（按 conf 降序后，以 oks>=thr 判 TP）
     records: dict[int, list[tuple[float, float]]] = {}
     n_pred = 0
 
@@ -433,7 +337,7 @@ def _accumulate(collected: list[dict], bin_spec: Bin, sigmas: Sequence[float],
         for cls, conf_v, gt_index, pred_index in match_pose_image(item["preds"], gts, match_iou):
             n_pred += 1
             if gt_index != -1 and gt_index not in in_bin:
-                continue                     # 命中本层之外的 GT → ignore（COCO 语义）
+                continue
             if gt_index < 0:
                 records.setdefault(cls, []).append((0.0, conf_v))
                 continue
@@ -452,7 +356,7 @@ def _accumulate(collected: list[dict], bin_spec: Bin, sigmas: Sequence[float],
             continue
         recs = sorted(records.get(cls, []), key=lambda r: -r[1])
         per_thr = []
-        for thr in IOU_THRESHOLDS:           # 复用同一组阈值：0.50, 0.55, …, 0.95
+        for thr in IOU_THRESHOLDS:
             tp = [r[0] >= thr for r in recs]
             fp = [not t for t in tp]
             per_thr.append(average_precision(tp, fp, n_gt))
@@ -544,9 +448,6 @@ def _fmt(value: float) -> str:
     return "nan" if value is None or math.isnan(value) else f"{value:.4f}"
 
 
-# ------------------------------------------------------------------ 论文指标（ADD）
-
-#: 论文（Keypoint-Guided, T-RO 2024 §IV-A-3）的 ADD 判据：ADD < 50% × 机型直径。
 ADD_THRESHOLD_RATIO = 0.5
 
 
@@ -554,34 +455,7 @@ def add_metric(pred_kpts_px: Sequence[Sequence[float]],
                gt_kpts_px: Sequence[Sequence[float]],
                depth_m: float,
                K: Sequence[Sequence[float]]) -> float:
-    """按论文式 (13) 的口径算 **ADD**（米）：真值 3D 关键点与预测 3D 关键点的平均距离。
-
-    论文的 ADD 需要先把预测的 2D 关键点做 PnP 估出位姿 ``R̃, t̃``，再算
-    ``mean_p ‖(R p + t) − (R̃ p + t̃)‖``。**本库不做 PnP**，改用等价而更直接的做法：
-
-    每个关键点在相机系下的位置是 ``p_c = p_o + d·u``（``u`` 是相机射线方向，
-    ``d`` 是该点的深度）。因此同一个关键点的"真值 vs 预测"之差**与深度无关**：
-
-        ‖p_c^gt − p_c^pred‖ = d · ‖u^gt − u^pred‖
-
-    于是 ``ADD = mean_i[ d_i · ‖u_i^gt − u_i^pred‖ ]``。
-    其中 ``d_i`` 用**真值深度**（由 6D 位姿与机体 3D 点算出）—— 这也是它相对纯像素
-    误差的价值所在：**同样的像素误差，远处的目标 ADD 更大**，正好符合"深度越大、
-    同一像素对应的物理偏差越大"的直觉。
-
-    [!] **口径差异（引用前必读）**：论文的 ADD 含"PnP 估计位姿"这一步，本函数没有。
-    所以本库的 ADD 是"关键点层面的 3D 误差"，**不是**位姿层面的 ADD，两者不可直接比较。
-    变体卡片与论文数字对比时必须写清这一点。
-
-    Args:
-        pred_kpts_px: ``(n_kpt, 2)`` 预测关键点像素坐标。
-        gt_kpts_px: ``(n_kpt, 2)`` 真值关键点像素坐标。
-        depth_m: 各关键点的真值深度（米）；标量或长度 ``n_kpt`` 的序列。
-        K: 3×3 相机内参。
-
-    Returns:
-        ADD（米）；无有效点时返回 ``nan``。
-    """
+    """按论文式 (13) 的口径算 **ADD**（米）：真值 3D 关键点与预测 3D 关键点的平均距离。"""
     fx, fy = float(K[0][0]), float(K[1][1])
     cx, cy = float(K[0][2]), float(K[1][2])
     if not fx or not fy:
@@ -600,10 +474,7 @@ def add_metric(pred_kpts_px: Sequence[Sequence[float]],
 
 def gt_depths(pose_row: Sequence[float], object_points: Sequence[Sequence[float]],
               K: Sequence[Sequence[float]]) -> list[float]:
-    """由一帧 6D 位姿 ``(tx,ty,tz,qx,qy,qz,qw)`` 与机体 3D 点算出各关键点的**相机系深度**。
-
-    这是 ``add_metric`` 需要的 ``d_i``（也是论文式 (8) 里 ``p_i^c`` 的 z 分量）。
-    """
+    """由一帧 6D 位姿 ``(tx,ty,tz,qx,qy,qz,qw)`` 与机体 3D 点算出各关键点的**相机系深度**。"""
     if len(pose_row) < 7:
         raise ValueError(f"位姿需要 7 个数 (t + 四元数)，收到 {len(pose_row)}")
     R = _quat_to_rot(list(pose_row[3:7]))
@@ -632,20 +503,12 @@ def evaluate_pose_ap(*args: Any, **kwargs: Any) -> dict:
     return evaluate_pose(*args, **kwargs)
 
 
-# ------------------------------------------------------ 论文的位姿层面指标（PnP）
-
-#: 10°10cm 判据（论文式 14/15）：旋转误差 < 10° 且平移误差 < 10 cm。
 ROT_THRESHOLD_DEG = 10.0
 TRANS_THRESHOLD_M = 0.10
 
 
 def _numpy():
-    """延迟导入 numpy。
-
-    为什么不在模块顶部导入：本模块的 OKS/ADD/10°10cm 核心计算是纯 Python，
-    只有 PnP 需要 numpy+cv2。让"没装 numpy 也能评测 OKS"成为可能
-    （`tests/test_pose.py` 里的纯数值断言就靠这个）。
-    """
+    """延迟导入 numpy。"""
     try:
         import numpy as np
     except ImportError as exc:  # pragma: no cover
@@ -655,16 +518,13 @@ def _numpy():
 
 def rotation_error_deg(R_pred: Sequence[Sequence[float]],
                        R_gt: Sequence[Sequence[float]]) -> float:
-    """论文式 (14)：``arccos((trace(R̃·Rᵀ) − 1)/2)``（返回**度**）。
-
-    数值保护：``trace`` 会因浮点误差略微越界，直接 ``acos`` 会得到 nan。
-    """
+    """论文式 (14)：``arccos((trace(R̃·Rᵀ) − 1)/2)``（返回**度**）。"""
     a = [[float(v) for v in row] for row in R_pred]
     b = [[float(v) for v in row] for row in R_gt]
     tr = 0.0
     for i in range(3):
         for k in range(3):
-            tr += a[i][k] * b[i][k]          # trace(A·Bᵀ)
+            tr += a[i][k] * b[i][k]
     cos_t = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
     return math.degrees(math.acos(cos_t))
 
@@ -683,11 +543,7 @@ def pose_to_rt(pose_row: Sequence[float]) -> tuple[list[list[float]], list[float
 
 def add_pose_metric(R_pred, t_pred, object_points: Sequence[Sequence[float]],
                     R_gt, t_gt) -> float:
-    """论文式 (13) 的**原始形式**：``mean_p ‖(R̃p + t̃) − (Rp + t)‖₂``（米）。
-
-    与 ``add_metric``（关键点层面、用真值深度）不同，这里用的是 PnP 估出来的位姿，
-    **与论文完全同口径**，可直接比较。
-    """
+    """论文式 (13) 的**原始形式**：``mean_p ‖(R̃p + t̃) − (Rp + t)‖₂``（米）。"""
     total, n = 0.0, 0
     for p in object_points:
         a = [sum(R_pred[i][j] * p[j] for j in range(3)) + t_pred[i] for i in range(3)]
@@ -700,12 +556,7 @@ def add_pose_metric(R_pred, t_pred, object_points: Sequence[Sequence[float]],
 def solve_pnp(kpts_px: Sequence[Sequence[float]],
               object_points: Sequence[Sequence[float]],
               K: Sequence[Sequence[float]]):
-    """``cv2.solvePnP`` → ``(R, t, ok)``。
-
-    为什么把 ``ok`` 单独返回：PnP 会失败（点太少 / 共面退化 / 不收敛）。
-    失败帧**不能**算成"误差很大"，否则会把 ADD/10°10cm 拉飞；本库的做法是单独计数
-    （``n_pnp_failed``），与论文口径的差异在报告里写明。
-    """
+    """``cv2.solvePnP`` → ``(R, t, ok)``。"""
     try:
         import cv2
     except ImportError:
@@ -717,7 +568,7 @@ def solve_pnp(kpts_px: Sequence[Sequence[float]],
     try:
         ok, rvec, tvec = cv2.solvePnP(pts3d, pts2d, K_np, None,
                                       flags=cv2.SOLVEPNP_ITERATIVE)
-    except Exception:  # noqa: BLE001 - PnP 失败不应中断评测
+    except Exception:  # noqa: BLE001
         return None, None, False
     if not ok:
         return None, None, False

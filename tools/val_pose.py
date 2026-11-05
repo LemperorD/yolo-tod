@@ -1,37 +1,4 @@
-"""姿态评测入口：OKS-AP（整体 / 按目标尺度分层 / 按关键点尺度诊断）。
-
-**为什么不用 `yolo pose val`**：框架的 ``PoseValidator`` 只给一个总体
-``metrics.pose``（OKS-AP 50:95），拿不到"小目标层的关键点怎么样"。
-而本库的主战场是航拍小目标 —— OKS 的分母含框面积，小目标关键点的退化会被
-整体数字完全掩盖（详见 ``src/tod/eval/pose.py`` 的模块说明）。
-
-本入口固定同时输出三组东西：
-
-    1. 整体与**按目标边长分层**的 OKS-AP / OKS-AP50 / OKS≥0.5 命中率；
-    2. 同一套预测在**自定义 sigma** 口径下的 OKS-AP（衡量"训练目标与评测目标是否对齐"）；
-    3. **逐关键点尺度诊断**：每个尺度层的关键点平均误差（px）、≤1px 命中率、平均 OKS。
-
-用法::
-
-    # 真实权重评测（把 results.json 的 metrics 直接贴进变体卡片）
-    # --data 用注册表里的名字（configs/datasets.yaml），也接受数据集目录 / YAML 路径
-    python3 tools/val_pose.py \
-        --variant variants/visdrone-yolo26n-pose-p2-p16/variant.yaml \
-        --weights results/visdrone-yolo26n-pose-p2-p16/weights/best.pt \
-        --data visdrone2019-pose \
-        --imgsz 1024 --sigma-strategy person \
-        --json variants/visdrone-yolo26n-pose-p2-p16/results.json
-
-    # 合成数据冒烟（几秒钟）
-    python3 tools/val_pose.py --weights runs/x/weights/best.pt \
-        --data tests/.tmp/tiny-pose/dataset.yaml --max-images 4 --device cpu
-
-results.json 里带 git commit / 权重 mtime（PLAN §2.7），
-以及注册表解析出的 ``dataset_name / dataset_root``（换盘后仍可追溯读的是哪块盘）。
-
-[!] 口径提醒：本入口的 OKS-AP 用**框 IoU 匹配**（默认 0.5），不是 COCO 的 OKS 匹配，
-因此**不等于** COCO keypoints AP，两者不可直接比较。
-"""
+"""姿态评测入口：OKS-AP（整体 / 按目标尺度分层 / 按关键点尺度诊断）。"""
 
 from __future__ import annotations
 
@@ -45,7 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -59,7 +25,7 @@ def _git_commit() -> str:
         out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                              capture_output=True, text=True, timeout=10)
         return out.stdout.strip() if out.returncode == 0 else "unknown"
-    except Exception:  # noqa: BLE001 - 复现信息缺失不应中断评测
+    except Exception:  # noqa: BLE001
         return "unknown"
 
 
@@ -101,7 +67,6 @@ def main() -> int:
     if not args.weights.is_file():
         raise SystemExit(f"权重不存在：{args.weights}")
 
-    # 数据集位置与训练同源：注册表（configs/datasets.yaml）说了算
     try:
         paths = resolve(args.data, registry_path_hint=args.datasets,
                         data_root=args.data_root, splits=(args.split,))

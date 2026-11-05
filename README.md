@@ -1,21 +1,19 @@
 # yolo-tod —— 小目标检测魔改 YOLO 收集库
 
 收集、复现并**可归因地**对比针对小目标检测（Tiny/Small Object Detection）的 YOLO 魔改。
-完整方案见 [`PLAN.md`](PLAN.md)：架构设计、值得收录的魔改清单、优先级、评测协议。
+当前代码结构见 [架构文档](docs/ARCHITECTURE.md)，逐文件职责见 [代码文件索引](#代码文件索引)。
+研究选型、优先级与评测协议见 [PLAN.md](PLAN.md)，全流程命令见 [WORKFLOW.md](WORKFLOW.md)。
+面向无人机本体的新变体选型见 [RGB 目标无人机检测文献与复刻路线](docs/RGB_UAV_DETECTION_SURVEY.md)：55 项论文/方法，含抗干扰、小目标、视频和机体姿态。
 
-**当前状态：M0 骨架已完成（`tests/smoke.py` 77 项全绿，`tests/test_modules.py` 105 项全绿）；
-两个论文级变体已实现 —— SPAE-YOLOv8n 与 SDD-YOLO26n（结构自检全通）；
-**姿态式关键点检测（pose）已打通完整回路**（`tests/test_pose.py` 220 项全绿 +
-`tests/train_pose_smoke.py` 合成关键点数据真训练 32 项），已有两个姿态变体：
-`spae-yolov8n-pose`（**SPAE + 论文口径的 9 点机体关键点 + 3D 几何损失 L_rep**，
-面向 RflySim 仿真数据；预印本已存 `docs/`）与
-`visdrone-yolo26n-pose-p2-p16`（航拍行人 17 点，**数据集标注待准备**）；
-训练回路已用**合成数据**端到端跑通（`tests/train_smoke.py`：训练/验证/EMA/存权重/载权重/推理），
-并补齐了**尺度分层评测**（`tools/val.py`：整体 AP + AP_small/AP_tiny）、
-**姿态 OKS + ADD 分层评测**（`tools/val_pose.py`）、**关键点数据开训前校验**（`tools/check_pose_dataset.py`）与
-**消融流水线**（`tools/ablation.py`：leave-one-out + 逐字段 diff + 汇总表）。
-真实数据集上的精度数字待 M1。推理端（C++/TensorRT）工厂化骨架已落地：
-`src/todrt/`，CPU 自检 107 项全绿。**
+当前已实现检测变体 **SPAE-YOLOv8n / SDD-YOLO26n**，以及姿态变体
+**spae-yolov8n-pose / visdrone-yolo26n-pose-p2-p16**。训练端包含 9 点 UAV 几何监督、
+MAV6D 转换与训练入口、尺度分层 AP/OKS、ADD/PnP、开训前校验和消融流水线；
+另有合成数据的实际训练自检。航拍人体 17 点的真实标注仍待准备，真实数据集精度需独立验证。
+推理端 `src/todrt/` 提供工厂装配与四种可选后端。
+
+2026-10-29 注释与文档整理时，架构自检通过 77 项。当前本机环境使用 ultralytics 8.4.152，
+模块与姿态测试中的分配器 dtype / 损失返回值兼容失败在整理前源码上同样存在；
+本次整理保留原有执行逻辑，验证记录见 [架构文档](docs/ARCHITECTURE.md#6-验证与维护)。
 
 - 主干框架：**ultralytics**（AGPL-3.0；本库实测区间 8.2 → **8.4**，8.4 才自带
   `end2end`/`MuSGD`/TAL 小目标先验，SDD-YOLO 依赖这三项）
@@ -87,7 +85,7 @@ python3 tests/train_pose_smoke.py --layout uav --warmup 0   # 合成数据端到
 | 组件 | 本库落点 | 要点 |
 |---|---|---|
 | **P2 关键点头** | `model(add_p2=True)`（EP5/EP2） | 关键点分支跟着多一层，关键点预测分辨率 ×2 |
-| **OKS 关键点损失** | `modules/loss/pose.py`（EP7） | `TinyPoseLoss` 与框架同签名；sigma 策略 `person`/`auto`/`balanced`；σ 下限；可见性开关 |
+| **OKS 关键点损失** | `src/tod/loss/pose.py`（EP7） | `TinyPoseLoss` 与框架同签名；sigma 策略 `person`/`auto`/`balanced`；σ 下限；可见性开关 |
 | **姿态训练器** | `engine/pose_trainer.py`（EP9） | 继承检测侧全部 EP 接线，改用 `PoseModel` + 姿态准则（O2M/O2O **两套**都替换） |
 | **OKS 分层评测** | `eval/pose.py`（EP8） | OKS-AP 50:95 + 按目标边长分层 + **逐关键点尺度诊断**（≤1px 命中率/平均误差/平均 OKS） |
 | **合成关键点数据** | `tools/make_dummy_dataset.py --task pose`（EP0） | 火柴人 + COCO 17 点，tiny(12–24px) 与日常(48–112px) 双尺度 |
@@ -125,26 +123,40 @@ python3 tools/val_pose.py --weights results/.../best.pt `
 python3 tools/mav6d_calibrate.py --mav6d D:/MAV6D --model phantom4 --check-util   # 核对投影链
 python3 tools/mav6d_to_yolo.py --mav6d D:/MAV6D --model phantom4 --out data/mav6d  # 转换
 python3 tools/check_pose_dataset.py --data data/mav6d/phantom4/dataset.yaml       # 开训前校验
-python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280  # 训练
+python3 tools/train_mav6d.py --model phantom4 --no-lrep --epochs 100 --batch 4 --imgsz 1280  # 2D baseline
+python3 tools/train_mav6d.py --model phantom4 --epochs 100 --batch 4 --imgsz 1280            # + L_rep
 python3 tools/test_mav6d.py --model phantom4       # 测试（--model both 两机型一起报）
 ```
 
+> **数据架构/格式/坐标约定见 [`docs/MAV6D.md`](docs/MAV6D.md)。**
+> 原始 labels 不在盘上时，用 `--pose-from-pnp` 由 2D 标签反解 `labels_6d`；
+> Mavic 2 的机体宽高深比例与 Phantom 4 不同，必须再加 `--fit-pnp-shape`：
+> `python3 tools/mav6d_to_yolo.py --model mavic2 --out data/mav6d --pose-from-pnp --fit-pnp-shape`。
+> L_rep 的 6D 位姿块/单位/内参/翻转问题与修复记录见 [`docs/TRAINING_REVIEW.md`](docs/TRAINING_REVIEW.md)；
+> 建议先跑 `--no-lrep` 的 2D baseline，再开几何项。
+
 > 训练集位置统一由 `configs/datasets.yaml` 决定（换盘/换机器只改它的 `data_root`，
 > 脚本里没有任何绝对路径）；`python3 tools/train.py --list-datasets` 可先确认解析结果。
+> `dataset.yaml` 是转换产物（含标定得到的 `tod.camera_matrix` / `tod.object_points`，**不能手写**）；
+> 图/标签已在盘上、只缺它时用 `--yaml-only` 补写：
+> `python3 tools/mav6d_to_yolo.py --model phantom4 --out data/mav6d --yaml-only`。
 
-**本库从数据里实证核对过的四件事**（都写进了代码注释，别改）：
+**MAV6D 的四项格式与几何约定**（详见 [数据文档](docs/MAV6D.md) 与 [架构契约](docs/ARCHITECTURE.md#3-mav6d-与几何监督)）：
 
 1. `labels_yolo6d` 是 **21 列** = `cls` + 9 个点 ×2 + **(w,h)**。9 点 = 1 个 3D 框中心 +
    8 个角点（与作者 `util.py` 的 `corners` 及论文 p0~p8 一致）。作者自己的
    `unzip_tools.py` 报告里写成"10 个归一化点"**是错的**（本库用作者投影链逐值反解确认）。
 2. 归一化基准固定 **1920×1080**（转换时按各图实际尺寸重新归一化）。
-3. `labels` 每行 **16 个数**，只有**相机位姿**（`[9:12]` + `[12:16]`）可靠；目标位姿块是
-   `[1:4]`（平移）+ `[4:8]`（四元数），而 `[0]`/`[8]` 是纳秒时间戳 —— 偏移写错会差 670–1900 px。
+3. `labels` 每行 **16 个数**：`[0]` 相机时间戳、`[1:8]` 相机位姿、`[8]` 机体时间戳、
+   **`[9:16]` 机体位姿**。2026-10-26 修正：旧版把 `[1:8]` 当机体、`[9:16]` 当相机，
+   正好反了（差 ~2400 px / 169°）。现在 `labels_6d` 由 2D 关键点 PnP 重建。
 4. **标注含镜头畸变**（作者用了 5 个畸变系数，画幅边缘达几十像素）→ 转换时把 2D 关键点
    **去畸变**，让标签与 `L_rep` 的针孔几何自洽。
 
 已转换工作量（可复算）：`phantom4` **11 674 帧**（10 622 训练 / 1 052 验证，按**序列**切分），
-**全部带有效 6D 位姿**；框长边归一化 0.099–0.273（1920 px 下约 190–520 px）。
+其中 **95.4%** 有 PnP 重建的 6D 位姿（其余帧 `L_rep` 跳过）；框长边归一化
+min 0.0835 / p50 0.172 / max 0.526。`mavic2` 11 788 帧（11 122 / 666），
+6D 覆盖率 **95.7%**，并用 `--fit-pnp-shape` 拟合了与 Phantom 4 不同的宽高深比例。
 
 ### SPAE-YOLOv8n —— 空对空微小型无人机检测（Sensors 2026）
 
@@ -207,7 +219,7 @@ python3 tools/train.py --variant variants/SDD-YOLO26n/variant.yaml --dry-run
 
 - `src/tod/registry.py` —— 所有魔改的唯一入口，强制登记论文/许可证/扩展点归属
 - `src/tod/compose.py` —— 变体 DSL：`骨架 + 扩展点覆盖 → 模型 YAML / 变体卡片`
-- `src/tod/compat.py` —— **唯一**允许触碰 ultralytics 内部结构的文件
+- `src/tod/compat.py` —— 集中管理框架版本、命名空间和运行环境兼容；训练/数据适配在各自职责内调用框架接口
 - 扩展点 `EP0–EP9` —— 数据 / 主干 / 颈部 / 上采样 / 注意力 / 头 / 分配 / 损失 / 推理 / 训练策略
 
 ## 快速开始
@@ -228,7 +240,7 @@ python3 -m pip install torch torchvision --index-url https://download.pytorch.or
 python3 -m pip install -r requirement.txt
 python3 -m pip install -e . --no-deps      # 本仓库可编辑安装
 
-# 2) 架构层冒烟测试（不需要 GPU / torch）
+# 2) 架构层冒烟测试（完整检查需已安装训练依赖）
 python3 tests/smoke.py
 
 # 3) 查看已登记的魔改模块总表
@@ -268,56 +280,194 @@ v.card("variants/visdrone-yolov8n-p2-dysample-nwd/card.md")
 
 ## 目录
 
+```text
+src/tod/       Python 变体、训练、损失与评测
+src/todrt/     C++17 推理接口、后端、CLI 与 CMake
+tools/         环境、数据、训练、评测、消融与导出入口
+variants/      每个实验变体的配方、配置、卡片和证据
+configs/       数据集注册表、模板和标定预设
+tests/         Python 自检与可选实际训练验证
+scripts/       Git 辅助脚本
+docs/          架构、关键点、MAV6D、训练分析与部署文档
+results/       训练与评测输出（不入库）
+build/、.cache/ 构建目录与运行缓存（不入库）
 ```
-src/tod/            训练侧（Python）
-├─ registry.py      魔改注册表（强制元数据；规范名与别名都会注入框架命名空间）
-├─ compose.py       变体 DSL + 模型图改造（P2 注入 / 下采样替换 / 类型替换 / **task 与 kpt_shape**）
-├─ compat.py        唯一触碰 ultralytics 内部的地方（含只读配置目录回退、PoseModel 获取）
-├─ runtime.py       变体 spec 的运行时上下文
-├─ modules/
-│  ├─ conv/adown.py            ADown（EP1）
-│  ├─ attention/dual_attention.py DualAttention（EP4，SDD-YOLO §4.5）
-│  └─ head/efficient_uavdet.py Efficient_UAVDet（EP5，检测/关键点分支均可换）
-├─ assigner/stal.py  STAL 小目标感知分配（EP6，可消融开关）
-├─ optim/musgd.py    MuSGD（EP9，Muon 式 NS 正交化 + SGD 分量）
-├─ loss/box.py + criterion.py  SIoU / Wise-IoU v3 与训练准则接入（EP7）
-├─ loss/pose.py      **TinyPoseLoss**：OKS 关键点损失（EP7，sigma 策略 person/uniform/auto/balanced + σ 下限 + 可见性开关）
-├─ loss/reproj.py    **L_rep 几何重投影损失**（EP7，论文式 6/8/9：只罚垂直于相机射线的横向偏差 + warm-up 调度）
-├─ data/pose6d.py    6D 位姿旁挂数据（EP0，labels_6d CSV → batch 的 gt_pose / gt_image_size）
-├─ eval/scales.py    尺度分层评测（整体 AP + AP_small/AP_tiny，COCO 式 101 点插值）
-├─ eval/pose.py      **姿态 OKS + ADD 评测**（EP8：OKS-AP 50:95 + 按目标/关键点尺度分层 + 论文 ADD(0.5d)）
-└─ engine/           trainer.py + **pose_trainer.py**（EP 接线）/ surgery.py（EP4·EP5 建模后手术）
-                    / distill.py（EP9 特征对齐蒸馏）
 
-src/todrt/          部署侧（C++17，四个后端可选）—— 与 src/tod 并列，可独立复用
-├─ include/todrt/   core（注册表）/ json / modules / factory / backend
-├─ src/models/      ★ 变体配方（一个变体一个文件，两行宏）
-├─ src/             factory / preprocess（float 或 uint8）/ decode / nms / config_io
-├─ src/backend/     四后端：engine_trt / engine_rknn / engine_ort / engine_openvino
-│                   + backend_dispatch（唯一分派处）+ simple_detector（共用外壳）
-├─ apps/todrt_cli   部署工具（list/info/dryrun/probe/bench/run）
-└─ tests/cpp_smoke  架构自检（**不需要任何后端**，148 项）
+完整目录、依赖关系、调用链和数据契约见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。C++ 实机部署面向 Linux；本次整理在 Windows 上只做静态核对。
 
-configs/_base_/     数据集等基础配置（visdrone2019-det / **visdrone2019-pose** / **rflysim-pose**）
-configs/deploy/     部署配置（由 tools/export_onnx.py 生成，Python 与 C++ 的唯一契约）
-variants/<name>/    recipe.py（代码定义）+ variant.yaml + model.yaml + card.md + paper-notes.md
-tools/              make_variant.py / train.py / val.py / **val_pose.py** / ablation.py / catalog.py
-                    / **check_pose_dataset.py**（关键点数据开训前校验）
-                    / make_dummy_dataset.py（--task detect|pose --layout person|uav --kpt-shape N,D）
-                    / **train_mav6d.py + test_mav6d.py**（MAV6D 训练与全指标测试）
-                    / **setup_venv.ps1**（Windows 一键建 .venv，纯 ASCII）/ **setup_venv.sh**（Linux/macOS 对等脚本）
-                    / export_onnx.py / convert_rknn.py
-WORKFLOW.md         **全流程命令**：拉取 → 建 venv → 数据 → 训练 → 测试 → 消融 → 导出
-requirement.txt     venv 依赖清单（**不含 torch**：GPU 轮子按自己的 CUDA 版本单独装）
-docs/DEPLOY.md      部署流程与四个后端（TRT / RKNN / ORT / OpenVINO）的实操与坑
-docs/KEYPOINTS.md   **9 点机体关键点定义（唯一编号来源，含 flip_idx 与推断状态）**
-docs/VARIANTS.md    模块总表（由 tools/catalog.py 自动生成）
-tests/              smoke.py（无 torch 依赖，77 项）+ test_modules.py（105 项）
-                    + test_pose.py（**姿态/关键点/6D 位姿/L_rep，220 项**）
-                    + **test_mav6d.py**（MAV6D 工具链，49 项；`--skip-real` 可跳过真实数据）
-                    + train_smoke.py（检测回路真训练，opt-in）
-                    + train_pose_smoke.py（**姿态回路真训练 + L_rep + ADD 断言，32 项**）
-```
+## 代码文件索引
+
+以下按职责逐个列出当前代码与构建文件。文件内保留简短接口说明和关键不变量，长篇解释统一放在本 README 与专题文档。
+
+### Python 基础与配置装配
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [src/tod/__init__.py](src/tod/__init__.py) | 包入口；提供 UTF-8 输出配置、注册库加载与 bootstrap，训练前完成模块注册和框架注入。 |
+| [src/tod/registry.py](src/tod/registry.py) | 定义 ModuleSpec、扩展点与状态；校验模块注册、管理别名，并生成带来源/许可证/成本的清单。 |
+| [src/tod/compose.py](src/tod/compose.py) | 实现 Variant DSL、配置合并、P2 注入、类型和下采样替换；将配方物化为 variant.yaml、model.yaml 与卡片。 |
+| [src/tod/compat.py](src/tod/compat.py) | 集中适配框架版本、模型命名空间、基础 YAML、运行配置目录和受限环境；向调用层提供兼容性错误。 |
+| [src/tod/paths.py](src/tod/paths.py) | 读取数据集注册表与本机覆盖，统一解析名字/目录/YAML，检查图像标签并生成绝对路径 YAML 缓存。 |
+| [src/tod/runtime.py](src/tod/runtime.py) | 维护当前变体 spec；用上下文管理器设置和恢复配置，供 Trainer 与损失装配读取。 |
+
+### Python 数据、组件与优化器
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [src/tod/data/__init__.py](src/tod/data/__init__.py) | 数据扩展包入口；导出 6D CSV 读取、行校验、姿态数据集构造、四元数转换及异常类型。 |
+| [src/tod/data/pose6d.py](src/tod/data/pose6d.py) | 校验 labels_6d CSV 的目标行序与四元数，将位姿、有效性掩码和原图尺寸附加到样本，并临时替换框架数据集。 |
+| [src/tod/modules/__init__.py](src/tod/modules/__init__.py) | 网络组件集合入口；导入卷积、注意力和头组件以触发注册，不保存实验配方。 |
+| [src/tod/modules/conv/__init__.py](src/tod/modules/conv/__init__.py) | 主干卷积包入口；导入并对外提供 ADown。 |
+| [src/tod/modules/conv/adown.py](src/tod/modules/conv/adown.py) | 实现 ADown 双分支下采样；平均池化后拆分卷积与池化支路，再拼接输出，要求输入通道可均分。 |
+| [src/tod/modules/attention/__init__.py](src/tod/modules/attention/__init__.py) | 注意力包入口；导入并对外提供 DualAttention。 |
+| [src/tod/modules/attention/dual_attention.py](src/tod/modules/attention/dual_attention.py) | 实现通道与空间双注意力；保持张量通道和空间尺寸，作为 EP4 特征增强模块。 |
+| [src/tod/modules/head/__init__.py](src/tod/modules/head/__init__.py) | 输出头包入口；加载 Efficient_UAVDet 的注册实现。 |
+| [src/tod/modules/head/efficient_uavdet.py](src/tod/modules/head/efficient_uavdet.py) | 实现分组卷积 stem、分组可行性检查和原生头分支替换；保留预测输出层、DFL 与姿态解码，并报告实际压缩情况。 |
+| [src/tod/assigner/__init__.py](src/tod/assigner/__init__.py) | 标签分配包入口；导出 STAL 构造与安装接口。 |
+| [src/tod/assigner/stal.py](src/tod/assigner/stal.py) | 构造带小目标先验开关的 TaskAlignedAssigner；识别单/双分支准则并安装分配器。 |
+| [src/tod/optim/__init__.py](src/tod/optim/__init__.py) | 优化器包入口；导出 MuSGD 与原生实现选择接口。 |
+| [src/tod/optim/musgd.py](src/tod/optim/musgd.py) | 实现 Newton–Schulz 正交化与 MuSGD 回退优化器；按参数维度分组，优先选择框架原生 MuSGD。 |
+
+### Python 损失、训练与评测
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [src/tod/loss/__init__.py](src/tod/loss/__init__.py) | 损失包入口；导出 SIoU/WIoU、TinyPoseLoss、sigma 与关键点准则替换接口；完整准则由 criterion.py 装配。 |
+| [src/tod/loss/box.py](src/tod/loss/box.py) | 实现 SIoU 与有状态 WiseIoU，以及按名字选择回归损失的接口；不承担完整训练循环。 |
+| [src/tod/loss/criterion.py](src/tod/loss/criterion.py) | 将框损失、可选 DFL、STAL、关键点损失和 L_rep 装配进框架准则，同时覆盖端到端 O2M/O2O 子准则。 |
+| [src/tod/loss/pose.py](src/tod/loss/pose.py) | 实现 TinyPoseLoss、OKS sigma 策略及可见性配置；按关键点数量生成或校验 sigma，并替换姿态子准则。 |
+| [src/tod/loss/reproj.py](src/tod/loss/reproj.py) | 实现相机射线与三维机体点的横向几何损失、warm-up 包装、像素解码和逐目标位姿查找；依赖相机内参与 labels_6d。 |
+| [src/tod/engine/__init__.py](src/tod/engine/__init__.py) | 训练引擎包入口；延迟提供检测/姿态 Trainer，避免仅使用基础模块时提前加载完整训练框架。 |
+| [src/tod/engine/trainer.py](src/tod/engine/trainer.py) | 扩展 DetectionTrainer；接入建模后修改、框损失、STAL、MuSGD 与 KD，并在断点恢复后重装训练准则。 |
+| [src/tod/engine/pose_trainer.py](src/tod/engine/pose_trainer.py) | 复用检测扩展与框架 PoseTrainer；按需绑定 6D loader，装配关键点和几何损失，报告 warm-up 与实际生效状态。 |
+| [src/tod/engine/surgery.py](src/tod/engine/surgery.py) | 定位预测头和金字塔层；按变体配置挂接注意力、替换头分支，并记录实际执行的模型修改。 |
+| [src/tod/engine/distill.py](src/tod/engine/distill.py) | 加载冻结教师，按特征层对齐类别分布；实现温度缩放 KL 蒸馏及包装准则，支持锚点归约方式配置。 |
+| [src/tod/eval/__init__.py](src/tod/eval/__init__.py) | 评测包入口；对外组织框尺度分层与姿态评测接口，避免将训练逻辑混入指标实现。 |
+| [src/tod/eval/scales.py](src/tod/eval/scales.py) | 解析数据划分和框标签，完成 IoU 匹配、AP 积分与按目标尺寸分桶，输出整体和 tiny/small 指标。 |
+| [src/tod/eval/pose.py](src/tod/eval/pose.py) | 实现 OKS 匹配/AP、关键点像素误差、ADD 与 PnP 位姿指标；包含真值深度诊断和完整 R/t 指标两种口径。 |
+
+### 命令行工具
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [tools/setup_venv.ps1](tools/setup_venv.ps1) | Windows 环境安装入口；支持 -PythonVersion、-TorchIndex、-SkipChecks，创建 .venv、安装依赖与可编辑包并执行自检；脚本保持 ASCII。 |
+| [tools/setup_venv.sh](tools/setup_venv.sh) | Bash 环境安装入口；支持 --python、--torch-index、--skip-checks、--help，并兼容 POSIX 与 Windows Python 的 venv 布局。 |
+| [tools/catalog.py](tools/catalog.py) | 加载注册组件，将模块来源、许可证、成本和扩展点输出为清单；可更新 docs/VARIANTS.md。 |
+| [tools/make_variant.py](tools/make_variant.py) | 加载 recipe.py 中的变体与消融配方，调用 DSL 生成可审阅的模型 YAML、实验配置和卡片。 |
+| [tools/make_dummy_dataset.py](tools/make_dummy_dataset.py) | 生成固定随机种子的极小检测/姿态数据；支持人体和 UAV 布局，并可生成几何监督所需的 6D 位姿。 |
+| [tools/check_pose_dataset.py](tools/check_pose_dataset.py) | 开训前检查关键点定义、镜像索引、标签列数/范围/可见性、图像配对、尺度分布及 6D 配置；可写 JSON 报告。 |
+| [tools/mav6d_calibrate.py](tools/mav6d_calibrate.py) | 读取作者原始相机/机体位姿和 9 点标签，执行标定、三角化、几何求解，并用 --check-util 核对作者投影链。 |
+| [tools/mav6d_to_yolo.py](tools/mav6d_to_yolo.py) | 按机型和序列转换 MAV6D；处理去畸变、YOLO 标签、PnP 位姿重建、机体比例拟合与转换清单，支持只补 dataset.yaml。 |
+| [tools/train.py](tools/train.py) | 通用训练入口；解析变体、数据路径及超参覆盖，选择检测/姿态 Trainer，支持 --dry-run 与 --list-datasets。 |
+| [tools/train_mav6d.py](tools/train_mav6d.py) | MAV6D 专用训练入口；选择机型与数据集，控制 L_rep 开关、warm-up 和参数覆盖，再调用相应 Trainer。 |
+| [tools/val.py](tools/val.py) | 加载检测权重与数据划分，调用尺度分层评测，打印整体/tiny/small AP，并保存带实验信息的 JSON。 |
+| [tools/val_pose.py](tools/val_pose.py) | 姿态评测入口；配置 sigma、数据划分和尺度桶，输出 OKS-AP、逐关键点诊断及可选 ADD。 |
+| [tools/test_mav6d.py](tools/test_mav6d.py) | 定位单/双机型权重并评测；结合检测 AP、OKS 分层、PnP ADD/ADD(0.5d)、旋转/平移与 10°10cm 指标生成报告。 |
+| [tools/ablation.py](tools/ablation.py) | 加载完整变体和 leave-one-out 配方，比较逐字段差异，批量训练/评测并汇总 CSV 与 Markdown；--plan 仅预览。 |
+| [tools/export_onnx.py](tools/export_onnx.py) | 加载变体/权重并导出 ONNX；推断实际输出布局、stride 和类别数，生成 C++ 部署配置，可选构建 TensorRT engine。 |
+| [tools/convert_rknn.py](tools/convert_rknn.py) | 使用 RKNN-Toolkit2 将 ONNX 转为 .rknn，设置输入归一化和量化参数，并更新部署配置中的模型路径与输入契约。 |
+
+### 变体配方
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [variants/SPAE-YOLOv8n/recipe.py](variants/SPAE-YOLOv8n/recipe.py) | 组合 P2、ADown、SIoU 与 Efficient_UAVDet，提供各组件的消融入口；物化为同目录配置和卡片。 |
+| [variants/SDD-YOLO26n/recipe.py](variants/SDD-YOLO26n/recipe.py) | 组合 YOLO26 的 P2/C3、双注意力、WIoU、STAL 与 MuSGD；保留 NMS/DFL-free 底座及可选教师蒸馏配置。 |
+| [variants/spae-yolov8n-pose/recipe.py](variants/spae-yolov8n-pose/recipe.py) | 将 SPAE 组件接入 YOLOv8 Pose，定义 9 点 UAV 任务、OKS 与 L_rep；关键点分支默认保留原生通道。 |
+| [variants/visdrone-yolo26n-pose-p2-p16/recipe.py](variants/visdrone-yolo26n-pose-p2-p16/recipe.py) | 定义 P2 航拍人体 17 点姿态变体与 OKS 策略；真实 VisDrone 关键点标签仍需准备。 |
+
+### Python 验证入口
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [tests/smoke.py](tests/smoke.py) | 检查注册表、DSL 往返、图变换、消融和模型配置；部分实际模块签名/建图检查需要 torch 与框架。 |
+| [tests/test_dataset_paths.py](tests/test_dataset_paths.py) | 建立临时数据树，检查注册表深合并、三种路径入口、环境/命令行优先级、错误信息与数据统计。 |
+| [tests/test_modules.py](tests/test_modules.py) | 验证 ADown、SIoU/WIoU、双注意力、STAL、MuSGD、分组头、蒸馏和完整检测建图的数值及梯度。 |
+| [tests/test_pose.py](tests/test_pose.py) | 验证关键点 sigma/OKS、标签格式、姿态建图、头替换、双准则、L_rep 单位与 6D 数据绑定。 |
+| [tests/test_pose6d_swap.py](tests/test_pose6d_swap.py) | 回归验证两个框架命名空间中的数据集替换、样本位姿字段及替换上下文恢复，防止几何监督静默缺失。 |
+| [tests/test_mav6d.py](tests/test_mav6d.py) | 使用合成数据检查原始标签解析、位姿、畸变、序列切分与转换；真实数据检查可用 --skip-real 跳过。 |
+| [tests/test_repo_hygiene.py](tests/test_repo_hygiene.py) | 检查非锚定忽略规则是否误伤源码/配置、关键源文件是否已跟踪、临时脚本是否误入版本库。 |
+| [tests/train_smoke.py](tests/train_smoke.py) | 可选的实际检测训练自检；合成数据训练后核对权重、日志、参数更新、载入与推理。 |
+| [tests/train_pose_smoke.py](tests/train_pose_smoke.py) | 可选的实际姿态训练自检；检查二维关键点、UAV 6D/L_rep、warm-up、ADD 和权重推理证据。 |
+
+### C++ 公共接口与后端契约
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [src/todrt/include/todrt/core.hpp](src/todrt/include/todrt/core.hpp) | 声明统一异常、设备/精度、日志和注册元数据接口，是其他运行时头文件的基础。 |
+| [src/todrt/include/todrt/json.hpp](src/todrt/include/todrt/json.hpp) | 声明轻量 JSON Value、解析与序列化接口，支持配置文件所需的宽松语法。 |
+| [src/todrt/include/todrt/modules.hpp](src/todrt/include/todrt/modules.hpp) | 定义框、图像/张量视图、前处理结果、输出布局、DFL/NMS 配置与前后处理接口，统一坐标和数据类型契约。 |
+| [src/todrt/include/todrt/detector_options.hpp](src/todrt/include/todrt/detector_options.hpp) | 组合一次部署的模型、设备、构建、输入形状和前后处理选项，并声明配置读写接口。 |
+| [src/todrt/include/todrt/factory.hpp](src/todrt/include/todrt/factory.hpp) | 声明 builder、模型配方、注册宏与 Detector API，提供同步/异步检测、装配计划和性能测试接口。 |
+| [src/todrt/include/todrt/backend/factories.hpp](src/todrt/include/todrt/backend/factories.hpp) | 声明 EngineInputSpec、后端查找/构造与配置合成辅助接口，供公共工厂和 SDK 实现共享。 |
+| [src/todrt/include/todrt/backend/simple_detector.hpp](src/todrt/include/todrt/backend/simple_detector.hpp) | 定义 IEngineRunner、AsyncDetectorBase 与 RunnerDetector；统一队列、像素所有权、推理缓冲和后处理流水线。 |
+| [src/todrt/include/todrt/backend/engine_trt.hpp](src/todrt/include/todrt/backend/engine_trt.hpp) | 以 PIMPL 暴露 TensorRT 引擎构建/加载、执行、序列化和 DLA 诊断接口，公共头不引入 TRT SDK 类型。 |
+| [src/todrt/include/todrt/backend/trt_factory.hpp](src/todrt/include/todrt/backend/trt_factory.hpp) | 声明 TensorRT Detector 构造入口，将引擎与公共前后处理外壳组装为可用检测器。 |
+| [src/todrt/include/todrt/backend/rknn_factory.hpp](src/todrt/include/todrt/backend/rknn_factory.hpp) | 声明 RKNN Detector 构造入口，隔离 Rockchip SDK 实现与上层工厂。 |
+| [src/todrt/include/todrt/backend/ort_factory.hpp](src/todrt/include/todrt/backend/ort_factory.hpp) | 声明 ONNX Runtime Detector 构造入口，上层无需包含 ORT SDK 头。 |
+| [src/todrt/include/todrt/backend/openvino_factory.hpp](src/todrt/include/todrt/backend/openvino_factory.hpp) | 声明 OpenVINO Detector 构造入口，隔离 SDK 与公共调用接口。 |
+
+### C++ 实现、应用与构建
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [src/todrt/src/core.cpp](src/todrt/src/core.cpp) | 实现日志回调、枚举解析、注册元数据/别名查询与依赖检查，保持规范名清单的稳定顺序。 |
+| [src/todrt/src/json.cpp](src/todrt/src/json.cpp) | 实现 JSON 递归解析、类型访问和序列化，并处理注释、尾随逗号与错误位置。 |
+| [src/todrt/src/config_io.cpp](src/todrt/src/config_io.cpp) | 读写部署与运行时配置，按配置段和硬件 preset 合成 DetectorOptions，处理类型和参数校验。 |
+| [src/todrt/src/factory.cpp](src/todrt/src/factory.cpp) | 维护组件构造函数表，合并配方默认值、解析工厂链，创建 Detector 并生成 PlanAssembly 装配诊断。 |
+| [src/todrt/src/preprocess.cpp](src/todrt/src/preprocess.cpp) | 无 OpenCV 的 letterbox/缩放实现；输出 float32 NCHW 或 uint8 NHWC，并记录源图坐标反变换参数。 |
+| [src/todrt/src/decode.cpp](src/todrt/src/decode.cpp) | 按四种输出布局完成预测解码，包括 DFL 与插件 NMS 结果；校验锚点数量、通道和配置。 |
+| [src/todrt/src/nms.cpp](src/todrt/src/nms.cpp) | 实现硬 NMS、soft-NMS 和后处理器工厂，将解码结果按置信度、类别和保留数量筛选。 |
+| [src/todrt/src/models/yolov8_baseline.cpp](src/todrt/src/models/yolov8_baseline.cpp) | 注册原生 YOLOv8 检测配方、别名与元数据，作为工厂装配和部署对照基线。 |
+| [src/todrt/src/models/spae_yolov8n.cpp](src/todrt/src/models/spae_yolov8n.cpp) | 注册 SPAE 模型配方和硬件相关默认项；实际网络结构由导出模型及部署配置描述。 |
+| [src/todrt/src/backend/backend_dispatch.cpp](src/todrt/src/backend/backend_dispatch.cpp) | 集中将后端名称/别名映射到具体构造函数，并对未编译的 SDK 后端返回明确诊断。 |
+| [src/todrt/src/backend/backend_support.cpp](src/todrt/src/backend/backend_support.cpp) | 根据引擎真实输入合成前处理选项，根据导出配置合成后处理选项，处理布局和数据类型冲突。 |
+| [src/todrt/src/backend/simple_detector.cpp](src/todrt/src/backend/simple_detector.cpp) | 执行 runner、组织主机输出 TensorView、调用解码/NMS 并还原源图坐标，同时输出检测器描述。 |
+| [src/todrt/src/backend/engine_trt.cpp](src/todrt/src/backend/engine_trt.cpp) | 实现 TRT 模型构建/反序列化、动态形状、DLA/精度设置、CUDA 缓冲与 Graph 执行，并转换输出供公共解码。 |
+| [src/todrt/src/backend/engine_rknn.cpp](src/todrt/src/backend/engine_rknn.cpp) | 加载 RKNN 模型，处理 NPU 核选择和上下文、uint8 NHWC 输入及 float32 反量化输出。 |
+| [src/todrt/src/backend/engine_ort.cpp](src/todrt/src/backend/engine_ort.cpp) | 创建 ORT session，选择执行设备、解析动态输入输出形状，管理 CPU 张量缓冲并执行推理。 |
+| [src/todrt/src/backend/engine_openvino.cpp](src/todrt/src/backend/engine_openvino.cpp) | 加载/编译 OpenVINO 模型，配置设备与编译缓存，创建推理请求并提供统一 runner 接口。 |
+| [src/todrt/src/backend/engine_stub.cpp](src/todrt/src/backend/engine_stub.cpp) | 在没有 SDK 后端时提供占位 builder 与诊断，使公共装配和自检仍可独立使用。 |
+| [src/todrt/apps/todrt_cli.cpp](src/todrt/apps/todrt_cli.cpp) | 命令行应用；支持目录清单、设备探测、配置/装配检查、推理描述和性能测试。 |
+| [src/todrt/tests/cpp_smoke.cpp](src/todrt/tests/cpp_smoke.cpp) | 验证注册、配置优先级、工厂装配、输入契约、前处理、解码与 NMS；公共检查不依赖 SDK。 |
+| [src/todrt/CMakeLists.txt](src/todrt/CMakeLists.txt) | 定义 C++17 库、CLI 和自检目标，独立探测四种 SDK，处理架构/指令集、链接和安装导出。 |
+| [src/todrt/cmake/aarch64-linux-gnu.cmake](src/todrt/cmake/aarch64-linux-gnu.cmake) | 配置 Linux aarch64 交叉编译器、sysroot 和依赖查找范围，用于 Jetson/RK3588 等目标。 |
+| [src/todrt/cmake/todrtConfig.cmake.in](src/todrt/cmake/todrtConfig.cmake.in) | 安装包配置模板；使下游 CMake 项目可通过 find_package(todrt) 导入目标。 |
+| [src/todrt/cmake/todrt.pc.in](src/todrt/cmake/todrt.pc.in) | pkg-config 元数据模板，提供安装后的头文件、库路径、链接选项及已编译后端信息。 |
+
+### 仓库辅助脚本
+
+| 文件 | 用途与调用关系 |
+|---|---|
+| [scripts/sh/gitpush.sh](scripts/sh/gitpush.sh) | Bash 推送助手；检测当前分支/远端，首次推送设置 upstream。执行会推送远端，不属于训练流水线。 |
+| [scripts/bat/gitpush.bat](scripts/bat/gitpush.bat) | Windows 批处理推送助手；设置脚本内代理后检查分支/远端并推送，首次推送设置 upstream。 |
+
+### 配置、变体产物与文档
+
+| 文件 | 用途 |
+|---|---|
+| [pyproject.toml](pyproject.toml) | Python 包元数据、依赖入口、源码发现和 Ruff 规则；完整训练环境另按 requirement.txt 安装。 |
+| [requirement.txt](requirement.txt) | 训练/数据处理/验证依赖清单；torch 与 torchvision 按所需 CUDA/CPU 索引单独安装。 |
+| [configs/datasets.yaml](configs/datasets.yaml) | 入库数据集注册表，统一公共数据根目录、机型、源数据位置与训练数据位置；本机覆盖放 configs/datasets.local.yaml。 |
+| [visdrone2019-det.yaml](configs/_base_/datasets/visdrone2019-det.yaml) | VisDrone 检测类别、数据划分与尺寸评测口径模板。 |
+| [visdrone2019-pose.yaml](configs/_base_/datasets/visdrone2019-pose.yaml) | 航拍人体 17 点模板，包含关键点顺序和镜像索引；真实标注尚待准备。 |
+| [rflysim-pose.yaml](configs/_base_/datasets/rflysim-pose.yaml) | UAV 9 点模板、镜像索引与几何监督字段；相机内参与机体点需换成真实配置。 |
+| [_mav6d_mavic2_calib.json](configs/_base_/datasets/_mav6d_mavic2_calib.json) | Mavic 2 标定/机体几何预设，供转换器按机型解析。 |
+| [_mav6d_phantom4_calib.json](configs/_base_/datasets/_mav6d_phantom4_calib.json) | Phantom 4 标定/机体几何预设，供转换器生成 dataset.yaml 与位姿数据。 |
+| 各 variants/&lt;name&gt;/variant.yaml | 配方物化后的数据、EP 和训练配置；训练入口直接读取。 |
+| 各 variants/&lt;name&gt;/model.yaml | 配方物化后的网络结构，仅负责建图。 |
+| 各 variants/&lt;name&gt;/card.md、paper-notes.md | 分别记录变体身份/验证状态与论文证据/实现差异；evidence/ 保存参考材料。 |
+| [WORKFLOW.md](WORKFLOW.md) | 建环境、准备数据、训练、评测、消融和导出的操作步骤。 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 当前实际目录、模块边界、训练/部署调用链与关键数据契约。 |
+| [docs/RGB_UAV_DETECTION_SURVEY.md](docs/RGB_UAV_DETECTION_SURVEY.md) | RGB 目标无人机检测、鸟机辨识、视频与机体姿态文献，附创新点、来源和 TOD 复刻路线。 |
+| [PLAN.md](PLAN.md) | 研究选型、扩展点设计、评测协议与后续路线；当前实现以架构文档和文件索引为准。 |
+| [docs/VARIANTS.md](docs/VARIANTS.md) | 由 catalog 工具生成的模块清单及元数据。 |
+| [docs/KEYPOINTS.md](docs/KEYPOINTS.md) | 9 点编号、镜像关系、几何监督字段和指标定义。 |
+| [docs/MAV6D.md](docs/MAV6D.md) | 作者原始数据到训练产物的格式、坐标与转换约定。 |
+| [docs/MAV6D_TRAINING_FLOW.md](docs/MAV6D_TRAINING_FLOW.md) | MAV6D 数据流、监督和损失接线，以及当前训练假设与边界。 |
+| [docs/TRAINING_REVIEW.md](docs/TRAINING_REVIEW.md) | 训练、位姿、单位与内参问题的核对记录和限制。 |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Linux 部署步骤、SDK/CMake 选项和设备配置。 |
+| [src/todrt/README.md](src/todrt/README.md) | C++ API、工厂用法、阅读顺序、后端与构建参考。 |
 
 ## 评测与消融（可归因对比）
 

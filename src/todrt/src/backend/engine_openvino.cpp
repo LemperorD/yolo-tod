@@ -1,16 +1,3 @@
-// engine_openvino.cpp —— Intel OpenVINO 后端
-//
-// 定位：与 ONNX Runtime 互补的通用 CPU 后路。两点现实价值：
-//   1. **AMD x86 上直接用 CPU 设备**（OpenVINO 的 CPU 插件对 x86 有 AVX2/AVX512 深度优化，
-//      且不需要任何 Intel 硬件）；
-//   2. **Intel 机器上可切 GPU/NPU** —— 同一份配置改 `ov_device` 即可，不用改代码。
-//
-// 设计要点：
-//   1. **编译产物有缓存**：OpenVINO 首次 compile_model 要几十秒（图优化+kernel 选择），
-//      开 `ov_cache_dir` 后第二次启动接近瞬时。这也顺带解决了"换机器要重编"的问题。
-//   2. **动态 shape 走 reshape**：输入带 -1 时按本次 H/W reshape 再推理。
-//   3. **API 跨版本**：2.0 的 get_input_shape/get_shape 在 2024.x 改为
-//      get_input_shape/get_output_shape，这里用 TODRT_OV_AT_LEAST 收敛。
 #include "todrt/backend/openvino_factory.hpp"
 
 #if TODRT_HAVE_OPENVINO
@@ -30,7 +17,6 @@
 #include "todrt/backend/simple_detector.hpp"
 #include "todrt/factory.hpp"
 
-// OpenVINO 2024.0 起 get_shape() → get_output_shape()/get_input_shape()
 #if defined(OPENVINO_VERSION_MAJOR) && (OPENVINO_VERSION_MAJOR >= 2024)
 #define TODRT_OV_AT_LEAST_2024 1
 #else
@@ -53,8 +39,6 @@ std::string lower_compact(const std::string& s) {
   return k;
 }
 
-/// OpenVINO 的设备名要用它自己的写法（CPU / GPU / NPU / AUTO），
-/// 这里做一次宽松映射，让配置能写 "cpu"/"amd"/"x86" 这类词。
 std::string parse_device(const std::string& s) {
   const std::string k = lower_compact(s);
   if (k.empty() || k == "auto") return "AUTO";
@@ -62,7 +46,6 @@ std::string parse_device(const std::string& s) {
   if (k == "gpu" || k == "igpu" || k == "intelgpu") return "GPU";
   if (k == "npu" || k == "intelnpu" || k == "vpu") return "NPU";
   if (k == "multidevice" || k == "multi") return "MULTI";
-  // 允许直接透传 OpenVINO 的复合写法，如 "AUTO:GPU,CPU"
   return s;
 }
 
@@ -74,7 +57,6 @@ std::string parse_hint(const std::string& s) {
   return "LATENCY";
 }
 
-/// OpenVINO 引擎。
 class OpenVinoRunner : public IEngineRunner {
  public:
   const std::string& name() const override { return name_; }
@@ -96,7 +78,6 @@ class OpenVinoRunner : public IEngineRunner {
   std::string engine_info() const override;
 
  private:
-  /// 按实际输入尺寸 reshape（动态 shape 时才需要）。
   void MaybeReshape(int batch, int h, int w);
 
   std::string name_ = "openvino";
@@ -131,7 +112,6 @@ void OpenVinoRunner::Init(const BuildConfig& cfg, std::string* err) {
   const std::string dev = parse_device(cfg.ov_device);
   device_used_ = dev;
 
-  // 可用设备列表：这是排查"GPU/NPU 插件没装"的第一手信息
   try {
     const std::vector<std::string> devices = core_.get_available_devices();
     std::ostringstream oss;
@@ -146,14 +126,12 @@ void OpenVinoRunner::Init(const BuildConfig& cfg, std::string* err) {
     log_warn(std::string("查询 OpenVINO 设备失败：") + e.what());
   }
 
-  // ---- 读模型 ----
   try {
     model_ = core_.read_model(cfg.onnx_path);
   } catch (const std::exception& e) {
     fail(std::string("OpenVINO 读取模型失败：") + e.what() + "\n  模型：" + cfg.onnx_path);
   }
 
-  // ---- 输入形状 → 契约 ----
   const std::vector<ov::Output<ov::Node>> inputs = model_->inputs();
   if (inputs.empty()) fail("模型没有输入");
   const ov::Shape in_shape = inputs[0].get_shape();
@@ -177,7 +155,6 @@ void OpenVinoRunner::Init(const BuildConfig& cfg, std::string* err) {
            et.get_type_name() + (dynamic_ ? "（动态 shape）" : ""));
   if (is_u8) log_info("输入是 u8：按量化模型处理，前处理产出原始像素（不做归一化）。");
 
-  // ---- 输出 ----
   const std::vector<ov::Output<ov::Node>> outputs = model_->outputs();
   if (outputs.empty()) fail("模型没有输出");
   for (size_t i = 0; i < outputs.size(); ++i) {
@@ -194,7 +171,6 @@ void OpenVinoRunner::Init(const BuildConfig& cfg, std::string* err) {
              os.str() + "]");
   }
 
-  // ---- 编译（可缓存）----
   ov::AnyMap props;
   props.emplace(ov::hint::performance_mode.name(), parse_hint(cfg.ov_performance_hint));
   if (cfg.ov_num_streams > 0) props.emplace(ov::num_streams.name(), cfg.ov_num_streams);
@@ -229,7 +205,6 @@ void OpenVinoRunner::Init(const BuildConfig& cfg, std::string* err) {
 void OpenVinoRunner::MaybeReshape(int batch, int h, int w) {
   if (!dynamic_) return;
   if (cur_b_ == batch && cur_h_ == h && cur_w_ == w) return;
-  // NCHW；非 4 维输入不 reshape（交给用户保证）
   try {
     ov::Shape target;
     const ov::Shape in = model_->input().get_shape();
@@ -263,7 +238,6 @@ void OpenVinoRunner::Run(const void* input, size_t input_bytes, int batch,
   const int side = static_cast<int>(std::lround(std::sqrt(static_cast<double>(hw))));
   MaybeReshape(batch, side, side);
 
-  // ---- 输入张量：直接用前处理缓冲（零拷贝）----
   const ov::Shape in_shape = request_.get_input_shape(0);
   ov::Tensor in_tensor;
   if (u8) {
@@ -285,7 +259,6 @@ void OpenVinoRunner::Run(const void* input, size_t input_bytes, int batch,
   const auto t1 = std::chrono::steady_clock::now();
   last_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-  // ---- 输出：拷进调用方给的 float 缓冲 ----
   for (size_t i = 0; i < outputs.size(); ++i) {
     if (!outputs[i]) continue;
     const ov::Tensor out = request_.get_output_tensor(i);
@@ -324,8 +297,6 @@ std::string OpenVinoRunner::engine_info() const {
   }
   return oss.str();
 }
-
-// ------------------------------------------------------------------ 装配
 
 std::unique_ptr<Detector> BuildOvDetector(const std::string& model_name, DetectorOptions o,
                                           const std::string& preproc_name,
@@ -421,7 +392,7 @@ std::unique_ptr<IModelBuilder> MakeOvBuilder() {
   return std::unique_ptr<IModelBuilder>(new OvModelBuilder());
 }
 
-}  // namespace
+}
 
 TOD_RT_REGISTER_BUILDER(openvino, MakeOvBuilder)
 TOD_RT_REGISTER_BUILDER(ov, MakeOvBuilder)
@@ -435,11 +406,10 @@ std::unique_ptr<Detector> CreateOpenVinoDetector(const std::string& model_name,
   (void)recipe;
   (void)builder_name;
   DetectorOptions o = opts;
-  // 真正决定执行设备的是 ov_device；这里只保证 device 语义不误导日志
   if (o.device == Device::kAuto) o.device = Device::kCpu;
   return BuildOvDetector(model_name, o, preproc_name, postproc_name);
 }
 
-}  // namespace todrt
+}
 
-#endif  // TODRT_HAVE_OPENVINO
+#endif

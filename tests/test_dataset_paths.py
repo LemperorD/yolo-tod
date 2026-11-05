@@ -1,21 +1,4 @@
-"""数据集注册表（``configs/datasets.yaml``）与路径解析的自检：不需要 torch / 框架。
-
-守的是「训练集在哪」这条链路上最容易悄悄错的地方：
-
-1. **相对 path 的锚点**。ultralytics 把数据集 YAML 里的相对 ``path`` 解析成
-   ``<datasets_dir>/...``（不是 YAML 所在目录），所以必须由本库先把根目录算成**绝对路径**，
-   再写一份副本交给框架 —— 测试直接断言副本里的 ``path`` 是绝对的、且等于解析出的根目录。
-2. **换盘**。只改注册表的 ``data_root`` / 机器覆盖文件，解析结果就必须跟着变；
-   数据不在盘上时必须**报错**而不是回落到仓库里那份旧的同名数据（静默训练错数据比崩更糟）。
-3. **优先级**。``--data-root`` > ``$TOD_DATA_ROOT`` > 注册表 ``root`` > 数据集 YAML 自带的 path。
-4. **三种 ``--data`` 写法**（注册表名 / 目录 / YAML）都要落到同一个根目录 ——
-   否则同一份数据用不同写法会训练到不同地方。
-
-用法::
-
-    python3 tests/test_dataset_paths.py
-    python3 tests/test_dataset_paths.py --keep      # 保留临时目录
-"""
+"""数据集注册表（``configs/datasets.yaml``）与路径解析的自检：不需要 torch / 框架。"""
 
 from __future__ import annotations
 
@@ -27,7 +10,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-# Windows 控制台/重定向默认是 GBK，切到 UTF-8，免得中文与符号输出直接报错
 try:
     import tod
 
@@ -72,7 +54,6 @@ def _fake_dataset(root: Path, *, n_train: int = 3, n_val: int = 1,
             _write(root / "images" / split / f"{i}.jpg")
             if with_labels:
                 _write(root / "labels" / split / f"{i}.txt", "0 0.5 0.5 0.2 0.2\n")
-    # 预处理产物那种"数据集自带 dataset.yaml"的形态（path 是转换时的绝对路径）
     dump_yaml({"path": str(root.resolve()), "train": "images/train", "val": "images/val",
                "nc": 1, "names": {0: "obj"}}, root / "dataset.yaml")
     return root
@@ -82,19 +63,15 @@ def _make_world(base: Path) -> tuple[Path, Path]:
     """造一套「仓库 + 新硬盘」的假世界，返回 (仓库根, 注册表路径)。"""
     repo = base / "repo"
     (repo / "configs").mkdir(parents=True, exist_ok=True)
-    # 仓库里那份"旧的同名数据"：如果解析错，就会悄悄跑在这上面
     _fake_dataset(repo / "data" / "visdrone2019-det", n_train=99, n_val=99)
-    # 新硬盘上的真数据
     _fake_dataset(base / "hdd" / "visdrone2019-det")
     _fake_dataset(base / "hdd" / "rflysim-pose", n_train=2, n_val=1)
     _fake_dataset(base / "hdd" / "mav6d" / "phantom4", n_train=4, n_val=2)
-    # MAV6D 转换产物：dataset.yaml 里带 L_rep 需要的 kpt_shape
     dump_yaml({"path": str((base / "hdd" / "mav6d" / "phantom4").resolve()),
                "train": "images/train", "val": "images/val",
                "nc": 1, "names": {0: "uav"}, "kpt_shape": [9, 3]},
               base / "hdd" / "mav6d" / "phantom4" / "dataset.yaml")
 
-    # 数据集模板（相对 path：正是会导致框架解析到 datasets_dir 的写法）
     _write(repo / "configs" / "_base_" / "datasets" / "visdrone2019-det.yaml",
            "path: ./data/visdrone2019-det\ntrain: images/train\nval: images/val\n"
            "nc: 1\nnames:\n  0: car\n")
@@ -125,7 +102,6 @@ def test_registry_loading(repo: Path, registry: Path) -> None:
           str(loaded.get("data_root")))
     check("读到 4 个数据集", len(loaded["datasets"]) == 4, str(list(loaded["datasets"])))
 
-    # 机器相关覆盖（configs/datasets.local.yaml）只改 data_root，其它字段保留
     _write(repo / "configs" / "datasets.local.yaml",
            f"data_root: {(WORK / 'hdd').as_posix()}\n"
            "datasets:\n  visdrone2019-det:\n    root: hdd-visdrone\n")
@@ -189,7 +165,6 @@ def test_three_ways_agree(repo: Path, registry: Path) -> None:
         assert got is not None
         check(f"{label} → 新硬盘根目录", got.root == hdd, f"{got.root} != {hdd}")
 
-    # 目录方式要求目录里自带 dataset.yaml（MAV6D 转换产物就是这样）
     mav = resolve("mav6d-phantom4", registry_path_hint=registry, repo_root=repo,
                   require_train=True)
     assert mav is not None
@@ -222,7 +197,6 @@ def test_priority(repo: Path, registry: Path) -> None:
     check("--data-root 又盖过 $TOD_DATA_ROOT",
           both.root == (WORK / "hdd" / "visdrone2019-det").resolve(), str(both.root))
 
-    # 数据集 YAML 里写的相对 path 必须按**仓库根**解析（不是框架的 datasets_dir）
     outside = _write(WORK / "loose.yaml",
                      "path: data/visdrone2019-det\ntrain: images/train\nval: images/val\n"
                      "nc: 1\nnames:\n  0: car\n")
@@ -253,7 +227,6 @@ def test_errors(repo: Path, registry: Path) -> None:
         check("报错里指出怎么修（改 data_root / --data-root / 环境变量）",
               "data_root" in msg and "--data-root" in msg, msg.splitlines()[-1])
 
-    # 图在、标签空：只警告；图 0 张：require_train 必报错
     empty = _fake_dataset(WORK / "hdd" / "empty-set", n_train=0, n_val=0)
     _write(empty / "images" / "train" / ".keep")
     try:

@@ -1,18 +1,3 @@
-// engine_trt.cpp —— TensorRT 后端实现（仅在有 TensorRT 的开发/构建环境编译）
-//
-// 目标平台：**Linux（JetPack 6.x / Orin、x86_64 + dGPU）**。本文件不使用任何
-// Windows 专有 API；交叉编译只需把 TRT/CUDA 的头与库指向 aarch64 版本。
-//
-// 版本策略：
-//   * TensorRT 10.x   —— 主路径：强类型张量 + enqueueV3 + setTensorAddress
-//   * TensorRT 8.5/8.6—— 兼容分支：binding 索引 API + enqueueV2 + kFP16/kINT8 flag
-//   * TensorRT >= 11  —— DLA 已被上游移除：显式告警并回落 GPU，而不是静默忽略
-//
-// 性能要点（都能在下面找到对应代码）：
-//   1. 输出缓冲按引擎声明的 dtype 分配（FP16 引擎输出就是 half）；
-//   2. 计时用 CUDA event（wall clock 会把 memcpy 等待算进去，虚高）；
-//   3. CUDA Graph 在固定 shape 下捕获一次、复用多次（Orin 上 CPU 弱，收益明显）；
-//   4. 全程只用一条 non-blocking stream，方便与相机/解码流水线并行。
 #include "todrt/backend/engine_trt.hpp"
 
 #if TODRT_HAVE_TENSORRT
@@ -35,7 +20,6 @@
 #include "todrt/backend/trt_factory.hpp"
 #include "todrt/factory.hpp"
 
-// 版本比较统一成 (major*1000 + minor)，避免到处写多层 #if
 #define TRT_VER (NV_TENSORRT_MAJOR * 1000 + NV_TENSORRT_MINOR)
 #define TRT_AT_LEAST(maj, min) (TRT_VER >= ((maj) * 1000 + (min)))
 
@@ -64,11 +48,6 @@ std::vector<int64_t> dims_to_vec(const nvinfer1::Dims& d) {
   return v;
 }
 
-/// 用初值列表构造 nvinfer1::Dims。
-///
-/// 为什么不直接用 `Dims4{...}`：**TensorRT 10 起 Dims4/Dims3/... 已不存在**
-/// （Dims.d 也从 int32_t 改成了 int64_t）。用这个助手可以同时兼容两代 API，
-/// 而且把"维度数量"这一处易错点收敛在一个函数里。
 nvinfer1::Dims dims_of(std::initializer_list<int64_t> dims) {
   nvinfer1::Dims d;
   int32_t n = 0;
@@ -89,7 +68,6 @@ size_t volume(const std::vector<int64_t>& shape) {
   return n;
 }
 
-/// 半精度 → 单精度。FP16 引擎的输出是 half，而工具链的解码器只吃 float32。
 inline float half_to_float(uint16_t h) {
   const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
   uint32_t exp = (h >> 10) & 0x1Fu;
@@ -98,7 +76,7 @@ inline float half_to_float(uint16_t h) {
   if (exp == 0) {
     if (man == 0) {
       bits = sign;
-    } else {  // 次正规数
+    } else {
       exp = 127 - 15 + 1;
       while ((man & 0x400u) == 0) {
         man <<= 1;
@@ -128,7 +106,6 @@ DataType from_trt(nvinfer1::DataType t) {
   }
 }
 
-/// TensorRT 日志 → todrt 日志，保证全部日志只有一个出口。
 class TrtLogger : public nvinfer1::ILogger {
  public:
   void log(Severity severity, const char* msg) noexcept override {
@@ -150,7 +127,6 @@ class TrtLogger : public nvinfer1::ILogger {
 };
 
 #if !TRT_AT_LEAST(10, 0)
-/// INT8 熵校准（TRT 10 起改为显式量化，不再需要这个接口）。
 class EntropyCalibrator : public nvinfer1::IInt8EntropyCalibrator2 {
  public:
   EntropyCalibrator(int batch, int channels, int height, int width, const std::string& cache)
@@ -170,7 +146,6 @@ class EntropyCalibrator : public nvinfer1::IInt8EntropyCalibrator2 {
     (void)names;
     (void)nb_bindings;
     if (bindings == nullptr || bindings[0] == nullptr) return false;
-    // 由调用方（Detector 层）在需要时填充 host_；这里只做一次 H2D 拷贝。
     if (cudaMemcpyAsync(device_, host_.data(), host_.size(), cudaMemcpyHostToDevice, stream_) !=
         cudaSuccess) {
       return false;
@@ -208,9 +183,7 @@ class EntropyCalibrator : public nvinfer1::IInt8EntropyCalibrator2 {
 };
 #endif
 
-}  // namespace
-
-// ------------------------------------------------------------------ Impl
+}
 
 struct TrtEngine::Impl {
   TrtLogger logger;
@@ -246,8 +219,6 @@ struct TrtEngine::Impl {
   bool cuda_graphs = false;
   bool dynamic = false;
 
-  // DLA 层归属统计（ClassifyLayers 填充，DlaLayerCount/GpuLayerCount/LayerInfo 读取）。
-  // 这是排查"为什么没上 DLA / FPS 没起来"的第一手信息，必须保留。
   int dla_layers = 0;
   int gpu_layers = 0;
   std::vector<std::string> layer_info;
@@ -296,8 +267,6 @@ TrtEngine::TrtEngine() : impl_(new Impl()) {}
 TrtEngine::~TrtEngine() = default;
 bool TrtEngine::valid() const { return impl_ && impl_->engine && impl_->context; }
 
-// ------------------------------------------------------------------ Probe
-
 TrtEngine::PlanInfo TrtEngine::Probe(const BuildConfig& cfg) {
   PlanInfo info;
   info.trt_version = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR);
@@ -329,8 +298,6 @@ TrtEngine::PlanInfo TrtEngine::Probe(const BuildConfig& cfg) {
 #endif
   return info;
 }
-
-// ------------------------------------------------------------------ Build
 
 bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
   auto fail = [&](const std::string& m) {
@@ -382,7 +349,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
     return fail(oss.str());
   }
 
-  // 输入名与 ONNX 对齐检查（写错名字是 profile 设置失败最常见的原因）
   if (impl_->network->getNbInputs() < 1) return fail("ONNX 里没有输入张量");
   const char* onnx_input = impl_->network->getInput(0)->getName();
   if (!cfg.input_name.empty() && cfg.input_name != onnx_input) {
@@ -393,7 +359,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
   log_info(std::string("ONNX 输入：") + input_name + " " +
            dims_to_string(impl_->network->getInput(0)->getDimensions()));
 
-  // 先把"哪些层能上 DLA"统计出来（在构建前问 builder 最准）
   ClassifyLayers();
 
   std::unique_ptr<nvinfer1::IBuilderConfig> config(impl_->builder->createBuilderConfig());
@@ -414,7 +379,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
   }
 #endif
 
-  // ---- 精度 ----
 #if !TRT_AT_LEAST(10, 0)
   if (cfg.precision == Precision::kFP16) {
     if (!impl_->builder->platformHasFastFp16()) log_warn("设备不支持快速 FP16（性能可能下降）。");
@@ -442,7 +406,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
   }
 #endif
 
-  // ---- DLA ----
   const bool want_dla = (cfg.device == Device::kDla);
 #if !TRT_AT_LEAST(11, 0)
   if (want_dla) {
@@ -481,7 +444,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
   }
 #endif
 
-  // ---- 动态 shape profile ----
   if (impl_->dynamic) {
     const int64_t bmin = cfg.dynamic_batch ? 1 : cfg.max_batch;
     const int64_t bopt = cfg.dynamic_batch ? std::max<int64_t>(1, cfg.max_batch / 2) : cfg.max_batch;
@@ -516,7 +478,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
 #endif
   }
 
-  // ---- 构建 ----
   const auto t0 = std::chrono::steady_clock::now();
   std::unique_ptr<nvinfer1::IHostMemory> serialized(
       impl_->builder->buildSerializedNetwork(*impl_->network, *config));
@@ -533,7 +494,6 @@ bool TrtEngine::Build(const BuildConfig& cfg, std::string* err) {
            std::to_string(std::chrono::duration<double>(t1 - t0).count()) + " s，engine " +
            std::to_string(serialized->size() / (1024.0 * 1024.0)) + " MB");
 
-  // ---- 反序列化 ----
   impl_->runtime.reset(nvinfer1::createInferRuntime(impl_->logger));
   if (!impl_->runtime) return fail("createInferRuntime 失败");
 #if !TRT_AT_LEAST(11, 0)
@@ -606,8 +566,6 @@ bool TrtEngine::Serialize(const std::string& path, std::string* err) const {
   return true;
 }
 
-// ------------------------------------------------------------------ Finalize
-
 bool TrtEngine::Finalize() {
   Impl& im = *impl_;
   im.context.reset(im.engine->createExecutionContext());
@@ -656,7 +614,6 @@ bool TrtEngine::Finalize() {
     return false;
   }
 
-  // 输入设备缓冲
   const size_t in_elems = volume(im.input_shape);
   const DataType in_dt = from_trt(im.engine->getTensorDataType(im.input_name.c_str()));
   im.dev_input_bytes = in_elems * dtype_size(in_dt);
@@ -677,7 +634,6 @@ bool TrtEngine::Finalize() {
   for (size_t k = 0; k < im.output_names.size(); ++k) {
     size_t bytes = volume(im.output_shapes[k]) * dtype_size(im.output_types[k]);
     if (bytes == 0) {
-      // 动态 shape 时按 max profile 估一个上界
       const size_t anchors = static_cast<size_t>(im.cfg.shape_max[0] / 4) *
                                  static_cast<size_t>(im.cfg.shape_max[1] / 4) +
                              static_cast<size_t>(im.cfg.shape_max[0] / 8) *
@@ -708,11 +664,8 @@ bool TrtEngine::Finalize() {
   return true;
 }
 
-// ------------------------------------------------------------------ 查询
-
 std::vector<int64_t> TrtEngine::InputShape() const { return impl_->input_shape; }
 std::vector<std::vector<int64_t>> TrtEngine::OutputShapes() const {
-  // 动态 shape 下重新查询一次，保证与当前 profile 一致
   if (impl_->dynamic && impl_->context) {
     std::vector<std::vector<int64_t>> shapes;
     shapes.reserve(impl_->output_names.size());
@@ -731,9 +684,6 @@ double TrtEngine::LastInferMs() const { return impl_->last_infer_ms; }
 int TrtEngine::DlaLayerCount() const { return impl_->dla_layers; }
 int TrtEngine::GpuLayerCount() const { return impl_->gpu_layers; }
 
-/// 逐层统计"这层能不能上 DLA"。排查"为什么 FPS 没起来"时这是第一手信息：
-/// DLA 只支持卷积/池化/逐元素/拼接等有限算子，任何不支持的层都会退回 GPU，
-/// 而一次 DLA↔GPU 切换的代价往往比这层本身的计算还大。
 void TrtEngine::ClassifyLayers() {
 #if !TRT_AT_LEAST(11, 0)
   Impl& im = *impl_;
@@ -765,7 +715,6 @@ std::vector<std::string> TrtEngine::LayerInfo() {
   std::vector<std::string> out;
 #if TRT_AT_LEAST(8, 5)
   if (!impl_->engine) return out;
-  // 10.x：用 IEngineInspector 输出逐层信息（含执行精度与设备）
   std::unique_ptr<nvinfer1::IEngineInspector> inspector(impl_->engine->createEngineInspector());
   if (!inspector) return out;
   inspector->setExecutionContext(impl_->context.get());
@@ -778,8 +727,6 @@ std::vector<std::string> TrtEngine::LayerInfo() {
 #endif
   return out;
 }
-
-// ------------------------------------------------------------------ 推理
 
 bool TrtEngine::Infer(const void* input, size_t input_bytes, int batch,
                       const std::vector<void*>& outputs, const std::vector<size_t>& output_bytes,
@@ -801,11 +748,7 @@ bool TrtEngine::Infer(const void* input, size_t input_bytes, int batch,
     return false;
   }
 
-  // 动态 shape：按本次输入尺寸设定
   if (im.dynamic) {
-    // 实际尺寸由调用方通过 input_bytes 体现（w*h*3*4*batch）；这里从字节数反推。
-    // 注意：这里假设输入是方图（检测模型绝大多数如此）；非方图请在
-    // DetectorOptions.shape_* 里把 profile 设成对应的 w/h。
     const size_t per_sample = input_bytes / static_cast<size_t>(std::max(1, batch));
     const size_t hw = per_sample / (3 * sizeof(float));
     const int64_t side = static_cast<int64_t>(std::lround(std::sqrt(static_cast<double>(hw))));
@@ -835,7 +778,6 @@ bool TrtEngine::Infer(const void* input, size_t input_bytes, int batch,
     }
   }
 #else
-  // 8.x：binding 索引 API（输入/输出索引需要按引擎名称表查一次）
   int in_idx = -1;
   std::vector<int> out_idx(im.output_names.size(), -1);
   for (int i = 0; i < im.engine->getNbBindings(); ++i) {
@@ -876,7 +818,7 @@ bool TrtEngine::Infer(const void* input, size_t input_bytes, int batch,
       if (err) *err = "Infer: enqueue 失败（DLA/GPU 执行出错，检查日志）";
       return false;
     }
-    // 固定 shape 下捕获一次 graph，后续复用
+    // 只在固定 shape 下捕获，后续推理复用相同的执行图。
     if (im.cuda_graphs && !im.dynamic && !im.graph_ready) {
       cudaStreamSynchronize(im.stream);
       cudaGraph_t graph = nullptr;
@@ -887,7 +829,6 @@ bool TrtEngine::Infer(const void* input, size_t input_bytes, int batch,
         const bool ok = im.context->enqueueV2(nullptr, im.stream, nullptr);
 #endif
         if (ok && cudaStreamEndCapture(im.stream, &graph) == cudaSuccess && graph) {
-          // CUDA 12 起 cudaGraphInstantiate 只有 3 个参数（旧的 5 参数版本已移除）
           if (cudaGraphInstantiate(&im.graph_exec, graph, 0) == cudaSuccess) {
             im.graph_ready = true;
             log_info("CUDA Graph 捕获成功，后续推理复用。");
@@ -932,14 +873,6 @@ void TrtEngine::Release() {
 
 namespace {
 
-// ------------------------------------------------------------------ Runner
-//
-// 与另外三个后端同构：本文件只实现"跑一次"（IEngineRunner），
-// 流水线（前处理 → 引擎 → 解码 → NMS → 坐标反变换）由共用的 RunnerDetector 负责。
-//
-// 早先这里是一个手写的 `TrtDetector : Detector`，结果它没能跟上 Detector 接口的演进
-// （Detector 改成 protected RunBatch() + 共用异步骨架后，那份实现就编不过了）。
-// 收到共用外壳上以后，这类接口漂移由 simple_detector.cpp 一处承担。
 class TrtRunner : public IEngineRunner {
  public:
   TrtRunner(std::shared_ptr<TrtEngine> engine, EngineInputSpec spec)
@@ -952,8 +885,6 @@ class TrtRunner : public IEngineRunner {
     return engine_ ? engine_->OutputShapes() : std::vector<std::vector<int64_t>>{};
   }
   std::vector<DataType> output_types() const override {
-    // 通用外壳只接受 float32 输出。TRT 在 FP16 引擎下会给出 half，
-    // 这里如实声明，外壳会明确报错而不是把 half 当 float 解出乱框。
     return engine_ ? engine_->OutputTypes() : std::vector<DataType>{};
   }
 
@@ -966,18 +897,17 @@ class TrtRunner : public IEngineRunner {
       throw TritError("引擎输出数量与调用方缓冲不匹配（内部错误）");
     }
 
-    // 外层给的是 float* 缓冲；TRT 需要的是"按引擎声明 dtype 大小"的缓冲区。
-    // float32 输出可直接复用调用方缓冲；非 float32（FP16 引擎）先用内部缓冲再接。
     scratch_.resize(shapes.size());
     std::vector<void*> ptrs(shapes.size(), nullptr);
     std::vector<size_t> bytes(shapes.size(), 0);
     for (size_t k = 0; k < shapes.size(); ++k) {
       size_t elems = 1;
       for (int64_t d : shapes[k]) elems *= static_cast<size_t>(d > 0 ? d : 1);
+      // 按引擎实际 dtype 分配；FP16 先写临时缓冲，再转成外层需要的 float32。
       const size_t need = elems * dtype_size(types[k]);
       bytes[k] = need;
       if (types[k] == DataType::kF32 && output_elems[k] * sizeof(float) >= need) {
-        ptrs[k] = outputs[k];  // 零拷贝：直接写进调用方缓冲
+        ptrs[k] = outputs[k];
         scratch_[k].clear();
       } else {
         if (scratch_[k].size() < need) scratch_[k].resize(need);
@@ -990,7 +920,6 @@ class TrtRunner : public IEngineRunner {
       throw TritError("TensorRT 推理失败：" + err);
     }
 
-    // FP16 引擎输出转成 float32（通用外壳的契约）
     for (size_t k = 0; k < shapes.size(); ++k) {
       if (ptrs[k] == outputs[k]) continue;
       const size_t n = std::min(output_elems[k], bytes[k] / dtype_size(types[k]));
@@ -1023,13 +952,9 @@ class TrtRunner : public IEngineRunner {
   std::string name_ = "yolov8-trt";
   std::shared_ptr<TrtEngine> engine_;
   EngineInputSpec spec_;
-  std::vector<std::vector<char>> scratch_;  // 仅非 float32 输出时使用
+  std::vector<std::vector<char>> scratch_;
 };
 
-// ------------------------------------------------------------------ 工厂
-//
-// 与另外三个后端（RKNN / ORT / OpenVINO）同构：builder 是**本文件的私有实现**，
-// 对外只暴露 CreateTrtDetector()。engine / runner / builder 的职责划分见文件头注释。
 class TrtModelBuilder : public IModelBuilder {
  public:
   const std::string& name() const override { return name_; }
@@ -1044,8 +969,6 @@ class TrtModelBuilder : public IModelBuilder {
     }
   }
 
-  /// `--dry-run` / `PlanAssembly` 要能在**没有引擎**的情况下回答"这台机器能不能用 TRT"，
-  /// 所以这里只探 CUDA 设备 + TensorRT 版本 + DLA core 数，不建引擎。
   bool Available(std::string* reason) const override {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {
@@ -1097,7 +1020,6 @@ class TrtModelBuilder : public IModelBuilder {
     if (engine_) engine_->Release();
   }
 
-  /// Detector 需要复用**同一个** TrtEngine 实例（构建一次，别构建两次）。
   const std::shared_ptr<TrtEngine>& engine() const { return engine_; }
 
  private:
@@ -1109,7 +1031,7 @@ std::unique_ptr<IModelBuilder> MakeTrtBuilder() {
   return std::unique_ptr<IModelBuilder>(new TrtModelBuilder());
 }
 
-}  // namespace
+}
 
 TOD_RT_REGISTER_BUILDER(yolov8_trt, MakeTrtBuilder)
 TOD_RT_REGISTER_BUILDER(trt, MakeTrtBuilder)
@@ -1148,7 +1070,6 @@ std::unique_ptr<Detector> CreateTrtDetector(const std::string& model_name,
   builder.Build(bc);
   std::shared_ptr<TrtEngine> engine = builder.engine();
 
-  // 输入契约：TensorRT 的输入是 NCHW float32（本工具链固定这样导出）
   EngineInputSpec spec;
   const std::vector<int64_t> in_shape = engine->InputShape();
   if (in_shape.size() == 4 && in_shape[2] > 0 && in_shape[3] > 0) {
@@ -1157,7 +1078,7 @@ std::unique_ptr<Detector> CreateTrtDetector(const std::string& model_name,
   } else {
     spec.height = o.preproc_opts.input_height;
     spec.width = o.preproc_opts.input_width;
-    spec.dynamic_shape = true;  // 引擎输入含动态维
+    spec.dynamic_shape = true;
     spec.dynamic_min = o.shape_min;
     spec.dynamic_max = o.shape_max;
   }
@@ -1166,7 +1087,6 @@ std::unique_ptr<Detector> CreateTrtDetector(const std::string& model_name,
 
   PreprocessOptions po = resolve_preprocess_options(o, spec);
   PostprocessOptions pp = resolve_postprocess_options(o);
-  // 解码用的输入尺寸来自引擎（不是配置里的猜测）；动态 shape 时用本次前处理的尺寸
   pp.decode.input_width = po.input_width;
   pp.decode.input_height = po.input_height;
 
@@ -1182,8 +1102,6 @@ std::unique_ptr<Detector> CreateTrtDetector(const std::string& model_name,
       new RunnerDetector(model_name, o, std::move(runner), std::move(pre), std::move(post)));
 }
 
-// backend_available 统一在 backend_dispatch.cpp 实现（它知道所有后端的编译状态）
+}
 
-}  // namespace todrt
-
-#endif  // TODRT_HAVE_TENSORRT
+#endif

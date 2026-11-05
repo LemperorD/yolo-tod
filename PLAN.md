@@ -1,7 +1,7 @@
 # 小目标检测（Tiny/Small Object Detection, TOD）YOLO 魔改收集库 —— 架构与选型方案
 
 > 文档版本：v0.1 ｜ 更新日期：2026-09-14 ｜ 状态：待评审
-> 本文档回答两件事：**(A) 用什么代码架构来"收集大量魔改 YOLO"才不失控；(B) 先收哪些魔改、优先级如何。**
+> 本文保留研究选型、设计依据和后续路线。当前实际代码结构与调用链见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，逐文件职责见 [README.md](README.md#代码文件索引)。
 
 ---
 
@@ -51,66 +51,30 @@
 
 ---
 
-## 3. 推荐目录结构
+## 3. 当前目录与架构入口
 
-```
-yolo-tod/
-├─ PLAN.md                     # 本文档
-├─ README.md                   # 快速开始
-├─ pyproject.toml              # 依赖（含 ultralytics / mmyolo 引脚）
-├─ requirement.txt             # venv 依赖清单（不含 torch：GPU 轮子要按自己的 CUDA 版本单独装）
-├─ tools/setup_venv.ps1        # Windows 一键建 .venv（纯 ASCII，PS 5.1 安全）
-├─ tools/setup_venv.sh         # Linux/macOS 对等脚本（bin/python 布局）
-├─ WORKFLOW.md                 # ★ 全流程命令：拉取 → 建环境 → 数据 → 训练 → 测试 → 消融 → 导出
-│
-├─ configs/                    # 只放配置，不放代码
-│  ├─ _base_/
-│  │  ├─ datasets/             # visdrone.yaml / ai-tod.yaml / dota.yaml ...
-│  │  ├─ schedules/            # 100e_adamw_cosine.yaml ...
-│  │  └─ runtime/              # 单卡/多卡/AMP/梯度检查点
-│  ├─ variants/                # ★ 变体 = 组合后的完整配置
-│  │  ├─ visdrone/YOLOv8n_P2_DySample_NWD.yaml
-│  │  └─ ai-tod/...
-│  └─ ablations/               # 消融用的最小覆盖片段（只有 diff）
-│
-├─ src/tod/
-│  ├─ registry.py              # ★ 注册表 + 元数据 + 命名空间注入
-│  ├─ compat.py                # 框架版本兼容层（唯一允许碰内部的文件）
-│  ├─ compose.py               # ★ 变体构造 DSL（骨架 + EP 覆盖 → 导出 YAML）
-│  ├─ modules/
-│  │  ├─ conv/                 # SPD-Conv, DCNv4, AKConv, DSConv, RepConv...
-│  │  ├─ block/                # C2f/C3k2/GELAN/Rep/FasterNet/PKI 变体
-│  │  ├─ attention/            # CA, ECA, SimAM, EMA, LSK, MLCA...
-│  │  ├─ neck/                 # BiFPN, AFPN, HS-FPN, Gold-YOLO GD, ASFF, CCFM...
-│  │  ├─ upsample/             # CARAFE, DySample, SAPT, WaveletUp
-│  │  └─ head/                 # DetectP2, DyHead, QueryDet, DualHead(NMS-free)
-│  ├─ assigner/                # TAL, SimOTA, ATSS, RFLA, NWD-assigner
-│  ├─ loss/                    # NWD, WiseIoU, InnerIoU, Focaler-IoU, SlideLoss
-│  ├─ data/                    # slicing(SAHI), copy-paste, mosaic9, oversample
-│  ├─ engine/                  # trainer / validator / predictor 包装
-│  ├─ eval/                    # 尺度分层指标、按面积上报、显著性检验
-│  └─ utils/                   # 可视化、日志、成本统计(FLOPs/延迟)
-│
-├─ variants/                   # ★ 论文级完整复现（变体卡片）
-│  └─ <name>/
-│     ├─ card.md               # 论文/来源/改动点/结论/坑
-│     ├─ model.yaml            # 网络结构
-│     ├─ train.yaml            # 训练配置
-│     └─ results.json          # 指标（machine-readable）
-│
-├─ third_party/                # 只能整仓引入的魔改（git submodule）
-│  └─ README.md                # 来源、commit、许可证、适配说明
-│
-├─ tools/                      # train.py val.py export.py bench.py
-│  └─ ablation.py              # 批量跑消融网格
-├─ docs/
-│  ├─ VARIANTS.md              # ★ 由 registry 自动生成的清单总表
-│  ├─ PROTOCOL.md              # 评测协议
-│  └─ COST.md                  # 参数/FLOPs/延迟/显存记录表
-└─ results/                    # 实验输出（gitignore，仅保留 summary）
+```text
+src/tod/          Python：注册表、DSL、数据路径与运行上下文
+  data/           6D 位姿 CSV、数据集绑定与安全增强
+  modules/        conv / attention / head 网络组件
+  assigner/       STAL 标签分配
+  loss/           框、关键点、几何损失和准则装配
+  optim/          MuSGD
+  engine/         检测/姿态 Trainer、模型修改与蒸馏
+  eval/           框 AP、OKS、ADD 与 PnP
+src/todrt/        C++17：公共接口、模型配方、四种后端、CLI 与 CMake
+tools/            环境、数据、训练、评测、消融和导出命令
+variants/         四个变体各自的 recipe / YAML / card / paper-notes
+configs/          数据集注册表、模板与标定预设
+tests/            Python 自检与可选训练回路验证
+scripts/          Git 推送辅助脚本
+docs/             架构、数据格式、训练分析与部署
+results/          本地训练与评测产物
 ```
 
-**关键点：`modules/` 是"零件库"，`variants/` 是"成品车"。** 两者分离，才能既做组合实验又保留论文可追溯性。
+完整目录和依赖关系统一维护于 [当前代码架构](docs/ARCHITECTURE.md)，不再将规划中的空目录混入已实现文件树。各文件的输入、职责及调用关系见 [README 的代码文件索引](README.md#代码文件索引)。
+
+`src/tod/modules/` 等目录提供可复用组件，`variants/` 保存组合与证据；`tools/` 只承担命令入口和流程编排。训练端通过 ONNX 与部署配置连接 `src/todrt/`，两端在运行时分别管理各自的依赖和资源。
 
 ---
 

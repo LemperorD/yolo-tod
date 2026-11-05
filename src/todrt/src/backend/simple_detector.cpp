@@ -1,7 +1,3 @@
-// simple_detector.cpp —— RunnerDetector 的实现（后端无关）
-//
-// 这里只有一件事：把 IEngineRunner 的输出整流成工具链解码器能吃的形状，
-// 然后交给后处理器与坐标反变换。异步/计时/生命周期都在 AsyncDetectorBase 里。
 #include "todrt/backend/simple_detector.hpp"
 
 #include <algorithm>
@@ -55,9 +51,8 @@ std::vector<Detection> RunnerDetector::RunBatch(const PreprocessResult& pp, doub
                                                 double* infer_ms, double* postprocess_ms) {
   if (!runner_) throw TritError("Detector 未配置引擎");
   if (!preprocessor() || !post_) throw TritError("Detector 未配置前/后处理器");
-  if (preprocess_ms) *preprocess_ms = 0.0;  // 前处理在上层完成
+  if (preprocess_ms) *preprocess_ms = 0.0;
 
-  // 1) 准备主机侧输出缓冲（后端负责把结果写到这里，统一 float32）
   const std::vector<std::vector<int64_t>> shapes = runner_->output_shapes();
   const std::vector<DataType> types = runner_->output_types();
   if (shapes.empty()) throw TritError("引擎没有输出张量");
@@ -69,8 +64,6 @@ std::vector<Detection> RunnerDetector::RunBatch(const PreprocessResult& pp, doub
     size_t n = 1;
     for (int64_t d : shapes[k]) n *= static_cast<size_t>(d > 0 ? d : 0);
     if (n == 0) {
-      // 动态 shape 且尚未确定：后端应在 Run 里重新查询；这里给不出尺寸就报错，
-      // 而不是静默跳过（静默跳过会表现为"一个目标都检测不到"，更难查）。
       throw TritError("输出 " + std::to_string(k) +
                       " 的形状含动态维且未确定，无法分配缓冲（动态 shape 请把 profile 设全）");
     }
@@ -79,11 +72,10 @@ std::vector<Detection> RunnerDetector::RunBatch(const PreprocessResult& pp, doub
     ptrs[k] = host_outputs_[k].data();
   }
 
-  // 2) 跑引擎
+  // 通用解码只读取主机侧 float32；量化与半精度转换由后端完成。
   runner_->Run(pp.bytes.data(), pp.bytes.size(), pp.batch, ptrs, elems);
   if (infer_ms) *infer_ms = runner_->last_infer_ms();
 
-  // 3) 解码 + NMS（后处理器只吃 float32；后端必须在 Run 内完成类型转换）
   last_.clear();
   last_.reserve(shapes.size());
   for (size_t k = 0; k < shapes.size(); ++k) {
@@ -99,9 +91,9 @@ std::vector<Detection> RunnerDetector::RunBatch(const PreprocessResult& pp, doub
   }
   std::vector<std::vector<Detection>> per_image = post_->Run(last_, pp);
   per_image = preprocessor()->ToSourceCoords(std::move(per_image), pp);
-  if (postprocess_ms) *postprocess_ms = 0.0;  // 由 Bench 的 wall-clock 覆盖
+  if (postprocess_ms) *postprocess_ms = 0.0;
   if (per_image.empty()) return std::vector<Detection>();
   return std::move(per_image.front());
 }
 
-}  // namespace todrt
+}

@@ -166,6 +166,10 @@ class ReprojCriterion:
         self._sum = 0.0
         self._count = 0
         self.epoch_mean: float | None = None
+        self.epoch_active = False
+        self.epoch_batches = 0
+        self.epoch_terms = 0
+        self._terms_at_epoch_start = 0
 
     def reproj_terms(self) -> int:
         """累计成功计算的几何项数量（``L_rep`` 是否真的跑过，看这个计数最客观）。"""
@@ -176,6 +180,7 @@ class ReprojCriterion:
         self.epoch = int(epoch)
         self._sum = 0.0
         self._count = 0
+        self._terms_at_epoch_start = self._terms
 
     @property
     def active(self) -> bool:
@@ -186,6 +191,10 @@ class ReprojCriterion:
     def update(self) -> None:
         """框架在每个 epoch 末调用：记录本 epoch 的 L_rep 均值，再推进计数。"""
         self.epoch_mean = (self._sum / self._count) if self._count else None
+        self.epoch_active = self.active
+        self.epoch_batches = self._count
+        self.epoch_terms = self._terms - self._terms_at_epoch_start
+        self._terms_at_epoch_start = self._terms
         self._sum = 0.0
         self._count = 0
         self.epoch += 1
@@ -196,7 +205,8 @@ class ReprojCriterion:
     def __getattr__(self, item: str) -> Any:
         """未定义的属性一律转发给被包装的准则（透明包装，便于外部检查）。"""
         if item in {"base", "reproj", "weight", "warmup_epochs", "enabled", "epoch",
-                    "last_value", "epoch_mean", "_sum", "_count", "_terms"}:
+                    "last_value", "epoch_mean", "epoch_active", "epoch_batches",
+                    "epoch_terms", "_terms_at_epoch_start", "_sum", "_count", "_terms"}:
             raise AttributeError(item)
         return getattr(self.base, item)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 from tod import runtime
@@ -11,6 +12,8 @@ from tod.loss.criterion import build_pose_criterion, build_reproj_criterion
 
 try:  # pragma: no cover
     from ultralytics.models.yolo.pose import PoseTrainer as _PoseTrainer
+    from ultralytics.utils import LOGGER, RANK
+    from ultralytics.utils.torch_utils import unwrap_model
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "tod.engine.pose_trainer 需要 ultralytics。请先完成环境安装：\n"
@@ -21,6 +24,13 @@ except ImportError as exc:  # pragma: no cover
 # MRO 复用检测侧扩展与框架 PoseModel；保留框架构造器的默认 cfg。
 class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
     """姿态训练器 = 框架 ``PoseTrainer`` + 本库的 EP6/EP7/EP9 接线。"""
+
+    def preprocess_batch(self, batch):
+        mask = batch.get("gt_pose_mask")
+        if RANK in {-1, 0} and mask is not None:
+            self._pose_targets += mask.numel()
+            self._pose_valid += int(mask.sum())
+        return super().preprocess_batch(batch)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0,
                        mode: str = "train"):
@@ -113,20 +123,53 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
         print(f"[EP4/EP5] 已生效 EP：{sorted(k for k, v in eps.items() if v)}"
               f" | ProgLoss={'框架原生 E2ELoss.update' if _has_prog_loss(criterion) else '不适用'}")
         if not getattr(self, "_lrep_cb_added", False):
+            self._pose_targets = self._pose_valid = 0
             self.add_callback("on_train_epoch_end", self._log_lrep)
             self._lrep_cb_added = True
 
     def _log_lrep(self, trainer) -> None:
-        """epoch 末打印 ``L_rep`` 的均值/累计项数，避免几何项在日志里“隐身”。"""
-        criterion = getattr(trainer.model, "criterion", None)
+        """记录刚结束一轮的几何监督状态和实际位姿覆盖。"""
+        if RANK not in {-1, 0}:
+            return
+        criterion = getattr(unwrap_model(trainer.model), "criterion", None)
         if criterion is None or not hasattr(criterion, "reproj_terms"):
             return
-        mean = getattr(criterion, "epoch_mean", None)
-        if mean is None:
-            return
-        print(f"[L_rep] epoch={getattr(criterion, 'epoch', '?')} "
-              f"mean={mean:.6f} terms={criterion.reproj_terms()} "
-              f"active={getattr(criterion, 'active', '?')}")
+        mean = criterion.epoch_mean
+        state = "warm-up"
+        if criterion.epoch_active:
+            state = "active" if criterion.epoch_batches else "no-valid-terms"
+        coverage = self._pose_valid / self._pose_targets if self._pose_targets else None
+        metrics = {
+            "epoch": trainer.epoch + 1,
+            "scope": "rank0" if RANK == 0 else "all",
+            "lrep_state": state,
+            "lrep_mean_per_batch": mean,
+            "lrep_batches": criterion.epoch_batches,
+            "lrep_image_branch_terms": criterion.epoch_terms,
+            "pose_valid_targets": self._pose_valid,
+            "pose_total_targets": self._pose_targets,
+            "pose_coverage": coverage,
+        }
+        mean_text = "-" if mean is None else f"{mean:.6g}"
+        coverage_text = "-" if coverage is None else f"{coverage:.1%}"
+        LOGGER.info(f"[L_rep] epoch={metrics['epoch']} scope={metrics['scope']} {state}"
+                    f" | mean={mean_text} batches={criterion.epoch_batches}"
+                    f" terms={criterion.epoch_terms}"
+                    f" | 6D targets={self._pose_valid}/{self._pose_targets} ({coverage_text})")
+        self._write_pose_metrics("pose_train_metrics.csv", metrics)
+        self._pose_targets = self._pose_valid = 0
+
+    def _write_pose_metrics(self, filename: str, metrics: dict) -> None:
+        path = self.save_dir / filename
+        written = getattr(self, "_pose_metric_files", set())
+        append = path.exists() and (self.resume or filename in written)
+        with path.open("a" if append else "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(metrics))
+            if stream.tell() == 0:
+                writer.writeheader()
+            writer.writerow(metrics)
+        written.add(filename)
+        self._pose_metric_files = written
 
 
 __all__ = ["TODPoseTrainer"]

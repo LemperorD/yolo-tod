@@ -109,6 +109,8 @@ def main() -> int:
     model_yaml = args.work / "model.yaml"
     variant.model_yaml(model_yaml, write=True)
     spec["dataset_cfg"] = load_yaml(data_yaml)
+    if spec["dataset_cfg"].get("tod", {}).get("pose_labels"):
+        spec["pose6d_log_interval"] = 1
     runtime.set_active(spec)
 
     from ultralytics import YOLO
@@ -159,7 +161,48 @@ def main() -> int:
           f"实际 {[r[pose_col] for r in rows]}")
 
     rep_enabled = bool(((spec.get("eps") or {}).get("EP7") or {}).get("reproj"))
+    if spec.get("pose6d_log_interval"):
+        pose_csv = data_yaml.parent / cfg["tod"]["pose_labels"] / "val.csv"
+        with pose_csv.open(encoding="utf-8", newline="") as fh:
+            expected = sum(1 for _ in csv.DictReader(fh))
+        with (run_dir / "pose_val_metrics.csv").open(encoding="utf-8", newline="") as fh:
+            pnp_rows = list(csv.DictReader(fh))
+        check("PnP 验证 CSV 每轮一行", len(pnp_rows) == args.epochs)
+        check("PnP 解算分母包括未匹配目标",
+              expected > 0 and all(int(row["targets_with_pose"]) == expected for row in pnp_rows))
+        import torch
+        from tod.eval.pose import evaluate_pnp_metrics
+
+        validator = model.trainer.validator
+        geometry = cfg["tod"]
+        camera = torch.tensor(geometry["camera_matrix"])
+        points = torch.tensor(geometry["object_points"]) + torch.tensor([0., 0., 3.])
+        pixels = points @ camera.T
+        pixels = pixels[:, :2] / pixels[:, 2:]
+        # Feed a perfect prediction in letterboxed coordinates, including keypoint confidence.
+        box = torch.tensor([[30., 40., 55., 75.]])
+        validator.pose_rows = {"test": [[0., 0., 3., 0., 0., 0., 1.]]}
+        validator.pose_samples = []
+        validator._collect_pose_sample(
+            {"bboxes": box, "cls": torch.tensor([0]), "conf": torch.tensor([1.]),
+             "keypoints": torch.cat((pixels + 20, torch.ones_like(pixels[:, :1])), dim=1)[None]},
+            {"im_file": "test.jpg", "bboxes": box, "cls": torch.tensor([0]),
+             "imgsz": (680, 680), "ori_shape": (640, 640), "ratio_pad": ((1., 1.), (20, 20))},
+        )
+        stats = evaluate_pnp_metrics(validator.pose_samples, geometry["camera_matrix"],
+                                     geometry["object_points"], geometry["model_diameter"])
+        validator.pose_rows = validator.pose_samples = None
+        check("PnP 使用还原后的二维像素，完美预测能解算", stats["n"] == 1 and stats["add_m"] < 1e-4)
     if rep_enabled:
+        with (run_dir / "pose_train_metrics.csv").open(encoding="utf-8", newline="") as fh:
+            geometry_rows = list(csv.DictReader(fh))
+        check("几何训练 CSV 每轮一行", len(geometry_rows) == args.epochs)
+        check("几何训练 CSV 记录有效位姿覆盖率",
+              all(float(row["pose_coverage"]) == 1 for row in geometry_rows))
+        check("几何训练 CSV 区分预热与生效",
+              all(row["lrep_state"] == ("warm-up" if i <=
+                  int(cfg["tod"]["reproj_warmup_epochs"]) else "active")
+                  for i, row in enumerate(geometry_rows)))
         check("数据集含 6D 位姿旁挂（labels_6d/<split>.csv）",
               (args.work / "data" / "labels_6d" / "val.csv").is_file())
         check("数据集声明了 L_rep 需要的相机内参与机体 3D 点",

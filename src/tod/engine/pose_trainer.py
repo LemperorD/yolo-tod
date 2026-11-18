@@ -48,13 +48,13 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
         csv_path = Path(self.data["path"]) / pose_dir / "val.csv" if pose_dir else None
         if (not csv_path or not csv_path.is_file() or not geometry.get("camera_matrix")
                 or not geometry.get("object_points")):
-            LOGGER.warning("[PnP] 训练期 6D 验证需要 val.csv、相机内参和 3D 关键点")
+            LOGGER.warning("[PnP val] Skipped: requires val.csv, camera intrinsics and 3D keypoints")
             return super().get_validator()
 
         try:
             self._pnp_rows = load_pose_csv(csv_path)
         except (OSError, Pose6DError) as exc:
-            LOGGER.warning(f"[PnP] 无法读取验证集位姿：{exc}")
+            LOGGER.warning(f"[PnP val] Could not read {csv_path.name}: {exc}")
             return super().get_validator()
         self._pnp_interval = interval
         self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
@@ -98,14 +98,14 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
             "translation_error_m": stats["trans_err_m_mean"],
             "10deg10cm_ratio": stats["10deg10cm_ratio"],
         }
-        errors = "ADD / 10°10cm 暂无有效结果"
+        errors = "ADD and 10deg10cm: n/a (no successful solves)"
         if stats["available"]:
             errors = (f"ADD={metrics['add_m']:.3f}m ADD(0.5d)={metrics['add_0.5d_ratio']:.1%}"
-                      f" | 旋转误差={metrics['rotation_error_deg']:.2f}°"
-                      f" 平移误差={metrics['translation_error_m']:.3f}m"
-                      f" | 10°10cm={metrics['10deg10cm_ratio']:.1%}")
-        LOGGER.info(f"[PnP val] epoch={epoch} | 解算成功={stats['n']}/{targets}"
-                    f" | 匹配后解算失败={stats['n_pnp_failed']} | {errors}")
+                      f" | rotation={metrics['rotation_error_deg']:.2f}deg"
+                      f" translation={metrics['translation_error_m']:.3f}m"
+                      f" | 10deg10cm={metrics['10deg10cm_ratio']:.1%}")
+        LOGGER.info(f"[PnP val] epoch={epoch} | solved={stats['n']}/{targets}"
+                    f" | failed_after_match={stats['n_pnp_failed']} | {errors}")
         self._write_pose_metrics("pose_val_metrics.csv", metrics)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0,

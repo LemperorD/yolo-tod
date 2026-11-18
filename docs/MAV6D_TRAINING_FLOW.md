@@ -195,6 +195,15 @@ flowchart TD
 
 训练时使用框架 PoseValidator，保存权重的 fitness 来自框与关键点指标。当前没有把 PnP 的 ADD 或 10°10cm 接到 best.pt 的选择标准，因此 best.pt 不一定是 6D 指标最优的轮次。
 
+训练目录同时保存以下日志，可按 `epoch` 与框架的 `results.csv` 对齐。
+
+| 日志 | 内容 |
+|---|---|
+| `[L_rep]` / `pose_train_metrics.csv` | 当前轮的预热/生效状态、产生几何损失的 batch 数、按图像和预测分支计的项数、产生几何项的 batch 上的原始损失均值，以及有 6D 监督的 GT 目标数和占比。分布式模式下 `scope=rank0` 表示仅统计主进程分片。 |
+| `[PnP val]` / `pose_val_metrics.csv` | 验证集中带位姿的目标数、PnP 成功和失败数、ADD、ADD(0.5d)、平均旋转与平移误差、10°10cm。误差及阈值命中率以成功解算的目标为分母，`pnp_success_over_targets` 将漏检也计入分母。 |
+
+`train_mav6d.py` 在单进程训练的第 1 轮、每 5 轮和计划的最后一轮随常规验证计算 PnP 指标。用 `--pnp-every N` 调整频率，`0` 关闭。PnP 复用验证的预测框和关键点，使用置信度 ≥ 0.25、框 IoU ≥ 0.5 的匹配口径。只要验证集提供位姿 CSV 和几何参数，`--no-lrep` 训练也可以记录 PnP 指标。
+
 `tools/val_pose.py` 提供本库分层关键点评测；其框 IoU 匹配协议与标准 COCO OKS 匹配协议不同。`tools/test_mav6d.py` 另外做 PnP。当前 PnP 成功率指标只统计匹配到、带 GT 位姿且 PnP 成功的目标，漏检与 PnP 失败需另行报告；不能把这个条件成功率当作全数据集位姿召回率。
 
 ## 5. 常见训练方案与本项目的区别
@@ -226,7 +235,7 @@ flowchart TD
 4. **reproj_weight=0 实际变 1。** `criterion.py` 的 `float(ep7.get('reproj_weight', 1.0) or 1.0)` 会吞掉零值。当前要关闭需用 `--no-lrep`，不能靠权重零做消融。
 5. **候选匹配不是代码注释所称的一对一。** `_nearest_anchor_indices_per_box()` 对每个框独立 argmin，没有排除已用候选；多目标可共用一个预测。预测 p0 最近的候选也不一定是检测分配器认定的正样本，且真实 p0 不必等于二维框中心。
 6. **部分目标缺失位姿时存在索引错配风险。** `_pose_lookup()` 按 mask 压缩位姿行，`_one_branch()` 却配 `boxes[:n_obj]`。例如仅第二个目标有位姿时，会配给第一个框。当前单目标 MAV6D 路径通常不触发，但不能泛化为可靠的多目标几何训练实现。
-7. **没有保存独立 L_rep 损失列。** 包装器仍返回基础 `items`，只有 epoch 末 callback 打印几何统计；results.csv 的五项损失不能完整反映总训练目标。
+7. **几何项单独记录。** 框架 results.csv 仍只记录五项基础损失；几何项的原始均值和实际使用情况见同目录下的 pose_train_metrics.csv。
 
 ### B. 需要明确的训练设计
 

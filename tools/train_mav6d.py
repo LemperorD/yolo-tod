@@ -88,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-run", action="store_true", help="只建模型/准则自检，不训练")
     ap.add_argument("--no-lrep", action="store_true",
                     help="关闭 EP7.reproj（2D baseline；几何增强保持开启）")
+    ap.add_argument("--pnp-every", type=int, default=5, metavar="N",
+                    help="单进程训练时，第 1 轮、每 N 轮和计划的最后一轮记录验证集 PnP 指标；0 关闭")
     ap.add_argument("--no-pretrained", action="store_true",
                     help="兼容保留；当前自定义结构始终从零训练（不自动迁移预训练）")
     ap.add_argument("--set", action="append", default=[], metavar="K=V",
@@ -119,7 +121,10 @@ def explicit_set_keys(items: list[str]) -> set[str]:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.pnp_every < 0:
+        parser.error("--pnp-every 必须为非负整数")
 
     import tod
     from tod import compat, runtime
@@ -178,6 +183,7 @@ def main() -> int:
             print(f"[mav6d] 警告：6D 位姿覆盖率只有 {float(coverage):.1%}，"
                   "L_rep 实际几乎不生效；建议先跑 --no-lrep，"
                   "或用 --pose-from-pnp --fit-pnp-shape 重拟合形状。")
+    spec["pose6d_log_interval"] = args.pnp_every
     runtime.set_active(spec)
 
     tod.bootstrap()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from copy import copy
 from pathlib import Path
 
 from tod import runtime
@@ -28,9 +29,84 @@ class TODPoseTrainer(TODDetectionTrainer, _PoseTrainer):
     def preprocess_batch(self, batch):
         mask = batch.get("gt_pose_mask")
         if RANK in {-1, 0} and mask is not None:
-            self._pose_targets += mask.numel()
-            self._pose_valid += int(mask.sum())
+            masks = mask if isinstance(mask, (list, tuple)) else (mask,)
+            for image_mask in masks:
+                self._pose_targets += image_mask.numel()
+                self._pose_valid += int(image_mask.sum())
         return super().preprocess_batch(batch)
+
+    def get_validator(self):
+        interval = runtime.active().get("pose6d_log_interval", 0)
+        if not interval or RANK != -1:
+            return super().get_validator()
+
+        from tod.data.pose6d import Pose6DError, load_pose_csv
+        from tod.engine.pose_validator import TODPoseValidator
+
+        geometry = self.data.get("tod") or {}
+        pose_dir = geometry.get("pose_labels")
+        csv_path = Path(self.data["path"]) / pose_dir / "val.csv" if pose_dir else None
+        if (not csv_path or not csv_path.is_file() or not geometry.get("camera_matrix")
+                or not geometry.get("object_points")):
+            LOGGER.warning("[PnP] 训练期 6D 验证需要 val.csv、相机内参和 3D 关键点")
+            return super().get_validator()
+
+        try:
+            self._pnp_rows = load_pose_csv(csv_path)
+        except (OSError, Pose6DError) as exc:
+            LOGGER.warning(f"[PnP] 无法读取验证集位姿：{exc}")
+            return super().get_validator()
+        self._pnp_interval = interval
+        self.loss_names = "box_loss", "pose_loss", "kobj_loss", "cls_loss", "dfl_loss"
+        if getattr(unwrap_model(self.model).model[-1], "flow_model", None) is not None:
+            self.loss_names += ("rle_loss",)
+        return TODPoseValidator(self.test_loader, save_dir=self.save_dir,
+                                args=copy(self.args), _callbacks=self.callbacks)
+
+    def validate(self):
+        interval = getattr(self, "_pnp_interval", 0)
+        epoch = self.epoch + 1
+        if not interval or (epoch != 1 and epoch % interval and epoch != self.epochs):
+            return super().validate()
+
+        self.validator.pose_rows = self._pnp_rows
+        self.validator.pose_samples = samples = []
+        try:
+            result = super().validate()
+        finally:
+            self.validator.pose_rows = self.validator.pose_samples = None
+        if result[0] is not None:
+            self._log_pnp(epoch, samples)
+        return result
+
+    def _log_pnp(self, epoch: int, samples: list) -> None:
+        from tod.eval.pose import evaluate_pnp_metrics
+
+        geometry = self.data["tod"]
+        stats = evaluate_pnp_metrics(samples, geometry["camera_matrix"],
+                                     geometry["object_points"], geometry.get("model_diameter"))
+        targets = sum(min(len(sample["gts"]), len(sample["poses"])) for sample in samples)
+        metrics = {
+            "epoch": epoch,
+            "targets_with_pose": targets,
+            "pnp_success": stats["n"],
+            "pnp_failed": stats["n_pnp_failed"],
+            "pnp_success_over_targets": stats["n"] / targets if targets else None,
+            "add_m": stats["add_m"],
+            "add_0.5d_ratio": stats["add_0.5d_ratio"],
+            "rotation_error_deg": stats["rot_err_deg_mean"],
+            "translation_error_m": stats["trans_err_m_mean"],
+            "10deg10cm_ratio": stats["10deg10cm_ratio"],
+        }
+        errors = "ADD / 10°10cm 暂无有效结果"
+        if stats["available"]:
+            errors = (f"ADD={metrics['add_m']:.3f}m ADD(0.5d)={metrics['add_0.5d_ratio']:.1%}"
+                      f" | 旋转误差={metrics['rotation_error_deg']:.2f}°"
+                      f" 平移误差={metrics['translation_error_m']:.3f}m"
+                      f" | 10°10cm={metrics['10deg10cm_ratio']:.1%}")
+        LOGGER.info(f"[PnP val] epoch={epoch} | 解算成功={stats['n']}/{targets}"
+                    f" | 匹配后解算失败={stats['n_pnp_failed']} | {errors}")
+        self._write_pose_metrics("pose_val_metrics.csv", metrics)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0,
                        mode: str = "train"):
